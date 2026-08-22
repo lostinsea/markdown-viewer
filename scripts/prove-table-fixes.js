@@ -31,7 +31,10 @@ const CUSTOM_CSS = path.join(SRC, "custom-styles.css");
 const CENSUS = path.join(ROOT, "test", "theme-census.js");
 const GOLDEN = path.join(ROOT, "test", "fixtures", "theme-golden.json");
 const THEME_TEST = path.join(ROOT, "test", "test-theme.js");
+const THEME_FIXTURE = path.join(ROOT, "test", "fixtures", "syntax-census.md");
+const THEME_JS = path.join(SRC, "custom-theme.js");
 const PKG_TEST = path.join(ROOT, "test", "test-packaging.js");
+const MERMAID_CFG = path.join(SRC, "mermaid-config.js");
 
 const REVERTS = [
   {
@@ -2002,11 +2005,14 @@ const REVERTS = [
     // The anchor carries beginExportThemeHold() because
     // `await setExportTheme(false);` is a whole line that could plausibly
     // recur; pinning it to the hold makes the site unambiguous.
+    // Re-pointed again when theme-6-export inserted parkExportScheme() between
+    // the hold and the re-theme, which split the two-line anchor. --anchors
+    // caught it; a full run would have reported SETUP-FAILED hours later.
     from:
-      "  beginExportThemeHold();\n" +
+      "  parkExportScheme();\n" +
       "  await setExportTheme(false);",
     to:
-      "  beginExportThemeHold();\n" +
+      "  parkExportScheme();\n" +
       "  document.body.classList.remove('dark-mode');",
     expect: [/PDF export re-themes the diagrams to match the light page/],
     // The body class must still go light, or this would be proving nothing
@@ -2087,12 +2093,14 @@ const REVERTS = [
       "    if (document.body.dataset.wasDark === '1') await setExportTheme(true);\n" +
       "  }",
     // The paired edit takes the snapshot, where the removed one was taken.
+    // Re-pointed when theme-6-export inserted parkExportScheme() between the
+    // hold and the re-theme, splitting the old two-line anchor.
     also: {
       from:
-        "  beginExportThemeHold();\n" +
+        "  parkExportScheme();\n" +
         "  await setExportTheme(false);",
       to:
-        "  beginExportThemeHold();\n" +
+        "  parkExportScheme();\n" +
         "  document.body.dataset.wasDark = document.body.classList.contains('dark-mode') ? '1' : '0';\n" +
         "  await setExportTheme(false);",
     },
@@ -4728,6 +4736,1068 @@ const REVERTS = [
     mustPass: [
       /the census measures exactly the token properties this suite pins/,
       /every golden record carries every property the census measures/,
+    ],
+  },
+  {
+    id: "R295",
+    // ACCENT SURVIVAL. Not a deletion: the cell stays DECLARED, so the
+    // completeness check in 10b still passes and this fails on exactly one
+    // axis. What it reproduces is the realistic accident - a scheme author
+    // copying a block and leaving one surface on the value it was copied
+    // from - which is invisible to every check that only asks whether a
+    // variable exists.
+    // THE SUBSTITUTED COLOUR IS PART OF THE PROOF. #279EA7 - the obvious
+    // choice, being the light default accent - fails THREE assertions, not
+    // the one named: white on it measures 3.21, so clarity's undimmed-AA bar
+    // and its dimmed-choice bar go down with it. `collateral` is computed
+    // only from `mustPass`, so the extra failures print and nothing flags
+    // them, and the entry reads as a narrow proof while being a broad one.
+    // #1F3244 is a needle in the SAME list (the default ink/panel colour) and
+    // measures 13.14 against white, so accent survival is the only axis that
+    // can move.
+    what: "point clarity's solid welcome fill back at a DEFAULT palette colour",
+    file: CSS,
+    from: "  --welcome-solid-bg: #0969da;",
+    to: "  --welcome-solid-bg: #1F3244;",
+    suite: "test:theme",
+    expect: [/clarity: no element still paints a DEFAULT accent colour/],
+    mustPass: [
+      /clarity: overrides every literal its mode's base declares/,
+      /light default: the accent literals 10c searches for are really painted/,
+    ],
+  },
+  {
+    id: "R296",
+    // REGISTRY <-> STYLESHEET, the direction that is easy to get wrong.
+    // Deliberately ADDS a block rather than removing one: deleting a scheme's
+    // block breaks completeness, accent survival and contrast all at once, so
+    // it would prove nothing about the registry check specifically. A stray
+    // block is the accident that actually happens - a scheme renamed in JS and
+    // half-renamed in CSS - and only one assertion can see it.
+    what: "leave an orphan scheme block in the stylesheet",
+    file: CSS,
+    from: 'body[data-theme="clarity"] {',
+    to: 'body[data-theme="ghost"] {\n  --primary-color: #123456;\n}\n\nbody[data-theme="clarity"] {',
+    suite: "test:theme",
+    expect: [/every body\[data-theme\] block in the stylesheet is a registered scheme/],
+    mustPass: [/every registered non-base scheme has a body\[data-theme\] block/],
+  },
+  {
+    id: "R297",
+    // THE ABSOLUTE CONTRAST BAR, and this is the exact regression it was
+    // written for. Before --danger-bg existed, the editor Exit button was a
+    // literal #e74c3c with white ink in every scheme, and at 3.82:1 it was the
+    // ONLY sub-AA cell all four had left. It passed the RELATIVE bar - the
+    // defaults paint the same pair, so it was neither novel nor worse - which
+    // is precisely why the absolute bar had to exist as well.
+    what: "let clarity inherit the default's sub-AA danger surface",
+    file: CSS,
+    from: "  --danger-bg: #cf222e;",
+    to: "  --danger-bg: #e74c3c;",
+    suite: "test:theme",
+    expect: [/clarity: every element it paints at full opacity meets WCAG AA \(4\.5:1\)/],
+    mustPass: [
+      // THE RELATIVE BAR MUST STAY GREEN, and that is the entire argument for
+      // the absolute one existing beside it. Stated contrapositively since the
+      // split-contrast-bar redesign renamed it: a cell rendering below AA has
+      // to have been below AA in the default too. The danger surface satisfies
+      // that either way - the defaults paint the identical white-on-#e74c3c
+      // pair - so this assertion is structurally incapable of noticing the
+      // regression R297 installs. (Its previous name,
+      // "no element that met WCAG AA under the default falls below it", had
+      // been dead since that rename and was caught by --expects.)
+      /clarity: every element that RENDERS below AA also renders below AA in its mode's default/,
+      /clarity: overrides every literal its mode's base declares/,
+    ],
+  },
+  {
+    id: "R298",
+    // A COLOUR THAT IS FINE ON ONE BACKGROUND AND FAILS ON ANOTHER. #7a5c3e
+    // measures 5.02:1 against parchment's code background and would pass any
+    // check that only looked there - but --tok-entity reads from this role and
+    // paints on --syn-entity-bg, where the same colour is 4.33:1. Kept as a
+    // separate entry from R297 because the mistake is a different one: not an
+    // inherited default, but a value verified against the wrong surface.
+    what: "restore parchment's operator colour that fails on the entity background",
+    file: CSS,
+    from: "  --syn-operator: #6f5133;",
+    to: "  --syn-operator: #7a5c3e;",
+    suite: "test:theme",
+    expect: [/parchment: every element it paints at full opacity meets WCAG AA \(4\.5:1\)/],
+    mustPass: [/parchment: overrides every literal its mode's base declares/],
+  },
+  {
+    id: "R299",
+    // THE EXPORT HOLD. A scheme picked from the menu while printToPDF is
+    // rasterising repaints the page underneath it, so the PDF comes out half
+    // in one scheme and half in another. Nothing about the stylesheet can
+    // catch this - it is a JS ordering rule - which is why 10e drives the real
+    // primitives rather than asserting on the CSS.
+    what: "let applyScheme repaint the document during an export hold",
+    file: THEME_JS,
+    from: '    if (typeof held === "function" && held()) return scheme;',
+    to: '    if (false) return scheme;',
+    suite: "test:theme",
+    expect: [/a scheme picked mid-export lands only once the export releases/],
+    mustPass: [
+      /an export parks the scheme, so a dark scheme is not printed onto white paper/,
+      /the scheme is restored from the stored preference once the export releases/,
+    ],
+  },
+  {
+    id: "R300",
+    // THE SETTLE ASSERTION'S OWN PROOF, and it took some thought to find one.
+    // "every theme state settled its CSS transitions before it was measured"
+    // went green on its first run, and the obvious revert - delete the wait -
+    // CANNOT falsify it: without the wait the suite reports five phantom colour
+    // failures elsewhere while this assertion, which only records states that
+    // failed to SETTLE, keeps passing. That is a false-positive proof, not a
+    // proof of this claim.
+    // What genuinely falsifies it is a transition the settle budget cannot
+    // outlast - the realistic accident being a product-side transition getting
+    // slower - so this stretches the very rule whose 0.2s background fade
+    // produced the original artifacts. The assertion must then report that the
+    // measurement was taken mid-flight, BY NAME, instead of the suite quietly
+    // recording whatever colour the element happened to be passing through.
+    what: "slow a themed transition past the settle budget, so states are measured mid-flight",
+    file: CUSTOM_CSS,
+    from: ".file-update-btn {\n  transition: background 0.2s ease !important;",
+    to: ".file-update-btn {\n  transition: background 30s ease !important;",
+    suite: "test:theme",
+    expect: [/every theme state settled its CSS transitions before it was measured/],
+    // THE POSITIVE CONTROL MUST SURVIVE, and saying so is the point. This
+    // revert makes a transition run LONGER, so the control - "the settle wait
+    // actually observed running transitions" - is if anything more satisfied
+    // than before. If it ever fails here, the settle machinery has stopped
+    // observing anything at all and the expected failure above would be
+    // reporting the absence of an instrument rather than the presence of a
+    // slow transition.
+    mustPass: [/the settle wait actually observed running CSS transitions/],
+  },
+  {
+    id: "R301",
+    // THE INVISIBLE-REGRESSION AXIS OF THE GLOW WORK, and the reason 10f
+    // asserts the declaration SCOPE separately from the resolved values.
+    // Before tokenisation, ELEVEN of the twelve accent glows carried the LIGHT
+    // teal literal with no body.dark-mode counterpart, so they painted the
+    // light halo in dark mode too. Redeclaring --accent-glow-rgb per mode is a
+    // one-line edit that reads like an oversight being corrected - it makes
+    // the token look consistent with every other accent variable in the file -
+    // and it silently changes the frozen DARK default on eleven surfaces.
+    // Nothing else in the suite can see it: every consumer is a :hover,
+    // :focus or ::after state, so the golden samples none of them.
+    what: "redeclare the mode-invariant accent glow per mode, changing the frozen dark halo",
+    file: CSS,
+    from: "  --accent-mode-glow-rgb: 61, 189, 198;",
+    to: "  --accent-mode-glow-rgb: 61, 189, 198;\n  --accent-glow-rgb: 61, 189, 198;",
+    suite: "test:theme",
+    expect: [
+      /dark default: every accent glow resolves to its frozen pre-theme colour/,
+      /the mode-invariant glow token is declared once, outside the dark block/,
+    ],
+  },
+  {
+    id: "R302",
+    // A SCHEME THAT CANNOT REACH A GLOW is 10c's stranded-accent defect in a
+    // state no screenshot of a resting page can show: abyss keeps its blue
+    // page and its blue buttons, and the halo under a hovered button stays
+    // Folia's default teal. Deleting one line from one scheme block is exactly
+    // how the Open File button was stranded in the first place.
+    // DECLARED-BUT-DEFAULT, not deleted, and the difference is the proof.
+    // Deleting the line strands abyss on the inherited :root value - which is
+    // the same halo - but it ALSO empties the cell out of abyss's own block,
+    // so 10b's completeness check fails alongside the retint assertion and the
+    // entry proves a disjunction rather than the property it names. Keeping
+    // the declaration and giving it the default triple removes 10b from the
+    // picture, and `mustPass` records that so a future change re-coupling them
+    // shows as COLLATERAL.
+    // TWO assertions still fail, and both are the SAME defect from two angles
+    // rather than a disjunction: 10f reports all eleven glow rules still on the
+    // default halo, and 10c independently catches the one glow that paints at
+    // REST (.welcome-open-btn's box-shadow) as a stranded accent surface. That
+    // layering is the design - 10c cannot reach the ten :hover/:focus rules at
+    // all, which is the entire reason 10f exists beside it.
+    what: "strand abyss on the default accent halo while still declaring the cell",
+    file: CSS,
+    from: "  --accent-glow-rgb: 122, 162, 247;",
+    to: "  --accent-glow-rgb: 39, 158, 167;",
+    suite: "test:theme",
+    expect: [
+      /abyss: every accent glow is retinted, none left on the default halo/,
+      /abyss: no element still paints a DEFAULT accent colour/,
+    ],
+    mustPass: [/abyss: overrides every literal its mode's base declares/],
+  },
+  {
+    id: "R303",
+    // THE NON-SHADOW GLOW, and it pins a hole this section shipped with for
+    // one run. The collector originally filtered on box-shadow alone, which
+    // dropped the drag-drop overlay's `background: rgba(var(--accent-glow-rgb),
+    // 0.08)` - a glow consumer that simply is not a shadow - out of the
+    // subject set entirely. The retint and fidelity assertions went on
+    // reporting a clean sweep; the ONLY symptom was a missing alpha.
+    // Note WHICH assertion this fails, because it is the designed division of
+    // labour: de-tokenising a rule removes it from the subject set rather than
+    // giving it a wrong value, so the RETINT assertion structurally cannot see
+    // it and the INVENTORY is what bites - it reports the tuple as MISSING,
+    // naming the exact selector, property and alpha that left. That is the
+    // whole reason a frozen inventory exists beside the value comparisons: a
+    // count would have been satisfied by any other rule being duplicated.
+    what: "de-tokenise the one glow that is a background rather than a box-shadow",
+    file: CSS,
+    from: "  background: rgba(var(--accent-glow-rgb), 0.08);",
+    to: "  background: rgba(39, 158, 167, 0.08);",
+    suite: "test:theme",
+    expect: [
+      /the glow rules are exactly the frozen inventory - same selectors, same properties, same alphas/,
+      /no rule paints a frozen accent literal outside a custom-property declaration/,
+    ],
+  },
+  {
+    id: "R304",
+    // DECLARED IS NOT RESOLVED - the exact hole 10b's CSSOM sweep shipped with.
+    // It answers "does clarity have a declaration for this cell", and a
+    // declaration whose value references a variable that does not exist answers
+    // YES. The cell then computes to the guaranteed-invalid value, reads back
+    // as the empty string, and every consumer silently falls back.
+    // The subject is deliberately --tok-block-comment IN A SCHEME, because that
+    // is the one cell in the one place no other assertion can reach: no bundled
+    // grammar emits `block-comment` (there is no prism-diff component and the
+    // CSP forbids the autoloader fetching one), section 9's injected-class
+    // probe runs against the DEFAULTS, and 10c/10d never see a token the
+    // census document does not render. So a broken reference here is invisible
+    // to all 143 other assertions - which is precisely why the resolution check
+    // had to exist, and why proving it required finding a cell with no
+    // collateral rather than breaking something conspicuous.
+    // Note it is a TYPO, not a deletion: deleting the line is the easy case
+    // 10b's completeness half already catches. Referencing a name that is one
+    // character off is the likelier accident and the silent one.
+    what: "point clarity's block-comment cell at a variable that does not exist",
+    file: CSS,
+    from: "  --syn-entity-bg: #ddf4ff;\n\n  --tok-block-comment: var(--syn-comment);",
+    to: "  --syn-entity-bg: #ddf4ff;\n\n  --tok-block-comment: var(--syn-commnet);",
+    suite: "test:theme",
+    expect: [
+      /clarity: every variable its mode's base declares resolves to a real value/,
+    ],
+  },
+  {
+    id: "R305",
+    // THE DIMMING A SCHEME CANNOT REACH. `opacity` composites a glyph towards
+    // its own background, so it lowers contrast whatever colour is chosen -
+    // and with the value inlined, a scheme has no way to compensate. Measured
+    // with it inlined: parchment 2.85 -> 2.70, abyss 4.47 -> 4.21, ember
+    // 4.47 -> 4.40, i.e. three cells that were ALREADY below AA in their
+    // mode's default pushed further below it by the scheme.
+    // This is the revert that gives the fourth 10d bar something to bite on,
+    // and the bar exists because the other three structurally cannot see this:
+    // the undimmed bar skips it (o < 0.999), the dimmed-choice bar reads the
+    // pre-dimming pair and passes, and the provenance bar excuses any cell
+    // whose default is already sub-AA - which this one is, in every mode.
+    what: "inline the submenu chevron's dimming again, so no scheme can lift it",
+    file: CSS,
+    from: "  font-size: 16px;\n  opacity: var(--submenu-arrow-opacity);",
+    to: "  font-size: 16px;\n  opacity: 0.5;",
+    suite: "test:theme",
+    expect: [/no element that was ALREADY below AA in the default is made worse/],
+  },
+  {
+    id: "R306",
+    // THE DEFECT 10g WAS BUILT FOR, and it is a live one this work introduced
+    // the fix for: .search-btn:hover was the one rule in the stylesheet that
+    // painted the accent without claiming its own ink. Reverting it is
+    // invisible in BOTH frozen defaults - --panel-fg and --on-accent-fg are
+    // each #ffffff there - so only a scheme with a light accent exposes it.
+    // It is deliberately proven on two axes at once: the CAUSE assertion names
+    // the missing declaration in every state, and the absolute bar measures the
+    // consequence where the two tokens actually diverge. The ink here is an
+    // <svg> stroke, not text, which is why the probe scores icons at all -
+    // a text-only sweep would report this rule as having nothing to measure.
+    what: "let .search-btn:hover paint the accent while inheriting the panel's ink",
+    file: CSS,
+    from:
+      "     --on-accent-fg is declared only in :root and the four scheme blocks. */\n" +
+      "  color: var(--on-accent-fg);",
+    to: "     --on-accent-fg is declared only in :root and the four scheme blocks. */",
+    suite: "test:theme",
+    expect: [
+      /every hover rule that repaints a neutral element with a saturated fill sets its own ink/,
+      /every hover cell it paints at full opacity meets its WCAG minimum/,
+      /no hover cell that was already below its minimum in the default is made worse/,
+    ],
+  },
+  {
+    id: "R307",
+    // THE GUARD ON THE GUARD. Every contrast bar in 10g is RELATIVE to a
+    // default measured in the same run, so a change that moves a default moves
+    // the yardstick with it and the whole section reports a clean sweep. This
+    // is the assertion that stops that, and this revert is the exact mistake it
+    // was written after: declaring the token on :root instead of body.
+    // A custom property whose value contains var() is substituted using the
+    // properties of the element the DECLARATION sits on. The light palette
+    // lives on :root but the dark palette lives on body.dark-mode, so a :root
+    // declaration silently freezes this token to the LIGHT accent - repainting
+    // the DARK default's hover ink from #3bbfcc to #279EA7. Measured: with the
+    // token on :root the suite passed 168/168 while the dark default was
+    // visibly wrong, which is precisely why the comparison against HEAD exists.
+    what: "declare --welcome-readme-ink-hover on :root, freezing it to the light accent",
+    file: CSS,
+    from: "body {\n  --welcome-readme-ink-hover: var(--welcome-accent);\n}",
+    to: ":root {\n  --welcome-readme-ink-hover: var(--welcome-accent);\n}",
+    suite: "test:theme",
+    // Two ember relative bars fail alongside it, but they are NOT the proof and
+    // are deliberately not listed: they bite only because ember's card
+    // background happens to sit where the frozen light ink drops under 4.5,
+    // i.e. by luck of a background this revert never touched. A scheme whose
+    // card was a shade darker would move the same defect past both of them. The
+    // HEAD comparison sees it unconditionally, which is the whole argument for
+    // having it beside the relative bars rather than trusting them.
+    expect: [/neither frozen default has changed a single state colour since HEAD/],
+  },
+  // R308-R311 PIN THE 10g COLLECTOR'S OWN PARSING. Three of the four
+  // hardenings are INERT against today's stylesheet - the :focus-within strip,
+  // the non-matching-@media skip and the !important lift all moved `collected`
+  // and `matched` by zero - so they are exercised against a synthetic
+  // stylesheet injected into the real document and collected by the real walk.
+  // The comma split is the exception and IS live: src/styles.css carries two
+  // multi-part state rules (.editor-splitter:hover, .editor-splitter.dragging
+  // and .mermaid-tpl-btn:hover, .mermaid-tpl-btn.active), whose non-state parts
+  // were previously stripped into the bare selector and replayed as if they
+  // were hover subjects. None of these four reverts touches product code, so
+  // none can move a measured colour.
+  {
+    id: "R308",
+    // Two collateral failures are expected and deliberately NOT listed: with
+    // the filter gone, the two real non-state parts above have no element to
+    // match and land in `unmatched`. They are a fact about the product's CSS
+    // rather than about this guard, so pinning them here would make the revert
+    // report WRONG-GUARD the day either rule is rewritten.
+    what: "collect every part of a selector list, not only the parts carrying a state",
+    file: THEME_TEST,
+    from: "if (t && STATE.test(t)) collected.push({ sel: t, decls: decls });",
+    to: "if (t) collected.push({ sel: t, decls: decls });",
+    suite: "test:theme",
+    expect: [
+      /self-check: a selector list contributes only the parts that carry a state/,
+    ],
+  },
+  {
+    id: "R309",
+    // THE DETECTION IS NOT THE LOAD-BEARING HALF, and finding that out cost a
+    // VACUOUS verdict: \b sits happily between "focus" and the "-" of
+    // "focus-within", so the shorter alternation still TESTS true and the rule
+    // is still collected. What breaks is the STRIP - ":focus-within" becomes
+    // "-within", so the bare selector is ".__sc-c-within", a perfectly valid
+    // selector that matches nothing. The rule lands in `unmatched` and a real
+    // hover surface leaves the subject set without anything failing.
+    // The product declares no :focus-within today (measured: zero occurrences
+    // in src/styles.css), which is exactly why this is proven against the
+    // synthetic sheet rather than left as an unexercised contract.
+    what: "drop focus-within from the state-stripping alternation",
+    file: THEME_TEST,
+    from: "const STATE_G = /:(hover|focus-within|focus-visible|focus|active)\\\\b/g;",
+    to: "const STATE_G = /:(hover|focus-visible|focus|active)\\\\b/g;",
+    suite: "test:theme",
+    expect: [
+      /self-check: :focus-within is collected and strips to a valid bare selector/,
+    ],
+  },
+  {
+    id: "R310",
+    what: "descend into every grouping rule, including an @media that does not apply",
+    file: THEME_TEST,
+    from: "if (rule.cssRules && rule.cssRules.length && groupApplies(rule)) walk(rule.cssRules);",
+    to: "if (rule.cssRules && rule.cssRules.length) walk(rule.cssRules);",
+    suite: "test:theme",
+    expect: [
+      /self-check: a rule inside a non-matching @media contributes nothing/,
+    ],
+  },
+  {
+    id: "R311",
+    // setProperty REJECTS a value containing !important, so the declaration
+    // silently does nothing - the fill-dropping failure that produced a
+    // fabricated 1.23:1 the last time it happened, in a different disguise.
+    what: "pass a value carrying !important straight to setProperty",
+    file: THEME_TEST,
+    from:
+      "el.style.setProperty(d[0], d[1].replace(/\\\\s*!\\\\s*important\\\\s*$/i, ''), 'important');",
+    to: "el.style.setProperty(d[0], d[1], 'important');",
+    suite: "test:theme",
+    expect: [
+      /self-check: a value carrying !important still lands on the probe element/,
+    ],
+  },
+  // R312-R316 PIN SECTION 10h - the glyph-painting pseudo-elements that every
+  // other contrast assertion in this suite is structurally blind to. 10d sweeps
+  // querySelectorAll('*'), whose subjects are ELEMENTS, and 10g deliberately
+  // drops any selector containing '::' because a pseudo-element cannot be
+  // queried and therefore cannot be replayed onto. Two of these reverts are
+  // product regressions and three pin the instrument, which is the split that
+  // matters: an instrument that quietly stops measuring reports a clean sweep.
+  {
+    id: "R312",
+    // THE EXACT REGRESSION THE --drop-overlay-fg TOKEN WAS ADDED TO FIX, and
+    // no other section of this suite can see it. The drop label is the accent
+    // printed on an 8% tint OF THAT SAME ACCENT, so the surface moves towards
+    // the ink instead of away from it - the third instance of that shape in
+    // this item, after --welcome-readme-ink-hover and --danger-bg. Measured at
+    // 4.37:1 with the tint composited. Deliberately NOT a relative failure:
+    // both frozen defaults are sub-AA here too, so the relative bars pass and
+    // only the ABSOLUTE one bites, which is the whole argument for keeping an
+    // absolute bar beside them.
+    what: "point clarity's drop-overlay ink back at its bare accent",
+    file: CSS,
+    from: "  --drop-overlay-fg: #0550ae;",
+    to: "  --drop-overlay-fg: var(--primary-color);",
+    suite: "test:theme",
+    expect: [
+      /clarity: every pseudo glyph it paints at full opacity meets WCAG AA \(4\.5:1\)/,
+    ],
+  },
+  {
+    id: "R313",
+    // The other half of the same fix, and a different accident: R312 is a
+    // scheme forgetting to override the token, this is the RULE forgetting to
+    // consume it. Both schemes' overrides go dead at once while remaining in
+    // the stylesheet, looking for all the world like they are doing their job.
+    // The dashed border's var(--primary-color) is left alone on purpose - it is
+    // a non-text boundary under 1.4.11 and is not what either measurement moved.
+    what: "read the drop label's ink straight from the accent, ignoring the token",
+    file: CSS,
+    from: "  color: var(--drop-overlay-fg);",
+    to: "  color: var(--primary-color);",
+    suite: "test:theme",
+    expect: [
+      /clarity: every pseudo glyph it paints at full opacity meets WCAG AA \(4\.5:1\)/,
+      /parchment: every pseudo glyph it paints at full opacity meets WCAG AA \(4\.5:1\)/,
+    ],
+  },
+  {
+    id: "R314",
+    // body.drop-active::after is the ONE glyph surface no resting DOM contains,
+    // so the probe has to build it. Without the activation it simply produces
+    // no cell, and the accent-on-its-own-tint pairing - the pairing that found
+    // both scheme defects above - leaves the subject set with every value
+    // assertion still green. That is the R295 failure exactly, one layer down:
+    // an assertion that walks the live DOM is only as wide as the DOM the
+    // suite happens to have built by then.
+    what: "stop putting the body into the drag-drop state before the pseudo sweep",
+    file: THEME_TEST,
+    from: "        document.body.classList.add('drop-active');",
+    to: "        void 0;",
+    suite: "test:theme",
+    // The four per-scheme equality guards fail alongside these three and are
+    // deliberately not listed: they report the SAME uncovered rule from the
+    // scheme side, so pinning them here would say nothing the coverage
+    // assertion does not already say and would rot the day a scheme is added.
+    expect: [
+      /the drag-drop overlay label was really put into the state the reader sees/,
+      /the overlay label was measured against its own tint, not the bare page beneath it/,
+      /every glyph-painting rule in the stylesheet reached a measured element/,
+    ],
+  },
+  {
+    id: "R315",
+    // THE COVERAGE HALF, PROVEN FROM THE ONLY DIRECTION THAT CAN PROVE IT.
+    // 10h builds its subject set twice, from two independent ends: the
+    // measurement sweeps the live DOM, the coverage check sweeps the
+    // stylesheet. This revert breaks neither the rules nor the probe - it
+    // removes the DOCUMENT one rule needs in order to have a subject, which is
+    // how three parts of the six-part heading-arrow selector list were sitting
+    // outside every contrast assertion when 10h was first run. Demoting the
+    // single h4 is enough and is deliberately the smallest form of the
+    // accident: a fixture edit that drops one heading level is far likelier
+    // than one that drops three. Nothing else in the suite notices - no token
+    // moves and no colour changes - and the per-scheme equality guard compares
+    // a scheme against a default measured on the same shrunken document, so it
+    // can only ever repeat the coverage finding, never add to it.
+    what: "demote h4 in the census fixture, leaving one heading-arrow rule with no subject",
+    file: THEME_FIXTURE,
+    from: "#### Level four",
+    to: "Level four",
+    suite: "test:theme",
+    expect: [/every glyph-painting rule in the stylesheet reached a measured element/],
+  },
+  {
+    id: "R316",
+    // THE VACUITY FLOOR UNDER THE EXEMPTION. Inherited-ink cells are excused
+    // from the two RELATIVE bars, because the heading arrow declares no colour
+    // of its own and its 0.4 opacity is frozen with the defaults, so its
+    // rendered ratio is ~2.2 whatever a scheme does. That exemption is only
+    // safe while it stays a minority: if the classifier ever stops
+    // discriminating, every cell becomes exempt and both relative bars iterate
+    // an empty list while reporting a clean sweep. This is that failure, forced.
+    // It bites on BOTH halves of the exemption's guard, which is the design
+    // working: the population floor empties, and the drop-overlay label - whose
+    // host paints no text of its own, so nothing else scores its ink - is
+    // caught by the structural half that says an exempted cell must sit on an
+    // element 10d already holds to 4.5.
+    what: "classify every pseudo glyph as inheriting its ink, emptying the relative bars",
+    file: THEME_TEST,
+    from: "          const ownInk = cs.color !== hostFg;",
+    to: "          const ownInk = false;",
+    suite: "test:theme",
+    expect: [
+      /light default: every pseudo glyph that inherits its ink sits on an element 10d already scores/,
+      /light default: at least one pseudo glyph chooses its own ink, so the relative bars have a population/,
+      /dark default: every pseudo glyph that inherits its ink sits on an element 10d already scores/,
+      /dark default: at least one pseudo glyph chooses its own ink, so the relative bars have a population/,
+    ],
+  },
+  {
+    id: "R317",
+    // THE PARK IS THE ONLY THING THAT KEEPS A SCHEME OFF PAPER, and this is the
+    // half of it that carries the scheme. The print stylesheet neutralises
+    // `body` and `#viewer` unconditionally and the rest of the page only when
+    // `body.dark-mode` is present (custom-styles.css:355-412), so a LIGHT
+    // scheme printed without this call keeps its own code box and every one of
+    // its syntax colours - and nothing on screen ever shows it, because the
+    // defect exists only under `@media print`.
+    // It fails the CAUSE and the CONSEQUENCE separately, which is why 10i names
+    // them as two assertions: the residue check reports that data-theme is
+    // still on the body, the invariance check reports which surfaces printed
+    // differently because of it.
+    what: "stop parking the scheme before an export, so a scheme is printed onto the page",
+    file: RENDERER,
+    from: "  beginExportThemeHold();\n  parkExportScheme();\n",
+    to: "  beginExportThemeHold();\n",
+    suite: "test:theme",
+    expect: [
+      /10i: the export preparation leaves no scheme or dark-mode residue/,
+      /10i: every theme state prints each measured surface exactly as the shipped light default does/,
+    ],
+    mustPass: [
+      /10i: the print stylesheet really was in effect for every printed measurement/,
+      /10i: the export preparation completed through its own pdf-export-ready signal/,
+      /10i: the print stylesheet alone does not neutralise a scheme/,
+    ],
+  },
+  {
+    id: "R318",
+    // THE OTHER HALF, AND THE ONE THAT PRINTS UNREADABLE CODE. Removing the
+    // dark-class strip leaves `body.dark-mode` in place under print, which
+    // turns ON the scoped neutralisation - headings, prose, table cells and the
+    // code box are all forced light - while leaving every `.token.*` colour
+    // untouched, because no @media print rule in either stylesheet mentions
+    // one. The result is a #f5f5f5 code box painted with colours chosen for a
+    // near-black one: measured at 2.05:1 (abyss keyword), 2.14 (default dark)
+    // and 2.38 (ember). Deliberately kept distinct from R317 - that one leaks
+    // the SCHEME, this one leaks the MODE, and the two reach paper by
+    // different rules.
+    what: "stop forcing light mode before an export, so dark tokens print on a forced-light code box",
+    file: RENDERER,
+    from: "  parkExportScheme();\n  await setExportTheme(false);\n",
+    to: "  parkExportScheme();\n",
+    suite: "test:theme",
+    expect: [
+      /10i: the export preparation leaves no scheme or dark-mode residue/,
+      /10i: every theme state prints each measured surface exactly as the shipped light default does/,
+    ],
+    mustPass: [
+      /10i: the print stylesheet really was in effect for every printed measurement/,
+      /10i: the export preparation completed through its own pdf-export-ready signal/,
+    ],
+  },
+  {
+    id: "R319",
+    // THE MERMAID SCOPE BOUNDARY, BROKEN THE WAY IT WOULD ACTUALLY BE BROKEN.
+    // custom-theme.js:69-74 records that mermaid is binary - two fixed palettes
+    // chosen by a boolean - and the whole "a same-mode scheme switch needs no
+    // diagram re-theme" property rests on it. The tempting change is exactly
+    // this one: make diagrams pick up the scheme's accent. It is a colour
+    // override rather than a bogus `theme:` name on purpose, so mermaid stays
+    // valid and the revert measures the boundary rather than provoking an
+    // unrelated crash.
+    what: "make the mermaid palette depend on the active scheme",
+    file: MERMAID_CFG,
+    from: "    themeVariables: isDark ? MERMAID_DARK_THEME : MERMAID_LIGHT_THEME,",
+    to: "    themeVariables: Object.assign({}, isDark ? MERMAID_DARK_THEME : MERMAID_LIGHT_THEME, (typeof document !== 'undefined' && document.body && document.body.getAttribute('data-theme')) ? { primaryColor: '#123456' } : {}),",
+    suite: "test:theme",
+    expect: [/10i: mermaid's configuration is decided by the mode alone, never by the scheme/],
+    mustPass: [/10i: mermaid really does distinguish the two modes/],
+  },
+  {
+    id: "R320",
+    // THE POPUP SCOPE BOUNDARY. A popup is a separate BrowserWindow whose CSS
+    // is built in the MAIN process from literal hexes chosen by an isDarkMode
+    // boolean, so the renderer - which owns none of those windows - cannot
+    // observe the boundary at all and the assertion is necessarily made at
+    // source level. This is the first step of forwarding a scheme across it,
+    // and it is deliberately INERT: nothing consumes the new binding, so no
+    // other assertion in any suite can notice. That is the point - a boundary
+    // assertion has to fail on the crossing itself, not on its consequences.
+    what: "forward the active scheme into the mermaid popup builder",
+    file: MAIN,
+    from: "  const { svgContent, isDarkMode } = data;\n",
+    to: "  const { svgContent, isDarkMode, dataTheme } = data;\n  const schemeAttr = dataTheme ? ' data-theme=\"' + dataTheme + '\"' : '';\n",
+    suite: "test:theme",
+    expect: [
+      /10i: the main process, which owns every popup window, knows nothing about colour schemes/,
+    ],
+    mustPass: [/10i: every popup surface exists and is themed by a boolean/],
+  },
+  {
+    id: "R321",
+    // THE INSTRUMENT PIN, and 10i is worthless without it. The export park
+    // makes all six states identical whether or not print media is in effect,
+    // so a silently-failed Emulation.setEmulatedMedia leaves the invariance
+    // assertion GREEN while measuring the screen cascade - a whole section
+    // reporting on a medium it never entered. This forces that state and
+    // requires the positive control to catch it on both of its independent
+    // oracles (the engine's own matchMedia, and .header being hidden, which
+    // only the print block does).
+    // Note what still passes: the invariance assertion, the residue check and
+    // the raw control all survive, because on screen the park is just as
+    // effective and the six states differ just as clearly. That is exactly the
+    // false green this control exists to prevent.
+    what: "never enter print emulation, so 10i measures the screen cascade instead",
+    file: THEME_TEST,
+    from: '        media: "print",',
+    to: '        media: "",',
+    suite: "test:theme",
+    expect: [
+      /10i: the print stylesheet really was in effect for every printed measurement/,
+    ],
+    mustPass: [
+      /10i: every theme state prints each measured surface exactly as the shipped light default does/,
+      /10i: the print stylesheet alone does not neutralise a scheme/,
+    ],
+  },
+  {
+    id: "R322",
+    // THE ROW THAT LOOKS PERFECT AND DOES NOTHING. Every assertion in this file
+    // outside 10j reaches the scheme layer through setScheme() directly, so
+    // until 10j existed the entire menu could have been unwired and the suite
+    // would have reported a flawless theme system. This is that state, and it
+    // is deliberately the least visible form of it: the row still highlights,
+    // still dismisses the menu, and still ticks - because markActive() is fed
+    // by storage, which nothing has changed - so only an assertion that reads
+    // the DOCUMENT and the STORE after a real click can see it.
+    what: "unwire the scheme rows, leaving a menu that looks alive and changes nothing",
+    file: THEME_JS,
+    from: "          setScheme(s.id);\n",
+    to: "",
+    suite: "test:theme",
+    expect: [
+      /10j: clicking a scheme row applies that scheme, and switches mode with it/,
+      /10j: the choice is stored under its own mode's key/,
+    ],
+    mustPass: [
+      /10j: every scheme row was reached and clicked as a mouse would reach it/,
+      /10j: choosing a scheme dismisses the menu it was chosen from/,
+    ],
+  },
+  {
+    id: "R323",
+    // THE NATURAL SIMPLIFICATION THE CODE COMMENT WARNS ABOUT, MADE REAL.
+    // markActive() ticks a scheme row when it is the stored choice for ITS OWN
+    // mode, so both groups carry a tick at once - which is what lets a reader
+    // on "Follow Desktop" see what the app will pick at either end of the day.
+    // Restricting the tick to the ACTIVE mode's group reads like tidying and
+    // leaves the other group looking unset when it is not.
+    // A bare count of ticked rows would NOT catch this, which is why 10j counts
+    // per group and then checks the id against storage.
+    what: "tick only the active mode's scheme group, leaving the other looking unset",
+    file: THEME_JS,
+    from: '      el.classList.toggle("active", !!s && schemeFor(s.mode).id === s.id);',
+    to: '      el.classList.toggle("active", !!s && s.mode === activeMode && schemeFor(s.mode).id === s.id);',
+    suite: "test:theme",
+    expect: [
+      /10j: each scheme group carries exactly one tick, and it names that group's stored choice/,
+      /10j: the ticks still describe the stored choice when the menu is reopened/,
+    ],
+    mustPass: [
+      /10j: exactly one mode row is ticked, and it names the stored themeMode/,
+      /10j: clicking a scheme row applies that scheme, and switches mode with it/,
+    ],
+  },
+  {
+    id: "R324",
+    // A MENU THAT WILL NOT GO AWAY. The mode rows and the scheme rows carry
+    // their own copies of the dismissal, so this anchors on the scheme row's
+    // pair specifically - the mode rows' copy stays, which is what keeps the
+    // failure narrow and is also why the two copies are worth pinning at all.
+    // The deferred document.body.click() still closes the hamburger and the
+    // View flyout, so the panel left standing is the theme submenu alone: a
+    // floating list with nothing behind it, and exactly the kind of half-state
+    // a class-only test reports as success.
+    what: "leave the theme submenu open after a scheme is chosen",
+    file: THEME_JS,
+    from: '          setScheme(s.id);\n          item.classList.remove("theme-open");\n',
+    to: "          setScheme(s.id);\n",
+    suite: "test:theme",
+    expect: [/10j: choosing a scheme dismisses the menu it was chosen from/],
+    mustPass: [
+      /10j: clicking a scheme row applies that scheme, and switches mode with it/,
+      /10j: the choice is stored under its own mode's key/,
+    ],
+  },
+  {
+    id: "R325",
+    // THE SINGLE RULE EVERY ROW DEPENDS ON. custom-theme.js reveals the panel
+    // by adding .theme-open and nothing else; this declaration is what that
+    // class means. Losing it - a stylesheet tidy that sees two adjacent
+    // !important display rules and keeps one - leaves the JS reporting a fully
+    // open menu while the reader sees nothing.
+    // DELIBERATELY BROAD, and the breadth is the finding: with the panel
+    // hidden, every row is zero-sized, so no click can be made and the whole of
+    // 10j's behavioural half loses its subject. An assertion set that stayed
+    // green here would be measuring classes rather than a usable menu, which is
+    // precisely the failure the elementFromPoint sweep was written to prevent.
+    what: "stop .theme-open revealing the submenu, so the rows exist but cannot be clicked",
+    file: CUSTOM_CSS,
+    from: "#customThemeMenuItem.theme-open > #customThemeSubmenu {\n  display: block !important;\n}",
+    to: "#customThemeMenuItem.theme-open > #customThemeSubmenu {\n  display: none !important;\n}",
+    suite: "test:theme",
+    expect: [
+      /10j: every scheme in the registry has a row the mouse can actually land on/,
+      /10j: every scheme row was reached and clicked as a mouse would reach it/,
+      /10j: clicking a scheme row applies that scheme, and switches mode with it/,
+      /10j: the choice is stored under its own mode's key/,
+      /10j: choosing a scheme dismisses the menu it was chosen from/,
+      /10j: each scheme group carries exactly one tick/,
+      /10j: exactly one mode row is ticked/,
+      /10j: every row is labelled with its registry label/,
+    ],
+    mustPass: [
+      /10j: the Themes submenu opens through the real hamburger -> View -> Theme path/,
+      /10j: no scheme row is reachable while the menu is closed \(positive control\)/,
+    ],
+  },
+  {
+    id: "R326",
+    // THE LABEL IS WHAT THE READER CHOOSES BY. A row wired to the correct id
+    // under the wrong text is invisible to every state assertion in 10j - the
+    // scheme applies, stores and ticks perfectly - and is the one defect a
+    // reader would report immediately. Substituting the id for the label is the
+    // realistic form: both are properties of the same registry entry, one line
+    // apart, and "abyss" reads plausibly enough that a screenshot might not
+    // settle it either.
+    what: "label the scheme rows with their ids instead of their labels",
+    file: THEME_JS,
+    from: "        row.textContent = s.label;",
+    to: "        row.textContent = s.id;",
+    suite: "test:theme",
+    expect: [/10j: every row is labelled with its registry label/],
+    mustPass: [
+      /10j: every scheme in the registry has a row the mouse can actually land on/,
+      /10j: clicking a scheme row applies that scheme, and switches mode with it/,
+    ],
+  },
+  {
+    id: "R327",
+    // THE INSTRUMENT PIN FOR THE CLOSED-MENU CONTROL, and it is an ORDERING
+    // defect rather than a logic one - the class this project has now hit four
+    // times (a wait predicate already true, a guard read after its own cleanup,
+    // an observation built inside the return statement). The control's whole
+    // value is that the identical sweep finds nothing before the menu is
+    // opened; sampling it one line later measures an OPEN menu and reports a
+    // perfect two-sided probe while proving only that the sweep is consistent
+    // with itself.
+    // Nothing else moves: the reachability assertion still measures an open
+    // menu and still passes, which is exactly why the control has to be pinned
+    // separately from the thing it guards.
+    what: "sample the closed-menu control after the menu has been opened",
+    file: THEME_TEST,
+    from:
+      "    const menuClosedReach = JSON.parse(await exec(REACH_PROBE));\n" +
+      "    const menuPath = JSON.parse(await exec(MENU_PATH_PROBE));\n",
+    to:
+      "    const menuPath = JSON.parse(await exec(MENU_PATH_PROBE));\n" +
+      "    const menuClosedReach = JSON.parse(await exec(REACH_PROBE));\n",
+    suite: "test:theme",
+    expect: [/10j: no scheme row is reachable while the menu is closed \(positive control\)/],
+    mustPass: [
+      /10j: every scheme in the registry has a row the mouse can actually land on/,
+      /10j: the Themes submenu opens through the real hamburger -> View -> Theme path/,
+    ],
+  },
+  {
+    id: "R328",
+    // THE RENDERER HALF of the single stored-mode resolver. Neutralises the
+    // FUNCTION rather than the legacy expression inside it (the R53 anti-rot
+    // pattern): the old body is kept, renamed and unreferenced, so the revert
+    // is a one-line anchor that cannot rot as the branch is reformatted.
+    // This breaks the RULE in the one place it is now written down, so BOTH
+    // files fall back together and still agree with each other. The assertions
+    // that fail are therefore the ones naming the MIGRATION; the one naming
+    // agreement BETWEEN the files keeps passing, and R329 is what pins that.
+    what: "drop the legacy 'darkMode' migration from renderer.js's resolveStoredMode()",
+    file: RENDERER,
+    from: "function resolveStoredMode() {\n",
+    to:
+      "function resolveStoredMode() {\n" +
+      "  return localStorage.getItem('themeMode') || 'desktop';\n" +
+      "}\n" +
+      "function __foliaUnusedLegacyResolveStoredMode() {\n",
+    suite: "test:theme",
+    expect: [
+      /10k: the overlay's stored-mode helper honours the legacy darkMode key/,
+      /10k: restoreExportScheme\(\) applies the scheme of the migrated mode/,
+      /10k: setScheme\(\) decides Follow Desktop from the migrated mode/,
+    ],
+    mustPass: [
+      /10k: positive control: the pre-unification raw read really does disagree here/,
+      /10k: renderer.js exports resolveStoredMode for the overlay to consume/,
+      /10k: the overlay and renderer.js resolve the SAME stored mode/,
+    ],
+  },
+  {
+    id: "R329",
+    // THE OVERLAY HALF, and the split between this and R328 is the whole
+    // design. R328 breaks the RULE in the one place it is written down, so
+    // both files fall back together and still agree with each other. This one
+    // breaks only custom-theme.js's consumption of it - the exact shape the
+    // code had before unification, where the scheme sites read the raw key
+    // while renderer.js honoured the legacy one - so the two files DISAGREE.
+    // Consequently the "resolve the SAME stored mode" assertion fails here and
+    // only here, and restoreExportScheme() - which lives in renderer.js and
+    // calls the resolver directly - keeps passing. Neither revert alone would
+    // demonstrate that both halves are load-bearing.
+    what: "make custom-theme.js's storedMode() read 'themeMode' raw again",
+    file: THEME_JS,
+    from:
+      '    return typeof window.resolveStoredMode === "function"\n' +
+      "      ? window.resolveStoredMode()\n" +
+      '      : localStorage.getItem(PREF_KEY) || "desktop";\n',
+    to: '    return localStorage.getItem(PREF_KEY) || "desktop";\n',
+    suite: "test:theme",
+    expect: [
+      /10k: the overlay's stored-mode helper honours the legacy darkMode key/,
+      /10k: the overlay and renderer.js resolve the SAME stored mode/,
+      /10k: setScheme\(\) decides Follow Desktop from the migrated mode/,
+    ],
+    mustPass: [
+      /10k: restoreExportScheme\(\) applies the scheme of the migrated mode/,
+      /10k: renderer.js exports resolveStoredMode for the overlay to consume/,
+    ],
+  },
+  {
+    id: "R330",
+    // THE HEX SPELLING, which is the one a human would actually type and the
+    // one the needle list deliberately does not contain. Chromium canonicalises
+    // a colour value on its way into the CSSOM, so this reaches the sweep as
+    // `rgb(39, 158, 167)` - that canonicalisation is the whole mechanism the
+    // widened needle set relies on, and this revert is what proves it end to
+    // end on a REAL rule rather than only on 10f's planted self-check.
+    // Before the widening the sweep carried only the three `rgba(` prefixes,
+    // so an accent re-added in either the hex or the opaque rgb() spelling was
+    // invisible to it.
+    // The selector matches nothing in the document ON PURPOSE: the sweep is
+    // over DECLARATIONS, not over painted pixels, so a non-matching rule is a
+    // legitimate subject and it isolates the literal assertion from every
+    // contrast, stranded-accent and fidelity assertion that would otherwise
+    // fire as collateral.
+    what: "re-add a frozen accent as a hex literal on an ordinary (non-print) rule",
+    file: CUSTOM_CSS,
+    from: "/* ============================================\n   CUSTOM: Compact Header\n",
+    to:
+      "body.dark-mode .folia-revert-r330-probe {\n" +
+      "  box-shadow: 0 2px 8px #279ea7;\n" +
+      "}\n\n" +
+      "/* ============================================\n   CUSTOM: Compact Header\n",
+    suite: "test:theme",
+    expect: [/no rule paints a frozen accent literal outside a custom-property declaration/],
+  },
+  {
+    id: "R331",
+    // THE EXCUSAL MUST BE GATED ON CONTEXT, NOT ONLY ON NAME. The two excused
+    // literals are legitimate solely because they sit inside `@media print`,
+    // where 10i proves the export park has already removed `data-theme` and
+    // the page is by contract the shipped light default. An excusal keyed on
+    // selector+property ALONE would pardon the same declaration anywhere - so
+    // this plants a duplicate of an excused rule under a different at-rule and
+    // requires the context assertion to notice.
+    // The media query is one that can never match, so the duplicate paints
+    // nothing and the revert stays narrow; the CSSOM exposes a non-matching
+    // media rule regardless, which is exactly why the sweep recurses into
+    // every group rather than only into the ones in effect.
+    what: "move a copy of an excused print literal into a non-print at-rule",
+    file: CUSTOM_CSS,
+    from: "/* ============================================\n   CUSTOM: Compact Header\n",
+    to:
+      "@media (min-width: 99999px) {\n" +
+      "  body.dark-mode #viewer blockquote {\n" +
+      "    border-left-color: #279ea7;\n" +
+      "  }\n" +
+      "}\n\n" +
+      "/* ============================================\n   CUSTOM: Compact Header\n",
+    suite: "test:theme",
+    expect: [/10f: every excused accent literal is in an at-rule that names print and does not apply on screen/],
+  },
+  {
+    id: "R332",
+    // A HEX INSIDE A var() FALLBACK, which is the one spelling that survives
+    // into the CSSOM completely unchanged. Chromium canonicalises a colour
+    // value on its way in - #279ea7 becomes rgb(39, 158, 167) - but NOT when
+    // the value contains var(), because such a value is stored as an unparsed
+    // token sequence. Measured:
+    //   color: var(--nope, #279ea7)  -> reads back "var(--nope, #279ea7)"
+    //   color: #279EA7               -> reads back "rgb(39, 158, 167)"
+    // So this is the accident R330 structurally cannot pin, and the reason the
+    // needle set carries hex spellings at all. It is not contrived: this
+    // codebase already writes var(--primary-color, #2d9cdb) at
+    // custom-styles.css:456, and the natural fallback for --primary-color is
+    // the frozen accent itself. Written in UPPER case, which also pins the
+    // case-insensitive match - the product spells it #279EA7, the needle list
+    // spells it lower.
+    what: "re-freeze the default accent as a hex var() fallback, which the CSSOM never canonicalises",
+    file: CUSTOM_CSS,
+    from: "/* ============================================\n   CUSTOM: Compact Header\n",
+    to:
+      ".folia-revert-r332-probe {\n" +
+      "  color: var(--folia-unset-r332, #279EA7);\n" +
+      "}\n\n" +
+      "/* ============================================\n   CUSTOM: Compact Header\n",
+    suite: "test:theme",
+    expect: [/no rule paints a frozen accent literal outside a custom-property declaration/],
+  },
+  {
+    id: "R333",
+    // THE EXCUSAL GATE'S SECOND HALF. R331 pins the requirement that the
+    // at-rule NAME print; this pins the requirement that it not APPLY on
+    // screen. Measured in the live window:
+    //   @media print          matches FALSE
+    //   @media screen, print  matches TRUE
+    //   @media not print      matches TRUE
+    // A substring test for the word "print" waves all three through, so an
+    // accent literal parked under `screen, print` would be pardoned while
+    // painting on screen every day. Neither revert alone shows both halves are
+    // load-bearing.
+    what: "park an excused print literal under an at-rule that also applies on screen",
+    file: CUSTOM_CSS,
+    from: "/* ============================================\n   CUSTOM: Compact Header\n",
+    to:
+      "@media screen, print {\n" +
+      "  body.dark-mode #viewer blockquote {\n" +
+      "    border-left-color: #279ea7;\n" +
+      "  }\n" +
+      "}\n\n" +
+      "/* ============================================\n   CUSTOM: Compact Header\n",
+    suite: "test:theme",
+    // FOUR ASSERTIONS, AND THE OTHER THREE ARE NOT NOISE. The excused selector
+    // is a real one, so once its at-rule starts applying on screen the rule
+    // actually paints - and the frozen light accent landing on a dark
+    // blockquote is precisely what the dark golden and 10c's stranded-accent
+    // sweep exist to catch. Three independent instruments agreeing with the
+    // gate is corroboration that the gate is aligned with them.
+    // The gate's INDEPENDENT value - catching a pardoned literal that paints
+    // nothing, and so is invisible to all three - is what R331 shows: its
+    // plant sits under a never-matching at-rule, paints nothing, and fails
+    // this assertion alone.
+    expect: [
+      /10f: every excused accent literal is in an at-rule that names print and does not apply on screen/,
+      /dark: reading surfaces reproduce the golden exactly/,
+      /abyss: no element still paints a DEFAULT accent colour/,
+      /ember: no element still paints a DEFAULT accent colour/,
+    ],
+  },
+  {
+    id: "R334",
+    // AN ACCENT INSIDE @keyframes, which the sweep dropped entirely until the
+    // walk learned about keyText. A CSSKeyframeRule has .style but no
+    // .selectorText, so gating on selectorText discarded it silently - and
+    // measured, this document already has 14 such rules, one of which
+    // (notePulse) animates box-shadow. An accent pulse is a stranded accent
+    // that no assertion in 10c, 10d, 10f or 10g could see: the resting-state
+    // golden cannot reach a mid-animation frame, and the glow collector was
+    // gated on selectorText too.
+    // Nothing references this animation, so it paints nothing and the revert
+    // stays narrow - the sweep is over DECLARATIONS, not over painted pixels.
+    what: "hide a frozen accent inside a @keyframes step, where no selector-gated sweep looks",
+    file: CUSTOM_CSS,
+    from: "/* ============================================\n   CUSTOM: Compact Header\n",
+    to:
+      "@keyframes foliaRevertR334Pulse {\n" +
+      "  50% {\n" +
+      "    box-shadow: 0 0 8px rgba(39, 158, 167, 0.3);\n" +
+      "  }\n" +
+      "}\n\n" +
+      "/* ============================================\n   CUSTOM: Compact Header\n",
+    suite: "test:theme",
+    expect: [/no rule paints a frozen accent literal outside a custom-property declaration/],
+  },
+  {
+    id: "R335",
+    // A SHORTHAND WHOSE VALUE CONTAINS var(), which is invisible to any sweep
+    // that reads the longhand list. Chromium stores such a declaration as a
+    // pending-substitution value and exposes it under the SHORTHAND name only;
+    // every longhand reads back as the empty string. Measured:
+    //   border: 1.5px solid var(--x, rgb(59, 191, 204))
+    //     -> rule.style.length === 17, ALL SEVENTEEN EMPTY, needle never fired
+    // and the old sweep additionally counted those 17 empty strings towards
+    // its own vacuity floor, so hiding a literal this way made the instrument
+    // look BUSIER. styles.css already writes `border: 1.5px solid
+    // var(--welcome-accent)`, so the shape is live. Reading cssText instead is
+    // what closes it, and this is the only revert that pins that choice -
+    // R332's is a longhand and would still be caught by the old loop.
+    what: "hide a frozen accent in a shorthand whose var() makes every longhand read back empty",
+    file: CUSTOM_CSS,
+    from: "/* ============================================\n   CUSTOM: Compact Header\n",
+    to:
+      ".folia-revert-r335-probe {\n" +
+      "  border: 1.5px solid var(--folia-unset-r335, rgb(59, 191, 204));\n" +
+      "}\n\n" +
+      "/* ============================================\n   CUSTOM: Compact Header\n",
+    suite: "test:theme",
+    expect: [/no rule paints a frozen accent literal outside a custom-property declaration/],
+  },
+  {
+    id: "R336",
+    // THE UNPINNED HALF OF THE EXPORT PARK. parkExportScheme()'s call site is
+    // pinned by R317; its partner's was not, because 10e and 10k both call
+    // restoreExportScheme() DIRECTLY and 10i emitted the real
+    // pdf-export-result without asserting anything about the page afterwards -
+    // the next loop iteration re-applied the state before anyone looked. So
+    // deleting this line failed nothing at all.
+    // The regression it leaves is the one renderer.js explicitly argues these
+    // are separate primitives to prevent: "A reader in light mode with a light
+    // scheme applied would never reach it, and the scheme would stay stripped
+    // for the rest of the session."
+    what: "drop the scheme restore from the pdf-export-result handler, stranding the reader's scheme after an export",
+    file: RENDERER,
+    from: "    restoreExportScheme();\n",
+    to: "",
+    suite: "test:theme",
+    expect: [
+      /10i: the export result handler puts the reader's scheme back, so an export does not strip it for the session/,
+    ],
+  },
+  {
+    id: "R337",
+    // CLOBBERING THE OTHER MODE'S STORED CHOICE, which the previous form of
+    // 10j's store assertion could not see. It read the other key only AFTER
+    // the click and accepted any recognised scheme id, so writing the same
+    // value into both keys satisfied it - and the tick check that follows
+    // agrees with the clobbered store, so it passed too. The reader's light
+    // choice was destroyed and the suite stayed green.
+    // Fixed by capturing both keys BEFORE each click and requiring the
+    // untouched one to be byte-identical afterwards.
+    what: "make picking a scheme overwrite the other mode's stored choice as well",
+    file: THEME_JS,
+    from: "    localStorage.setItem(SCHEME_KEYS[scheme.mode], scheme.id);\n",
+    to:
+      "    localStorage.setItem(SCHEME_KEYS[scheme.mode], scheme.id);\n" +
+      "    localStorage.setItem(\n" +
+      '      SCHEME_KEYS[scheme.mode === "dark" ? "light" : "dark"],\n' +
+      "      scheme.id,\n" +
+      "    );\n",
+    suite: "test:theme",
+    // THREE ASSERTIONS, AND ONE OF THEM CORRECTS THE PREDICTION THAT PROMPTED
+    // THIS REVERT. The reasoning offered was that the tick checks would AGREE
+    // with the clobbered store and pass, leaving the store assertion as the
+    // only possible guard. Measured, they fail too - the tick markup is
+    // rendered from the choice made before the clobber, so it goes stale
+    // against the store rather than agreeing with it.
+    // That does not make the store assertion redundant. The ticks catch this
+    // only because the clobber and the re-render disagree; a clobber that also
+    // re-rendered consistently would satisfy all three tick checks and be
+    // visible to the store assertion alone.
+    expect: [
+      /10j: the choice is stored under its own mode's key, leaving the other mode's alone/,
+      /10j: each scheme group carries exactly one tick, and it names that group's stored choice/,
+      /10j: the ticks still describe the stored choice when the menu is reopened/,
     ],
   },
 ];

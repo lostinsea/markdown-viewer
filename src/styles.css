@@ -56,6 +56,99 @@
   --accent-hover: #1f8089;
   --accent-secondary: #6b7c8d;
   --border-color: #d0d0d0;
+
+  /* ── SURFACE VARIABLES ───────────────────────────────────────────────────
+     Chrome and document surfaces that used to be spelled as literal colours in
+     BOTH modes, so no colour scheme could reach them. Measured symptom: under a
+     dark scheme the page went blue-black while the blockquote, the table header
+     and the top bar stayed on the old neutral/teal palette.
+
+     THE VALUES ARE LITERALS ON PURPOSE. A custom property whose value contains
+     var() is substituted on the element where it is DECLARED, so writing
+     `--panel-bg: var(--secondary-color)` here on :root (i.e. on <html>) would
+     resolve against the :root copy of --secondary-color and a scheme's override
+     on <body> would be silently ignored. Literals have no such dependency, so
+     these inherit into <body> and a scheme block overrides them normally. */
+  --surface-raised: #fafafa;
+  --overlay-bg: rgba(255, 255, 255, 0.95);
+  --header-bg: #ffffff;
+  --panel-bg: #1F3244;
+  --panel-fg: #ffffff;
+  --panel-shadow: rgba(0, 0, 0, 0.2);
+  --panel-btn-bg: rgba(255, 255, 255, 0.1);
+  --panel-btn-border: rgba(255, 255, 255, 0.2);
+  --table-header-bg: #1F3244;
+  --table-header-fg: #ffffff;
+  --accent-tint: rgba(39, 158, 167, 0.1);
+  --welcome-accent: #279EA7;
+  --welcome-accent-tint: rgba(39, 158, 167, 0.1);
+  /* The welcome screen has TWO accents, and they are genuinely different: the
+     OUTLINE accent above lightens in dark mode (#279EA7 -> #3bbfcc), while the
+     SOLID fill under the Open File button and the active carousel dot stays
+     #279EA7 in both. Folding the two together would change the dark default,
+     which is exactly the fidelity the golden defends - so they get separate
+     variables and both defaults stay byte-exact. Absent from the dark block
+     for the same reason --table-header-bg is: the value does not differ.
+     The hover is NOT var(--accent-hover): that is #1f8089, two digits off. */
+  --welcome-solid-bg: #279EA7;
+  --welcome-solid-hover: #1f8a92;
+  /* The ink printed ON an accent-filled surface (buttons, ::selection).
+     Every one of those rules used to spell #ffffff, which was recorded as safe
+     on the grounds that "white-on-accent is correct for every accent shipped".
+     MEASURED, and that was false even before schemes existed: white on the
+     light accent is 3.21:1 and on the DARK default accent 2.26:1. Schemes make
+     the case unarguable - a light accent such as Ember's #e0a458 takes white to
+     2.18:1. Defaulting to #ffffff keeps both defaults byte-exact while letting
+     a scheme whose accent is light print dark ink instead, which is what every
+     editor theme with a light accent does. */
+  --on-accent-fg: #ffffff;
+  /* The accent as read INSIDE the search panel, whose background is a dark
+     navy in BOTH default modes - so this is not simply --primary-color, and a
+     scheme that retinted only the accent produced brown-on-brown. */
+  --panel-accent: #279EA7;
+  /* Alert text on an ordinary surface. Literal #e74c3c everywhere until now;
+     a scheme with a warm light surface renders it at 2.96:1. */
+  --danger-fg: #e74c3c;
+  /* The danger SURFACE and the ink printed on it - the editor's Exit button.
+     Kept as the byte-exact default pair, which MEASURES 3.82:1 and so is one
+     of the sub-AA cells the frozen defaults carry and cannot shed. It is
+     tokenised anyway, because a scheme is under no such constraint: with these
+     two literals inlined it was the ONLY sub-4.5 cell left in all four
+     schemes, every one of them inheriting the default's failure rather than
+     choosing it. See test/test-theme.js section 10d. */
+  --danger-bg: #e74c3c;
+  --danger-bg-hover: #c0392b;
+  --on-danger-fg: #ffffff;
+  /* The accent GLOW - the alpha-tinted halo painted behind accent buttons and
+     focus rings. Carried as an rgb TRIPLE rather than as finished colours
+     because the twelve glow rules use six different alphas (.08 .15 .2 .3
+     .35 .45); one triple keeps every alpha at its use site instead of
+     manufacturing six near-duplicate tokens that a scheme author would then
+     have to keep in step with each other.
+
+     MEASURED, and the measurement decides the shape: of those twelve rules
+     exactly ONE (.app-update-btn.primary:hover) had a body.dark-mode override.
+     The other eleven painted the LIGHT teal even in dark mode. So the default
+     glow really is mode-INVARIANT, and this token is deliberately NOT
+     redeclared in the dark block - folding it into the dark accent would be an
+     appearance change to a frozen default, and one NO golden assertion could
+     catch, because every consumer is a :hover/:focus/::after state that
+     getComputedStyle cannot reach. The rule that does vary by mode gets its
+     own token below rather than dragging the other eleven with it. */
+  --accent-glow-rgb: 39, 158, 167;
+  --accent-mode-glow-rgb: 39, 158, 167;
+  /* The danger glow, tokenised for the same reason as --danger-bg above: the
+     default pair is frozen, a scheme's is not. */
+  --danger-glow-rgb: 231, 76, 60;
+  /* The submenu chevron's dimming, tokenised for the same reason again.
+     `opacity` composites a glyph towards its own background, so it lowers
+     contrast no matter what colour is chosen - and unlike a colour, a scheme
+     cannot reach it. MEASURED: at 0.5 the chevron renders 2.85:1 in the light
+     default and 4.47:1 in the dark, and three of the four schemes came out
+     BELOW their own mode's default (parchment 2.70, abyss 4.21, ember 4.40) -
+     cells already under AA being pushed further under, which is the one thing
+     a scheme has no headroom to trade. The default value is the frozen 0.5. */
+  --submenu-arrow-opacity: 0.5;
 }
 
 /* Dark mode variables */
@@ -71,6 +164,30 @@ body.dark-mode {
   --accent-hover: #4FCDD6;
   --accent-secondary: #7a8a9a;
   --border-color: #404040;
+
+  /* Dark counterparts of the surface variables. Every one of these reproduces
+     a colour that was previously hardcoded in a `body.dark-mode .x` rule, so
+     the two defaults are byte-identical to what shipped before - see
+     test/test-theme.js, which compares them against the frozen golden.
+     --table-header-bg is deliberately absent: it is #1F3244 in BOTH modes. */
+  --surface-raised: #2d2d2d;
+  --overlay-bg: rgba(26, 26, 26, 0.95);
+  --header-bg: #2d2d2d;
+  --panel-bg: #2d2d2d;
+  --panel-shadow: rgba(0, 0, 0, 0.4);
+  --panel-btn-border: rgba(255, 255, 255, 0.15);
+  --table-header-fg: #3DBDC6;
+  --accent-tint: rgba(61, 189, 198, 0.15);
+  --welcome-accent: #3bbfcc;
+  --welcome-accent-tint: rgba(59, 191, 204, 0.12);
+  --panel-accent: #3DBDC6;
+  /* The one accent glow the defaults genuinely vary by mode. Its sole consumer
+     used to be a `body.dark-mode .app-update-btn.primary:hover` rule carrying
+     rgba(61, 189, 198, 0.3); that rule existed only to swap this colour, so
+     with the value tokenised here it became byte-identical to the rule it
+     overrode and was removed. --accent-glow-rgb is absent from this block on
+     purpose - see its comment above. */
+  --accent-mode-glow-rgb: 61, 189, 198;
 }
 
 /* ───────────────────────────────────────────────────────────────────────────
@@ -296,47 +413,364 @@ body.dark-mode {
   --code-selection-bg: rgba(61, 189, 198, 0.35);
 }
 
-/* Dark mode specific overrides */
-body.dark-mode .mermaid {
-  background: #2d2d2d;
+/* ───────────────────────────────────────────────────────────────────────────
+   COLOUR SCHEMES
+   ───────────────────────────────────────────────────────────────────────────
+   A scheme is selected with VIEW -> Theme and applied as `data-theme` on
+   <body>. It re-themes the WHOLE application, not only the code box - the
+   eleven chrome variables at the top of this file are consumed ~230 times by
+   the document AND by the tab bar, menus, dialogs and search panel alike, so
+   there is no separation to respect and a scheme that moved only the syntax
+   colours would leave a Solarized document sitting in unrelated chrome.
+
+   POSITION IS LOAD-BEARING. `body[data-theme="x"]` and `body.dark-mode` are
+   both specificity (0,1,1) and both declare on the same element, so SOURCE
+   ORDER alone decides. These blocks must stay after the dark block above.
+   (The chrome variables they also override are declared on `:root`, i.e. on
+   <html>, so those are won by inheritance rather than by the cascade.)
+
+   THE DEFAULTS HAVE NO BLOCK, DELIBERATELY. "Default Light" (Solarized Light)
+   and "Default Dark" (Tomorrow Night) ARE the two blocks above; selecting them
+   removes `data-theme` entirely. Re-declaring their values here would be a
+   second copy of the appearance the golden baseline pins, free to drift from
+   it silently.
+
+   THE CONTRACT, enforced by test:theme rather than by convention. Every scheme
+   block must declare, explicitly:
+     - all 11 chrome variables (:root / body.dark-mode above),
+     - all 6 --code-* variables,
+     - all 10 --syn-* roles,
+     - plus the cells its MODE leaves un-roled, which differ per mode:
+         light: --tok-block-comment, --tok-operator, --tok-namespace,
+                --tok-function-name  (Solarized Light declares no rule for any
+                of them, so the base value is `inherit`);
+         dark:  --tok-inserted, --tok-function-name  (two Tomorrow Night
+                colours that sit outside its nine-role palette and are
+                therefore literals, not role references).
+   Anything omitted does not fall back to something neutral - it falls back to
+   the DEFAULT SCHEME's value, so an omission ships as a Solarized or Tomorrow
+   Night colour embedded in someone else's palette. That is why the assertion
+   is a completeness check and not a spot check.
+
+   The --tok-* mapping itself is inherited from the mode and is intentionally
+   still overridable: a dark scheme that distinguishes keyword from builtin
+   (Nord, Dracula and Gruvbox all do) can say so by re-declaring the cell.
+   ─────────────────────────────────────────────────────────────────────────── */
+
+/* Clarity - a crisp achromatic light scheme in the manner of VS Code Light+ and
+   GitHub's light theme: near-white paper, near-black prose, and hue reserved
+   entirely for code. Colours are Folia's own, chosen for contrast (see
+   test:theme section 10) rather than sampled from either. */
+body[data-theme="clarity"] {
+  --primary-color: #0969da;
+  --secondary-color: #1f2328;
+  --bg-primary: #f6f8fa;
+  --bg-secondary: #ffffff;
+  /* #eaeef2 was GitHub's own canvas-subtle and put the accent at 4.45:1 on the
+     two surfaces that paint accent ink onto this fill (.close-btn:hover and
+     .context-menu-item:hover) - measurably short of AA, and invisible to every
+     resting sweep because both are hover states. Lightened three units to
+     4.57:1; nothing else moves, since every other consumer paints DARK ink on
+     it and a lighter fill can only help there. */
+  --bg-tertiary: #edf1f5;
+  --text-primary: #1f2328;
+  --text-secondary: #59636e;
+  --accent-main: #0969da;
+  --accent-hover: #0550ae;
+  --accent-secondary: #6e7781;
+  --border-color: #d1d9e0;
+
+  --surface-raised: #f6f8fa;
+  --overlay-bg: rgba(255, 255, 255, 0.95);
+  --header-bg: #ffffff;
+  --panel-bg: #1f2328;
+  --panel-fg: #ffffff;
+  --panel-shadow: rgba(31, 35, 40, 0.24);
+  --panel-btn-bg: rgba(255, 255, 255, 0.1);
+  --panel-btn-border: rgba(255, 255, 255, 0.22);
+  --table-header-bg: #1f2328;
+  --table-header-fg: #ffffff;
+  --accent-tint: rgba(9, 105, 218, 0.1);
+  --welcome-accent: #0969da;
+  --welcome-accent-tint: rgba(9, 105, 218, 0.1);
+  --welcome-solid-bg: #0969da;
+  --welcome-solid-hover: #0550ae;
+  /* The accent at 10% over the card leaves 4.25:1 under the resting accent
+     ink - measured with the tint composited. The darker solid-hover shade is
+     already part of this scheme's palette and clears the bar. */
+  --welcome-readme-ink-hover: #0550ae;
+  /* Same shape one surface over: the drop overlay tints the accent at 8% onto
+     the page, and the resting accent measures 4.37:1 against it. The
+     solid-hover shade already in this palette clears 4.5. */
+  --drop-overlay-fg: #0550ae;
+  --on-accent-fg: #ffffff;
+  --panel-accent: #58a6ff;
+  --danger-fg: #cf222e;
+  /* White on the default #e74c3c is 3.82:1. GitHub's own danger red is
+     5.36:1 under the same white ink - measured, not assumed. */
+  --danger-bg: #cf222e;
+  --danger-bg-hover: #a40e19;
+  --on-danger-fg: #ffffff;
+  /* Both accent glows take the scheme's own accent: the split between them
+     exists only to preserve the two DEFAULTS, which disagree with each other
+     about whether the halo follows the mode. A scheme has no such history. */
+  --accent-glow-rgb: 9, 105, 218;
+  --accent-mode-glow-rgb: 9, 105, 218;
+  --danger-glow-rgb: 207, 34, 46;
+  --submenu-arrow-opacity: 0.75;
+
+  --code-bg: #f6f8fa;
+  --code-fg: #1f2328;
+  --code-inline-bg: #eaeef2;
+  --code-inline-fg: #1f2328;
+  --code-pre-code-bg: none;
+  --code-selection-bg: #b6e3ff;
+
+  --syn-comment: #5a6570;
+  --syn-punctuation: #1f2328;
+  --syn-operator: #0550ae;
+  --syn-keyword: #b4162b;
+  --syn-string: #0a3069;
+  --syn-literal: #0550ae;
+  --syn-tag: #0e5827;
+  --syn-function: #6f42c1;
+  --syn-variable: #8a3d00;
+  --syn-entity-bg: #ddf4ff;
+
+  --tok-block-comment: var(--syn-comment);
+  --tok-operator: var(--syn-operator);
+  --tok-namespace: var(--syn-tag);
+  --tok-function-name: var(--syn-function);
 }
 
-body.dark-mode .markdown-body blockquote {
-  background: #2d2d2d;
+/* Parchment - a warm low-glare light scheme for long reading, in the manner of
+   Quiet Light and the paper-toned terminal profiles. Ivory rather than white,
+   so the page carries less luminance than the room. */
+body[data-theme="parchment"] {
+  --primary-color: #9c5420;
+  --secondary-color: #3b352a;
+  --bg-primary: #f4efe4;
+  --bg-secondary: #fbf7ee;
+  /* Same measured correction as clarity's: at #e9e2d2 the accent landed at
+     4.40:1 on .close-btn:hover and .context-menu-item:hover. #ece6d8 is 4.56:1
+     and is three units lighter - below the threshold of a visible change to
+     the paper tone this scheme is built around. */
+  --bg-tertiary: #ece6d8;
+  --text-primary: #3b352a;
+  --text-secondary: #665c4d;
+  --accent-main: #9c5420;
+  --accent-hover: #7d4118;
+  --accent-secondary: #6f6555;
+  --border-color: #d9d0bd;
+
+  --surface-raised: #efe8da;
+  --overlay-bg: rgba(244, 239, 228, 0.95);
+  --header-bg: #fbf7ee;
+  --panel-bg: #3b352a;
+  --panel-fg: #f4efe4;
+  --panel-shadow: rgba(59, 53, 42, 0.28);
+  --panel-btn-bg: rgba(255, 255, 255, 0.12);
+  --panel-btn-border: rgba(255, 255, 255, 0.24);
+  --table-header-bg: #3b352a;
+  --table-header-fg: #f4efe4;
+  --accent-tint: rgba(156, 84, 32, 0.12);
+  --welcome-accent: #9c5420;
+  --welcome-accent-tint: rgba(156, 84, 32, 0.12);
+  --welcome-solid-bg: #9c5420;
+  --welcome-solid-hover: #7d4118;
+  /* Same shape as clarity: 4.22:1 with the 12% tint composited under the
+     resting accent ink, cleared by this scheme's darker solid-hover shade. */
+  --welcome-readme-ink-hover: #7d4118;
+  /* And the drop overlay, at 4.46:1 under the resting accent with its 8% tint
+     composited - the same shade clears it. */
+  --drop-overlay-fg: #7d4118;
+  --on-accent-fg: #ffffff;
+  --panel-accent: #d9a441;
+  --danger-fg: #a4342a;
+  --danger-bg: #a33a2a;
+  --danger-bg-hover: #872e20;
+  --on-danger-fg: #ffffff;
+  --accent-glow-rgb: 156, 84, 32;
+  --accent-mode-glow-rgb: 156, 84, 32;
+  --danger-glow-rgb: 163, 58, 42;
+  --submenu-arrow-opacity: 0.75;
+
+  --code-bg: #efe8da;
+  --code-fg: #3b352a;
+  --code-inline-bg: #e9e2d2;
+  --code-inline-fg: #3b352a;
+  --code-pre-code-bg: none;
+  --code-selection-bg: #ddcfab;
+
+  --syn-comment: #6b614e;
+  --syn-punctuation: #5c5344;
+  /* Darker than the #7a5c3e this started at, and the reason is the ENTITY
+     cell rather than the operator itself: --tok-entity reads from this role
+     and paints on --syn-entity-bg, where #7a5c3e measured 4.33:1. Against the
+     code background the operator was already fine at 5.02:1, so nothing but a
+     measurement of the entity pair could have found this. */
+  --syn-operator: #6f5133;
+  --syn-keyword: #973a2c;
+  --syn-string: #3f6b3f;
+  --syn-literal: #1f5f7d;
+  --syn-tag: #973a2c;
+  --syn-function: #7a5c00;
+  --syn-variable: #5c3f91;
+  --syn-entity-bg: #e3d8bf;
+
+  --tok-block-comment: var(--syn-comment);
+  --tok-operator: var(--syn-operator);
+  --tok-namespace: var(--syn-tag);
+  --tok-function-name: var(--syn-function);
 }
 
-body.dark-mode .loading-screen {
-  background: rgba(26, 26, 26, 0.95);
+/* Abyss - a cool deep-blue dark scheme in the manner of Nord and VS Code
+   Dark+. The page is bluer and darker than Default Dark's neutral charcoal,
+   and the palette is desaturated so no single token shouts. */
+body[data-theme="abyss"] {
+  --primary-color: #7aa2f7;
+  --secondary-color: #d8dee9;
+  --bg-primary: #11151c;
+  --bg-secondary: #171c26;
+  --bg-tertiary: #1e2531;
+  --text-primary: #d8dee9;
+  --text-secondary: #9aa7bd;
+  --accent-main: #7aa2f7;
+  --accent-hover: #9ab8ff;
+  --accent-secondary: #8494ab;
+  --border-color: #2b3444;
+
+  --surface-raised: #1a2029;
+  --overlay-bg: rgba(17, 21, 28, 0.95);
+  --header-bg: #171c26;
+  --panel-bg: #1e2531;
+  --panel-fg: #d8dee9;
+  --panel-shadow: rgba(0, 0, 0, 0.5);
+  --panel-btn-bg: rgba(255, 255, 255, 0.08);
+  --panel-btn-border: rgba(255, 255, 255, 0.16);
+  --table-header-bg: #1e2531;
+  --table-header-fg: #7aa2f7;
+  --accent-tint: rgba(122, 162, 247, 0.16);
+  --welcome-accent: #7aa2f7;
+  --welcome-accent-tint: rgba(122, 162, 247, 0.14);
+  --welcome-solid-bg: #7aa2f7;
+  --welcome-solid-hover: #9ab8ff;
+  /* Dark ink on a LIGHT accent. White would be 2.52:1 here. */
+  --on-accent-fg: #11151c;
+  --panel-accent: #7aa2f7;
+  --danger-fg: #f7768e;
+  /* NOT Nord's own #bf616a: measured at 4.09:1 against white, below the bar.
+     Darkened until it clears it. */
+  --danger-bg: #b04a55;
+  --danger-bg-hover: #963c46;
+  --on-danger-fg: #ffffff;
+  --accent-glow-rgb: 122, 162, 247;
+  --accent-mode-glow-rgb: 122, 162, 247;
+  --danger-glow-rgb: 176, 74, 85;
+  --submenu-arrow-opacity: 0.75;
+
+  --code-bg: #1a2029;
+  --code-fg: #d8dee9;
+  --code-inline-bg: #1e2531;
+  --code-inline-fg: #d8dee9;
+  --code-pre-code-bg: #1a2029;
+  --code-selection-bg: rgba(122, 162, 247, 0.35);
+
+  --syn-comment: #7d8ba3;
+  --syn-punctuation: #c9d3e0;
+  --syn-operator: #8fbcbb;
+  --syn-keyword: #8fb0d9;
+  --syn-string: #a3be8c;
+  --syn-literal: #c39ac0;
+  --syn-tag: #8fb0d9;
+  --syn-function: #88c0d0;
+  --syn-variable: #d08770;
+  --syn-entity-bg: #2b3444;
+
+  --tok-inserted: var(--syn-string);
+  --tok-function-name: var(--syn-function);
 }
 
-body.dark-mode .markdown-body th {
-  background: #1F3244;
-  color: #3DBDC6;
+/* Ember - a warm charcoal dark scheme in the manner of Monokai and the Okaidia
+   terminal palette. Counterpart to Parchment: the same warm cast, inverted. */
+body[data-theme="ember"] {
+  --primary-color: #e0a458;
+  --secondary-color: #eae6dd;
+  --bg-primary: #1c1b18;
+  --bg-secondary: #232220;
+  --bg-tertiary: #2c2a26;
+  --text-primary: #eae6dd;
+  --text-secondary: #aca699;
+  --accent-main: #e0a458;
+  --accent-hover: #eebc7c;
+  --accent-secondary: #948d80;
+  --border-color: #3a3733;
+
+  --surface-raised: #262421;
+  --overlay-bg: rgba(28, 27, 24, 0.95);
+  --header-bg: #232220;
+  --panel-bg: #2c2a26;
+  --panel-fg: #eae6dd;
+  --panel-shadow: rgba(0, 0, 0, 0.5);
+  --panel-btn-bg: rgba(255, 255, 255, 0.08);
+  --panel-btn-border: rgba(255, 255, 255, 0.16);
+  --table-header-bg: #2c2a26;
+  --table-header-fg: #e0a458;
+  --accent-tint: rgba(224, 164, 88, 0.16);
+  --welcome-accent: #e0a458;
+  --welcome-accent-tint: rgba(224, 164, 88, 0.14);
+  --welcome-solid-bg: #e0a458;
+  --welcome-solid-hover: #eebc7c;
+  /* Dark ink on a LIGHT accent. White would be 2.18:1 here. */
+  --on-accent-fg: #1c1b18;
+  --panel-accent: #e0a458;
+  --danger-fg: #f0776a;
+  --danger-bg: #c0392b;
+  --danger-bg-hover: #a12e22;
+  --on-danger-fg: #ffffff;
+  --accent-glow-rgb: 224, 164, 88;
+  --accent-mode-glow-rgb: 224, 164, 88;
+  --danger-glow-rgb: 192, 57, 43;
+  --submenu-arrow-opacity: 0.75;
+
+  --code-bg: #262421;
+  --code-fg: #eae6dd;
+  --code-inline-bg: #2c2a26;
+  --code-inline-fg: #eae6dd;
+  --code-pre-code-bg: #262421;
+  --code-selection-bg: rgba(224, 164, 88, 0.32);
+
+  --syn-comment: #9a9286;
+  --syn-punctuation: #e0dbd0;
+  --syn-operator: #e88aa6;
+  --syn-keyword: #ef7d9f;
+  --syn-string: #e0cd7a;
+  --syn-literal: #bb9af7;
+  --syn-tag: #ef7d9f;
+  --syn-function: #a6d86a;
+  --syn-variable: #f5a35a;
+  --syn-entity-bg: #3a352c;
+
+  --tok-inserted: var(--syn-string);
+  --tok-function-name: var(--syn-function);
 }
 
-body.dark-mode .header {
-  background: #2d2d2d;
-}
-
-body.dark-mode .search-panel {
-  background: #2d2d2d;
-  box-shadow: 0 2px 8px rgba(0, 0, 0, 0.4);
-}
-
-body.dark-mode .search-counter {
-  color: #3DBDC6;
-}
-
-body.dark-mode .search-btn {
-  background: rgba(255, 255, 255, 0.1);
-  border-color: rgba(255, 255, 255, 0.15);
-}
-
-body.dark-mode .search-btn:hover {
-  background: #3DBDC6;
-  border-color: #3DBDC6;
-}
-
+/* Dark mode specific overrides
+ *
+ * This block used to carry eleven rules re-stating colours that the dark
+ * variable block already declares (`.search-counter { color: #3DBDC6 }` is
+ * literally `var(--primary-color)`), plus surfaces that were hardcoded in both
+ * modes. Every one of them was unreachable by a colour scheme. They are now
+ * expressed as surface variables at the top of this file and consumed by the
+ * mode-agnostic rules, so a `body[data-theme]` block retunes them like anything
+ * else. Nothing here changed appearance - the golden in test/test-theme.js
+ * pins the document surfaces and scripts/capture-theme-shots.js the chrome.
+ *
+ * What remains is nothing: every rule that was here is now a variable. The
+ * mermaid DIAGRAM palette is still binary (getMermaidConfig(isDark) picks one
+ * of two fixed 14-key palettes), which is a recorded scope boundary - but the
+ * BOX around the diagram is ordinary chrome and follows --surface-raised like
+ * any other raised surface. */
 
 
 body {
@@ -354,7 +788,7 @@ body {
 }
 
 .header {
-  background: var(--bg-secondary);
+  background: var(--header-bg);
   padding: 12px 20px;
   display: flex;
   justify-content: space-between;
@@ -400,10 +834,10 @@ body {
 
 .btn:hover {
   background: var(--primary-color);
-  color: #ffffff;
+  color: var(--on-accent-fg);
   border-color: var(--primary-color);
   transform: translateY(-1px);
-  box-shadow: 0 2px 8px rgba(39, 158, 167, 0.3);
+  box-shadow: 0 2px 8px rgba(var(--accent-glow-rgb), 0.3);
 }
 
 .btn:active {
@@ -430,7 +864,7 @@ body {
 }
 
 .nav-btn:hover:not(:disabled) {
-  background: rgba(39, 158, 167, 0.1);
+  background: var(--accent-tint);
   color: var(--primary-color);
 }
 
@@ -451,11 +885,6 @@ body {
   margin: 0 4px;
 }
 
-body.dark-mode .nav-btn:hover:not(:disabled) {
-  background: rgba(61, 189, 198, 0.15);
-  color: #3DBDC6;
-}
-
 /* Loading Screen */
 .loading-screen {
   position: fixed;
@@ -463,7 +892,7 @@ body.dark-mode .nav-btn:hover:not(:disabled) {
   left: 0;
   right: 0;
   bottom: 0;
-  background: rgba(255, 255, 255, 0.95);
+  background: var(--overlay-bg);
   display: none;
   justify-content: center;
   align-items: center;
@@ -528,12 +957,31 @@ body.drop-active::after {
   justify-content: center;
   font-size: 22px;
   font-weight: 600;
-  color: var(--primary-color);
-  background: rgba(39, 158, 167, 0.08);
+  color: var(--drop-overlay-fg);
+  background: rgba(var(--accent-glow-rgb), 0.08);
   border: 3px dashed var(--primary-color);
   border-radius: 12px;
   pointer-events: none;
   z-index: 99999;
+}
+
+/* The ink the drop label prints in, tokenised for the same reason
+   --welcome-readme-ink-hover and --danger-bg were: the surface underneath it is
+   the accent tinted onto the page, so the fill moves TOWARDS the ink and a
+   perfectly legible accent stops being legible on it. Measured with the 8% tint
+   composited rather than skipped, clarity landed 4.37:1 and parchment 4.46:1 -
+   both under 1.4.3's 4.5 - while both defaults and both dark schemes cleared
+   it, because a dark tint moves a light accent further away. The default is the
+   accent itself, so both frozen defaults are unchanged to the byte and the rule
+   above merely NAMES the colour it was already inheriting.
+   The dashed BORDER deliberately keeps --primary-color: it is a non-text
+   boundary under 1.4.11, not ink, and is not what either measurement moved.
+   DECLARED ON body, NOT :root, for the reason recorded at
+   --welcome-readme-ink-hover: a custom property holding var() is substituted
+   against the element its DECLARATION sits on, and the dark and scheme palettes
+   live on body. */
+body {
+  --drop-overlay-fg: var(--primary-color);
 }
 
 /* Split-view mode */
@@ -634,14 +1082,14 @@ body.splitter-dragging * {
 }
 
 .unsaved-indicator {
-  color: #e74c3c;
+  color: var(--danger-fg);
   font-size: 12px;
   font-weight: 500;
 }
 
 .editor-save-btn {
   background: var(--primary-color);
-  color: #ffffff;
+  color: var(--on-accent-fg);
   border: none;
   padding: 6px 12px;
   border-radius: 4px;
@@ -657,7 +1105,7 @@ body.splitter-dragging * {
 .editor-save-btn:hover {
   background: var(--accent-hover);
   transform: translateY(-1px);
-  box-shadow: 0 2px 6px rgba(39, 158, 167, 0.3);
+  box-shadow: 0 2px 6px rgba(var(--accent-glow-rgb), 0.3);
 }
 
 .editor-save-btn:active {
@@ -665,8 +1113,8 @@ body.splitter-dragging * {
 }
 
 .editor-exit-btn {
-  background: #e74c3c;
-  color: #ffffff;
+  background: var(--danger-bg);
+  color: var(--on-danger-fg);
   border: none;
   padding: 6px 12px;
   border-radius: 4px;
@@ -680,9 +1128,9 @@ body.splitter-dragging * {
 }
 
 .editor-exit-btn:hover {
-  background: #c0392b;
+  background: var(--danger-bg-hover);
   transform: translateY(-1px);
-  box-shadow: 0 2px 6px rgba(231, 76, 60, 0.3);
+  box-shadow: 0 2px 6px rgba(var(--danger-glow-rgb), 0.3);
 }
 
 .editor-exit-btn:active {
@@ -850,7 +1298,7 @@ body.splitter-dragging * {
   margin: 1em 0;
   color: var(--text-secondary);
   font-style: italic;
-  background: #fafafa;
+  background: var(--surface-raised);
   padding: 16px 20px;
   border-radius: 0 8px 8px 0;
 }
@@ -937,8 +1385,8 @@ body.splitter-dragging * {
 }
 
 .markdown-body th {
-  background: var(--secondary-color);
-  color: #ffffff;
+  background: var(--table-header-bg);
+  color: var(--table-header-fg);
   padding: 12px;
   text-align: left;
   font-weight: 600;
@@ -998,7 +1446,7 @@ body.splitter-dragging * {
 
 /* Mermaid diagrams */
 .mermaid {
-  background: #fafafa;
+  background: var(--surface-raised);
   padding: 20px;
   border-radius: 8px;
   margin: 1em 0;
@@ -1106,7 +1554,7 @@ body.splitter-dragging * {
 }
 
 .welcome-dot.active {
-  background: #279EA7;
+  background: var(--welcome-solid-bg);
   transform: scale(1.35);
 }
 
@@ -1125,29 +1573,29 @@ body.splitter-dragging * {
   align-items: center;
   gap: 10px;
   padding: 13px 32px;
-  background: #279EA7;
-  color: #fff;
+  background: var(--welcome-solid-bg);
+  color: var(--on-accent-fg);
   border: none;
   border-radius: 10px;
   font-size: 15px;
   font-weight: 600;
   cursor: pointer;
   transition: background 0.18s ease, transform 0.12s ease, box-shadow 0.18s ease;
-  box-shadow: 0 3px 12px rgba(39, 158, 167, 0.35);
+  box-shadow: 0 3px 12px rgba(var(--accent-glow-rgb), 0.35);
   letter-spacing: 0.01em;
   width: 100%;
   justify-content: center;
 }
 
 .welcome-open-btn:hover {
-  background: #1f8a92;
-  box-shadow: 0 5px 18px rgba(39, 158, 167, 0.45);
+  background: var(--welcome-solid-hover);
+  box-shadow: 0 5px 18px rgba(var(--accent-glow-rgb), 0.45);
   transform: translateY(-1px);
 }
 
 .welcome-open-btn:active {
   transform: translateY(0);
-  box-shadow: 0 2px 8px rgba(39, 158, 167, 0.3);
+  box-shadow: 0 2px 8px rgba(var(--accent-glow-rgb), 0.3);
 }
 
 .welcome-open-hint {
@@ -1165,8 +1613,8 @@ body.splitter-dragging * {
   gap: 9px;
   padding: 10px 28px;
   background: transparent;
-  color: #279EA7;
-  border: 1.5px solid #279EA7;
+  color: var(--welcome-accent);
+  border: 1.5px solid var(--welcome-accent);
   border-radius: 10px;
   font-size: 14px;
   font-weight: 500;
@@ -1176,22 +1624,45 @@ body.splitter-dragging * {
 }
 
 .welcome-readme-btn:hover {
-  background: rgba(39, 158, 167, 0.1);
+  background: var(--welcome-accent-tint);
+  color: var(--welcome-readme-ink-hover);
   transform: translateY(-1px);
+}
+
+/* The ink the READ ME button prints while hovered. It defaults to the button's
+   resting accent, so both frozen defaults are unchanged to the byte - the hover
+   rule above now merely NAMES the colour it was already inheriting. Schemes get
+   to override it because the hover fill is that same accent at 10-14% over the
+   card: this is the one place in the product where the surface moves TOWARDS
+   the ink rather than away from it. Measured with the tint composited rather
+   than skipped, clarity landed 4.25:1 and parchment 4.22:1, both under 1.4.3's
+   4.5, while the dark schemes cleared it - a dark tint moves a light accent
+   further away.
+   DECLARED ON body, NOT :root, AND THAT IS LOAD-BEARING. A custom property
+   whose value contains var() is substituted using the custom properties of the
+   element the DECLARATION sits on, not the element that consumes it. The light
+   palette lives on :root but the dark palette lives on body.dark-mode and every
+   scheme on body[data-theme], so a :root declaration of this token would freeze
+   it to the LIGHT accent in every mode. That is not theoretical - it was the
+   first version, and it repainted the dark default's hover ink from #3bbfcc to
+   #279EA7 while the suite reported a clean sweep, because the defaults were
+   recorded rather than asserted. Declaring it on body puts it on the same
+   element as every override it needs to see. */
+body {
+  --welcome-readme-ink-hover: var(--welcome-accent);
 }
 
 .welcome-readme-btn:active {
   transform: translateY(0);
 }
 
-.dark-mode .welcome-readme-btn {
-  color: #3bbfcc;
-  border-color: #3bbfcc;
-}
-
-.dark-mode .welcome-readme-btn:hover {
-  background: rgba(59, 191, 204, 0.12);
-}
+/* The welcome screen genuinely has its OWN accent today: #279EA7 in light (the
+   same teal as --primary-color) but #3bbfcc in dark, two hex digits off the
+   app's #3DBDC6. Rather than amend the dark default to match - which would have
+   been a real, if imperceptible, appearance change in a project whose hard
+   constraint is that the two defaults look exactly as they always have - it
+   keeps a variable of its own. Schemes set it to their accent and the near-miss
+   disappears for them; the defaults stay byte-exact. */
 
 /* Version badge — fixed at bottom-left corner of the app window */
 .welcome-version {
@@ -1207,12 +1678,28 @@ body.splitter-dragging * {
   z-index: 5;
 }
 
-/* Dark mode icon stroke override */
-.dark-mode .welcome-slide-icon svg {
-  stroke: #3bbfcc;
+/* Welcome icon tinting.
+ *
+ * The .dark-mode selectors are the ORIGINAL ones, unchanged, so dark default
+ * appearance is byte-exact; only the literal became a variable. The
+ * [data-theme] copies extend the tint to LIGHT schemes, which would otherwise
+ * show a teal icon beside a rust or blue accent, and are widened to any element
+ * because a scheme is a deliberate retint rather than a fidelity case.
+ *
+ * Deliberately NOT widened to `svg *`: the root rule only reaches children that
+ * declare no stroke of their own, and every path in these five icons declares
+ * either stroke="#279EA7" or stroke="none". Widening it would paint the
+ * stroke="none" paths. */
+.dark-mode .welcome-slide-icon svg,
+body[data-theme] .welcome-slide-icon svg {
+  stroke: var(--welcome-accent);
 }
-.dark-mode .welcome-slide-icon svg rect[fill="#279EA7"] {
-  fill: #3bbfcc;
+.dark-mode .welcome-slide-icon svg rect[fill="#279EA7"],
+body[data-theme] .welcome-slide-icon svg [fill="#279EA7"] {
+  fill: var(--welcome-accent);
+}
+body[data-theme] .welcome-slide-icon svg [stroke="#279EA7"] {
+  stroke: var(--welcome-accent);
 }
 
 .demo-mermaid {
@@ -1246,7 +1733,7 @@ body.splitter-dragging * {
 /* Selection styling */
 ::selection {
   background: var(--primary-color);
-  color: #ffffff;
+  color: var(--on-accent-fg);
 }
 
 /* Smooth scrolling */
@@ -1273,12 +1760,12 @@ html {
   top: 0;
   left: 0;
   right: 0;
-  background: var(--secondary-color);
+  background: var(--panel-bg);
   padding: 12px 20px;
   display: flex;
   justify-content: center;
   align-items: center;
-  box-shadow: 0 2px 8px rgba(0, 0, 0, 0.2);
+  box-shadow: 0 2px 8px var(--panel-shadow);
   transform: translateY(-100%);
   transition: transform 0.3s ease;
 }
@@ -1309,11 +1796,18 @@ html {
 
 .search-input:focus {
   border-color: var(--primary-color);
-  box-shadow: 0 0 0 2px rgba(39, 158, 167, 0.2);
+  box-shadow: 0 0 0 2px rgba(var(--accent-glow-rgb), 0.2);
 }
 
 .search-counter {
-  color: var(--primary-color);
+  /* NOT var(--primary-color): this text sits on --panel-bg, which is a DARK
+     navy in light mode, so the accent is being read against a surface from the
+     opposite end of the palette. Measured: the default is 4.09:1, but Clarity
+     fell to 3.04 and Parchment to 2.14 once schemes could reach the panel -
+     a brown accent on a brown panel. --panel-accent is the accent as read
+     INSIDE the panel, and the two defaults declare exactly the values
+     --primary-color resolves to, so neither changes. */
+  color: var(--panel-accent);
   font-size: 13px;
   min-width: 60px;
   text-align: center;
@@ -1321,9 +1815,9 @@ html {
 }
 
 .search-btn {
-  background: rgba(255, 255, 255, 0.1);
-  color: #ffffff;
-  border: 1px solid rgba(255, 255, 255, 0.2);
+  background: var(--panel-btn-bg);
+  color: var(--panel-fg);
+  border: 1px solid var(--panel-btn-border);
   padding: 6px 10px;
   border-radius: 4px;
   cursor: pointer;
@@ -1336,6 +1830,14 @@ html {
 .search-btn:hover {
   background: var(--primary-color);
   border-color: var(--primary-color);
+  /* Ink must follow the BACKGROUND it lands on, not the panel it sits in.
+     This rule paints the accent, but inherited --panel-fg is chosen against
+     --panel-bg, so under a scheme with a light accent the two are near each
+     other: measured 1.86:1 (abyss) and 1.75:1 (ember), worse than the frozen
+     defaults' worst cell anywhere. Both defaults are unaffected byte for byte -
+     --panel-fg and --on-accent-fg are both #ffffff in light and dark, and
+     --on-accent-fg is declared only in :root and the four scheme blocks. */
+  color: var(--on-accent-fg);
 }
 
 .search-btn:disabled {
@@ -1742,7 +2244,7 @@ html {
   bottom: 30px;
   right: 30px;
   background: var(--primary-color);
-  color: #ffffff;
+  color: var(--on-accent-fg);
   padding: 16px 24px;
   border-radius: 8px;
   box-shadow: 0 4px 12px rgba(0, 0, 0, 0.15);
@@ -1866,14 +2368,14 @@ html {
 
 .file-update-btn.reload {
   background: var(--primary-color);
-  color: #ffffff;
+  color: var(--on-accent-fg);
   flex: 1;
 }
 
 .file-update-btn.reload:hover {
   background: var(--accent-hover);
   transform: translateY(-1px);
-  box-shadow: 0 2px 8px rgba(39, 158, 167, 0.3);
+  box-shadow: 0 2px 8px rgba(var(--accent-glow-rgb), 0.3);
 }
 
 .file-update-btn.reload:active {
@@ -1908,7 +2410,7 @@ html {
   top: 8px;
   right: 8px;
   background: var(--primary-color);
-  color: #ffffff;
+  color: var(--on-accent-fg);
   border: none;
   padding: 8px;
   border-radius: 6px;
@@ -1949,7 +2451,7 @@ html {
   top: 8px;
   right: 8px;
   background: var(--primary-color);
-  color: #ffffff;
+  color: var(--on-accent-fg);
   border: none;
   padding: 8px;
   border-radius: 6px;
@@ -1993,7 +2495,7 @@ html {
   top: 8px;
   right: 8px;
   background: var(--primary-color);
-  color: #ffffff;
+  color: var(--on-accent-fg);
   border: none;
   padding: 8px;
   border-radius: 6px;
@@ -2164,7 +2666,7 @@ html {
 
 .app-update-btn.primary {
   background: var(--primary-color);
-  color: #ffffff;
+  color: var(--on-accent-fg);
   flex: 1;
   justify-content: center;
 }
@@ -2172,7 +2674,7 @@ html {
 .app-update-btn.primary:hover {
   background: var(--accent-hover);
   transform: translateY(-1px);
-  box-shadow: 0 4px 12px rgba(39, 158, 167, 0.3);
+  box-shadow: 0 4px 12px rgba(var(--accent-mode-glow-rgb), 0.3);
 }
 
 .app-update-btn.primary:active {
@@ -2195,9 +2697,6 @@ body.dark-mode .app-update-toast {
   box-shadow: 0 8px 24px rgba(0, 0, 0, 0.4);
 }
 
-body.dark-mode .app-update-btn.primary:hover {
-  box-shadow: 0 4px 12px rgba(61, 189, 198, 0.3);
-}
 
 /* Context Menu */
 .context-menu {
@@ -2376,7 +2875,7 @@ body.dark-mode .context-menu {
 
 .note-dialog-input:focus {
   border-color: var(--primary-color);
-  box-shadow: 0 0 0 2px rgba(39, 158, 167, 0.15);
+  box-shadow: 0 0 0 2px rgba(var(--accent-glow-rgb), 0.15);
 }
 
 .note-dialog-textarea {
@@ -2395,7 +2894,7 @@ body.dark-mode .context-menu {
 
 .note-dialog-textarea:focus {
   border-color: var(--primary-color);
-  box-shadow: 0 0 0 2px rgba(39, 158, 167, 0.15);
+  box-shadow: 0 0 0 2px rgba(var(--accent-glow-rgb), 0.15);
 }
 
 .note-dialog-footer {
@@ -2427,13 +2926,13 @@ body.dark-mode .context-menu {
 
 .note-dialog-btn.primary {
   background: var(--primary-color);
-  color: #ffffff;
+  color: var(--on-accent-fg);
 }
 
 .note-dialog-btn.primary:hover {
   background: var(--accent-hover);
   transform: translateY(-1px);
-  box-shadow: 0 2px 8px rgba(39, 158, 167, 0.3);
+  box-shadow: 0 2px 8px rgba(var(--accent-glow-rgb), 0.3);
 }
 
 .note-dialog-btn.secondary {
@@ -2761,7 +3260,7 @@ body.dark-mode .context-menu {
 
 .submenu-arrow {
   font-size: 16px;
-  opacity: 0.5;
+  opacity: var(--submenu-arrow-opacity);
 }
 
 /* Nested submenu */
@@ -2969,7 +3468,7 @@ body.dark-mode .context-menu {
 .mermaid-tpl-btn.active {
   border-color: var(--primary-color);
   background: var(--primary-color);
-  color: #fff;
+  color: var(--on-accent-fg);
 }
 
 .mermaid-template-split {
@@ -3033,7 +3532,7 @@ body.dark-mode .context-menu {
 }
 
 .mermaid-preview-error {
-  color: #e74c3c;
+  color: var(--danger-fg);
 }
 
 .mermaid-template-code {

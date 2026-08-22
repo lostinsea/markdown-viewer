@@ -462,6 +462,39 @@ body.dark-mode .tab-close:hover {
   display: inline-block;
 }
 
+/* Scheme rows share the mode rows' checkmark gutter so the whole submenu
+   reads as one column. Written as a separate selector list rather than by
+   widening the rules above, because the mode rows also carry an SVG icon and
+   the two must stay independently adjustable. */
+.custom-scheme-option.active::before {
+  content: "✓";
+  margin-right: 6px;
+  color: var(--primary-color, #2d9cdb);
+  font-weight: 700;
+}
+.custom-scheme-option:not(.active)::before {
+  content: "";
+  margin-right: 20px;
+  display: inline-block;
+}
+
+/* Group captions. Not focusable, not clickable, and deliberately not a
+   .tools-submenu-item so the hover highlight cannot make them look actionable. */
+.theme-scheme-group {
+  padding: 6px 12px 2px;
+  font-size: 10px;
+  font-weight: 700;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  color: var(--text-secondary, #777);
+  cursor: default;
+  user-select: none;
+}
+
+.theme-scheme-sep {
+  margin-top: 4px;
+}
+
 /* ============================================
    CUSTOM: Fix upstream bug - file-update-icon spins infinitely even
    when the toast is hidden. The upstream logic is backwards:

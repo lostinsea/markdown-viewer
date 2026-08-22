@@ -20,7 +20,7 @@ const { parseEmojis } = require('./emoji-parser');
 // INITIALIZATION
 // ============================================
 
-// Resolve the effective dark/light state from the persisted preference.
+// Read the persisted theme mode, migrating the legacy key.
 //
 // Two keys exist: custom-theme.js owns 'themeMode' ('light' | 'dark' |
 // 'desktop') and is the source of truth; the upstream toggle writes the legacy
@@ -30,14 +30,38 @@ const { parseEmojis } = require('./emoji-parser');
 // both here, in the same order custom-theme.js uses, removes that coupling and
 // closes the ~150ms window at startup during which mermaid was configured from
 // the legacy key while the body was about to be themed from the new one.
-function resolveDarkPreference() {
-  const mode =
+//
+// THIS IS THE ONLY PLACE THAT RULE IS WRITTEN DOWN. It used to be hand-rolled
+// at five sites - here, and four `localStorage.getItem('themeMode') ||
+// 'desktop'` reads in custom-theme.js - of which only this one honoured the
+// legacy key. Measured on a legacy-only profile with the OS resolving light:
+// this resolver answered 'dark' while the scheme sites answered 'desktop' ->
+// light, so `data-theme` landed on a LIGHT scheme (`parchment`,
+// rgb(244,239,228)) over a body carrying `.dark-mode`. That state is not
+// reachable today - `applyTheme()` is the only writer of 'themeMode' and
+// custom-theme.js's init() calls it unconditionally, so a stored scheme
+// implies a stored mode - but it was one deleted migration block away, and the
+// divergence itself is real and measurable. Pinned by test:theme section 10k.
+function resolveStoredMode() {
+  return (
     localStorage.getItem('themeMode') ||
     (localStorage.getItem('darkMode') === 'enabled'
       ? 'dark'
       : localStorage.getItem('darkMode') === 'disabled'
         ? 'light'
-        : 'desktop');
+        : 'desktop')
+  );
+}
+
+// Exported explicitly rather than left to rely on a top-level `function`
+// declaration implicitly becoming a window property: custom-theme.js is a
+// separate classic script and a future `const`/module refactor here would
+// otherwise break it silently. test:theme asserts the export exists.
+window.resolveStoredMode = resolveStoredMode;
+
+// Resolve the effective dark/light state from the persisted preference.
+function resolveDarkPreference() {
+  const mode = resolveStoredMode();
   if (mode === 'dark') return true;
   if (mode === 'light') return false;
   return window.matchMedia('(prefers-color-scheme: dark)').matches;
@@ -2282,6 +2306,43 @@ function endExportThemeHold() {
   return exportThemeHold;
 }
 
+// A colour scheme (body[data-theme]) has to be parked for an export for the
+// same reason the dark class does, and rather more urgently: a scheme repaints
+// the PAGE, not just the code box, so exporting with `abyss` applied puts
+// near-black paper through a printer that was explicitly asked for white.
+//
+// These are separate primitives rather than a branch inside setExportTheme()
+// because the RESTORE path calls setExportTheme() only when the dark class
+// actually has to move (see the pdf-export-result handler). A reader in light
+// mode with a light scheme applied would never reach it, and the scheme would
+// stay stripped for the rest of the session - an export silently resetting the
+// reader's appearance.
+function parkExportScheme() {
+  document.body.removeAttribute('data-theme');
+}
+
+// Restored from the STORED PREFERENCE rather than from a value parked above,
+// which is the same source of truth resolveDarkPreference() gives the dark
+// class. That is what makes a scheme chosen from the menu mid-export land
+// correctly: applyScheme() skips the DOM write while the hold is up (mirroring
+// the darkModeToggle handler at the top of this file) and this call is what
+// finally applies it.
+function restoreExportScheme() {
+  const themes = window.foliaThemes;
+  if (!themes) return;
+  try {
+    themes.applyScheme(resolveStoredMode());
+  } catch (e) {
+    /* A scheme is cosmetic; never let restoring one break an export result. */
+  }
+}
+
+// Read by custom-theme.js's applyScheme(), which must not repaint the document
+// underneath a printToPDF that is still rasterising.
+window.__foliaExportThemeHeld = function () {
+  return exportThemeHold > 0;
+};
+
 async function setExportTheme(dark) {
   document.body.classList.toggle('dark-mode', dark);
   try {
@@ -2411,6 +2472,7 @@ ipcRenderer.on('prepare-for-pdf-export', async () => {
   // window would re-theme the diagrams the printer is about to capture; the
   // hold defers it to the restore below. See the darkModeToggle handler.
   beginExportThemeHold();
+  parkExportScheme();
   await setExportTheme(false);
   // Double rAF ensures the style change is painted before main calls printToPDF
   requestAnimationFrame(() => requestAnimationFrame(() => ipcRenderer.send('pdf-export-ready')));
@@ -2428,6 +2490,7 @@ ipcRenderer.on('pdf-export-result', async (event, data) => {
   // reader's theme instead of the light export theme. Only the last one out
   // restores.
   if (endExportThemeHold() === 0) {
+    restoreExportScheme();
     const restoreDark = resolveDarkPreference();
     if (restoreDark !== document.body.classList.contains('dark-mode')) {
       await setExportTheme(restoreDark);

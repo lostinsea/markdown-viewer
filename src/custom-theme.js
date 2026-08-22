@@ -17,16 +17,116 @@
 
   const PREF_KEY = "themeMode"; // 'light' | 'dark' | 'desktop'
 
+  /* Scheme choice is stored PER MODE, not globally - the same shape VS Code
+     uses for preferredLightColorTheme / preferredDarkColorTheme, and the only
+     one that can answer "Follow Desktop" when the OS flips at dusk. `themeMode`
+     itself is left strictly alone: its value domain is a contract read by
+     resolveDarkPreference() in renderer.js, which feeds mermaid's startup
+     theme and falls through to the OS branch SILENTLY on an unknown value. */
+  const SCHEME_KEYS = { light: "themeLightScheme", dark: "themeDarkScheme" };
+
+  /* `base: true` means the scheme IS the stylesheet's default block, so it is
+     applied by REMOVING data-theme rather than by setting it. Re-declaring
+     those values as a scheme block would be a second copy of the appearance
+     test/fixtures/theme-golden.json pins, free to drift from it in silence.
+     Every non-base id must have a matching body[data-theme="id"] block in
+     src/styles.css and every such block must appear here; test:theme asserts
+     BOTH directions, because either half alone permits a dead entry. */
+  const SCHEMES = [
+    { id: "default-light", label: "Default Light", mode: "light", base: true },
+    { id: "clarity", label: "Clarity", mode: "light" },
+    { id: "parchment", label: "Parchment", mode: "light" },
+    { id: "default-dark", label: "Default Dark", mode: "dark", base: true },
+    { id: "abyss", label: "Abyss", mode: "dark" },
+    { id: "ember", label: "Ember", mode: "dark" },
+  ];
+
+  function baseSchemeFor(mode) {
+    return SCHEMES.find((s) => s.mode === mode && s.base);
+  }
+
+  /* An absent or unknown id falls back to the mode's base scheme, deliberately
+     without complaint: a stored id can outlive the scheme it names (a
+     downgrade, or a scheme withdrawn), and the honest answer then is the
+     default appearance rather than a half-applied one. The `s.mode === mode`
+     term matters - it stops a dark id stored under the light key from being
+     applied over a light page. */
+  function schemeFor(mode) {
+    const stored = localStorage.getItem(SCHEME_KEYS[mode]);
+    return (
+      SCHEMES.find((s) => s.id === stored && s.mode === mode) ||
+      baseSchemeFor(mode)
+    );
+  }
+
+  function resolveMode(mode) {
+    if (mode === "light" || mode === "dark") return mode;
+    return window.matchMedia("(prefers-color-scheme: dark)").matches
+      ? "dark"
+      : "light";
+  }
+
+  /* The stored preference, read through renderer.js's resolveStoredMode() so
+     the legacy-'darkMode' migration rule lives in exactly one place. Every
+     site below used to hand-roll `localStorage.getItem(PREF_KEY) || "desktop"`,
+     which ignores the legacy key that resolveDarkPreference() - the thing that
+     decides the dark CLASS - honours; the two then disagree on a legacy-only
+     profile and the page wears a light scheme's variables under `.dark-mode`.
+     The typeof guard mirrors the one on __foliaExportThemeHeld below: this is
+     an overlay file and must degrade rather than throw if renderer.js is
+     absent. It cannot be absent in the shipped app (index.html loads
+     renderer.js first, both classic scripts), and test:theme asserts the export
+     exists so this fallback can never quietly become the live path. */
+  function storedMode() {
+    return typeof window.resolveStoredMode === "function"
+      ? window.resolveStoredMode()
+      : localStorage.getItem(PREF_KEY) || "desktop";
+  }
+
+  /* data-theme is the ONLY thing a scheme changes, and mermaid is deliberately
+     not re-themed with it: getMermaidConfig() takes a boolean and ships two
+     fixed 14-key palettes, so a same-mode scheme switch has nothing to tell it
+     and no re-render to trigger. That is a scope boundary rather than an
+     oversight - and it is the seam that breaks first if mermaid is ever made
+     scheme-aware. */
+  function applyScheme(mode) {
+    const scheme = schemeFor(resolveMode(mode));
+    /* An export owns the document's appearance until it has finished
+       rasterising. Mirrors the darkModeToggle handler in renderer.js: the
+       PREFERENCE has already been written by the caller, so skipping the DOM
+       write loses nothing - restoreExportScheme() re-derives it from storage
+       when the last export releases the hold. Without this a scheme picked
+       from the menu mid-export repaints the page underneath printToPDF. */
+    const held = window.__foliaExportThemeHeld;
+    if (typeof held === "function" && held()) return scheme;
+    if (scheme.base) document.body.removeAttribute("data-theme");
+    else document.body.setAttribute("data-theme", scheme.id);
+    return scheme;
+  }
+
+  /* Applied at PARSE time rather than from init() below, which runs 150 ms
+     late: without this the reader watches the first document paint in the
+     outgoing scheme and then jump. An inline <script> in index.html would be
+     earlier still, but the CSP is `script-src 'self'` and minting a nonce for
+     a cosmetic gain is the wrong trade. */
+  try {
+    if (document.body) applyScheme(storedMode());
+  } catch (e) {
+    /* localStorage can throw in a partitioned context; a missing scheme is a
+       cosmetic loss and must never stop the theme menu from being built. */
+  }
+
   // ─── Apply a theme mode ────────────────────────────────────────────────────
 
   function applyTheme(mode) {
-    const prefersDark = window.matchMedia(
-      "(prefers-color-scheme: dark)",
-    ).matches;
-    const wantDark = mode === "dark" || (mode === "desktop" && prefersDark);
+    const wantDark = resolveMode(mode) === "dark";
     const isDark = document.body.classList.contains("dark-mode");
 
     localStorage.setItem(PREF_KEY, mode);
+
+    /* Scheme BEFORE the toggle: the click below re-renders, and setting
+       data-theme afterwards would paint one frame in the outgoing palette. */
+    applyScheme(mode);
 
     // Delegate to the original toggle so Mermaid side-effects run
     if (wantDark !== isDark) {
@@ -34,11 +134,49 @@
       if (toggle) toggle.click();
     }
 
-    // Mark the active option in our submenu
+    markActive(mode);
+  }
+
+  /* Picking a scheme also SWITCHES to its mode, because that is what clicking
+     it means to a reader. The one exception is "Follow Desktop": if the OS is
+     already resolving to that scheme's mode, the choice is recorded WITHOUT
+     dropping the follow-the-desktop behaviour the reader deliberately asked
+     for - otherwise choosing a dark scheme at night would silently pin the app
+     to dark for good. */
+  function setScheme(id) {
+    const scheme = SCHEMES.find((s) => s.id === id);
+    if (!scheme) return;
+    localStorage.setItem(SCHEME_KEYS[scheme.mode], scheme.id);
+    const mode = storedMode();
+    const keepFollowing = mode === "desktop" && resolveMode(mode) === scheme.mode;
+    applyTheme(keepFollowing ? "desktop" : scheme.mode);
+  }
+
+  function markActive(mode) {
+    const activeMode = mode || storedMode();
     document.querySelectorAll(".custom-theme-option").forEach((el) => {
-      el.classList.toggle("active", el.dataset.mode === mode);
+      el.classList.toggle("active", el.dataset.mode === activeMode);
+    });
+    /* A scheme row is ticked when it is the stored choice for ITS OWN mode, so
+       BOTH groups carry a tick at once and the reader can see what "Follow
+       Desktop" will pick at either end of the day. Ticking only the active
+       mode's group would make the other group look unset when it is not. */
+    document.querySelectorAll(".custom-scheme-option").forEach((el) => {
+      const s = SCHEMES.find((x) => x.id === el.dataset.scheme);
+      el.classList.toggle("active", !!s && schemeFor(s.mode).id === s.id);
     });
   }
+
+  window.foliaThemes = {
+    SCHEMES,
+    SCHEME_KEYS,
+    schemeFor,
+    applyScheme,
+    resolveMode,
+    storedMode,
+    setScheme,
+  };
+
 
   // ─── Build the replacement submenu ────────────────────────────────────────
 
@@ -72,6 +210,36 @@
     `;
 
     const submenu = item.querySelector("#customThemeSubmenu");
+
+    /* Scheme rows are built as DOM nodes with textContent rather than appended
+       as markup. The labels are static today, so this is not a sanitisation
+       fix - it is the convention SEC-13/14 established for every menu surface,
+       so a future label drawn from a document or a user file cannot become the
+       one innerHTML sink nobody thought to check. */
+    const sep = document.createElement("div");
+    sep.className = "tools-menu-separator theme-scheme-sep";
+    submenu.appendChild(sep);
+
+    for (const groupMode of ["light", "dark"]) {
+      const head = document.createElement("div");
+      head.className = "theme-scheme-group";
+      head.textContent = groupMode === "light" ? "Light schemes" : "Dark schemes";
+      submenu.appendChild(head);
+
+      SCHEMES.filter((s) => s.mode === groupMode).forEach((s) => {
+        const row = document.createElement("div");
+        row.className = "tools-submenu-item custom-scheme-option";
+        row.dataset.scheme = s.id;
+        row.textContent = s.label;
+        row.addEventListener("click", (e) => {
+          e.stopPropagation();
+          setScheme(s.id);
+          item.classList.remove("theme-open");
+          setTimeout(() => document.body.click(), 10);
+        });
+        submenu.appendChild(row);
+      });
+    }
 
     // ── JS-controlled hover with a grace-period delay ──────────────────────
     // Pure CSS :hover fires the submenu close the instant the mouse crosses
@@ -125,24 +293,15 @@
     window
       .matchMedia("(prefers-color-scheme: dark)")
       .addEventListener("change", () => {
-        if ((localStorage.getItem(PREF_KEY) || "desktop") === "desktop") {
+        if (storedMode() === "desktop") {
           applyTheme("desktop");
         }
       });
 
-    // Restore saved preference.
-    // Migrate from the legacy 'darkMode' key if 'themeMode' was never set.
-    let saved = localStorage.getItem(PREF_KEY);
-    if (!saved) {
-      const legacy = localStorage.getItem("darkMode");
-      saved =
-        legacy === "enabled"
-          ? "dark"
-          : legacy === "disabled"
-            ? "light"
-            : "desktop";
-    }
-    applyTheme(saved);
+    // Restore the saved preference. storedMode() performs the legacy 'darkMode'
+    // migration that used to be spelled out here, so this is now the same
+    // resolution every other site uses rather than a fifth copy of it.
+    applyTheme(storedMode());
   }
 
   if (

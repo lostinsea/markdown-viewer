@@ -111,3 +111,17 @@ fidelity, not appearance. The stripped case is where
 class the dark `pre` paints nothing and the `code` background is the only panel
 there is. That state is reached transiently on every full render before Prism
 runs, and permanently in the `typeof Prism === "undefined"` fallback path.
+
+### Heading levels
+
+#### Level four
+
+The six heading levels each carry their own `::before` collapse arrow, written
+as one six-part selector list. Only the levels this fixture actually renders can
+be measured, so all six appear here: with h4-h6 absent, three parts of that list
+had no subject in the document and section 10h's coverage check reported them
+as unreached - a rule painting text that no contrast assertion could see.
+
+##### Level five
+
+###### Level six
