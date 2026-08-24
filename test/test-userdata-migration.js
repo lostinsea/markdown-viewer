@@ -26,7 +26,11 @@ function check(name, cond, detail) {
     console.log("PASS  " + name);
     pass++;
   } else {
-    console.log("FAIL  " + name + (detail ? "  " + detail : ""));
+    // Separator is "  -> ", matching every other suite: the revert harness
+    // recovers an assertion NAME by splitting a FAIL line there, so a suite
+    // that formats its evidence differently lets a revert's `expect` regex be
+    // satisfied by evidence text instead of by the assertion it names.
+    console.log("FAIL  " + name + (detail ? "  -> " + detail : ""));
     fail++;
   }
 }

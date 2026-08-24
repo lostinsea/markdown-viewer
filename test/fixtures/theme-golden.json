@@ -842,8 +842,11 @@
     ],
     "selectionComputed": {
       "pre": "rgb(7, 54, 66)",
+      "preFg": "rgb(255, 255, 255)",
       "preCode": "rgb(7, 54, 66)",
-      "body": "rgb(39, 158, 167)"
+      "preCodeFg": "rgb(255, 255, 255)",
+      "body": "rgb(39, 158, 167)",
+      "bodyFg": "rgb(255, 255, 255)"
     }
   },
   "dark": {
@@ -1687,8 +1690,11 @@
     ],
     "selectionComputed": {
       "pre": "rgb(7, 54, 66)",
+      "preFg": "rgb(255, 255, 255)",
       "preCode": "rgb(7, 54, 66)",
-      "body": "rgb(61, 189, 198)"
+      "preCodeFg": "rgb(255, 255, 255)",
+      "body": "rgb(61, 189, 198)",
+      "bodyFg": "rgb(255, 255, 255)"
     }
   }
 }

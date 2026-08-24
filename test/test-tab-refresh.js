@@ -2789,7 +2789,7 @@ app.whenReady().then(async () => {
   try {
     await run(win);
   } catch (error) {
-    console.log("FAIL  harness threw:", error && error.stack ? error.stack : error);
+    console.log("FAIL  harness threw  -> " + (error && error.stack ? error.stack : error));
     results.push({ name: "harness", ok: false });
   }
 

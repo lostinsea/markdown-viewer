@@ -30,6 +30,7 @@
 require("./test-userdata-isolation");
 
 const { app, BrowserWindow, ipcMain } = require("electron");
+const { execSync } = require("child_process");
 const fs = require("fs");
 const path = require("path");
 
@@ -40,6 +41,8 @@ const {
   SURFACE_SELECTORS,
   waitForWindow,
   captureBothModes,
+  applyModeInPage,
+  waitFor,
 } = require("./theme-census");
 
 const results = [];
@@ -61,10 +64,24 @@ function finish() {
   app.exit(failed === 0 ? 0 : 1);
 }
 
+/* A HANG DETECTOR, NOT A PERFORMANCE BUDGET - and the difference is what the
+   number has to respect. It sat at 180s while the suite ran 43s, which reads
+   like ample headroom until a revert deliberately slows the product down:
+   R300 stretches a themed transition past the settle budget, and since
+   applySettled() then burns its full 60x50ms poll (plus one exec round-trip
+   per poll) on every one of ~30 states, the run lands at roughly 183s. The
+   watchdog fired FIRST, called finish(), and truncated the run before the
+   settle assertion at the end of the suite was ever reported - so R300 came
+   back WRONG-GUARD and the settle assertion silently had no proof at all.
+   That is the worst failure mode available here: a truncated run still prints
+   a count and still looks like a result.
+   So the budget must outlast the slowest revert that legitimately depends on
+   this suite, not merely the suite at rest. At 43s this leaves ~10x headroom
+   for a real hang while keeping R300 provable. */
 const watchdog = setTimeout(() => {
-  check("harness completed within 180s", false, "watchdog fired");
+  check("harness completed within 420s", false, "watchdog fired");
   finish();
-}, 180000);
+}, 420000);
 
 // ─── THE AMENDMENTS ─────────────────────────────────────────────────────────
 // Keyed mode -> token class-set -> property -> { was, now, why }. `was` is
@@ -112,6 +129,20 @@ const BOX_AMENDMENTS = {};
 // ::selection is not on any element, so it is amended as a cascade rule rather
 // than a token tuple. The old value was Solarized navy in BOTH modes, which is
 // very nearly invisible against the #2d2d2d dark code background.
+//
+// THE ALPHA WAS BRIEFLY RE-DERIVED AND THEN RESTORED, and the round trip is
+// recorded rather than tidied away because it is the most instructive thing
+// about this cell. Section 10l composited the tint and measured the worst
+// TOKEN at 2.48:1 through it, so the alpha was lowered to 18% to protect those
+// tokens. The tokens were the wrong subject: the app-wide ::selection rule
+// declares a colour, so selected code is repainted in ONE flat ink and the
+// syntax palette underneath is never seen (captured pixels: 1264 distinct
+// colours unselected, 128 selected). Legibility is owned by
+// --code-selection-fg, the alpha only controls how visible the highlight is,
+// and 35% is what makes it visible - measured 1.95:1 against the code
+// background at 35% against 1.39:1 at 18%. Both the original fault and the
+// round trip are kept here rather than overwritten, because `was` is what
+// stops the amendment becoming a licence to differ.
 const DARK_CODE_SELECTION = {
   was: "rgb(7, 54, 66)",
   now: "rgba(61, 189, 198, 0.35)",
@@ -127,12 +158,51 @@ const DARK_CODE_SELECTION = {
 // coordinates (mode/key.property), not decisions: the three namespace keys are
 // one decision recorded three times, because the census key carries the
 // ancestor token chain.
+/* THE MEASURED SIZE OF THE DERIVED REQUIRED LIST. Pinned rather than floored -
+   see the note printed beside the assertion that consumes it. */
+const REQUIRED_COUNTS = { light: 61, dark: 61 };
+
 const DECIDED_AMENDMENTS = [
   "dark/entity.named-entity@.backgroundColor",
   "dark/namespace@.opacity",
   "dark/namespace@tag>attr-name.opacity",
   "dark/namespace@tag>tag.opacity",
   "dark/::selection.background",
+];
+
+// THE CHROME LEDGER, and it exists because the register above cannot hold this
+// kind of entry at all. DECIDED_AMENDMENTS covers the frozen SYNTAX defaults -
+// token tuples, code-box parts and the code ::selection rule - so an appearance
+// change to the app's own menu chrome had nowhere to be recorded, and both
+// models of the fourth review round independently reported the mode rows as an
+// undeclared deviation. They were right on the substance: the Light / Dark /
+// Follow Desktop rows predate this feature and this work rebuilt their tick
+// gutter underneath them.
+//
+// `was` IS A MEASUREMENT, NOT A RECOLLECTION. The insets were read off the live
+// menu with the old declarations restored (that restoration is revert R364),
+// which is what makes the stated reason checkable rather than asserted: the
+// hand-tuned `margin-right: 6px` / `20px` pair never aligned the three mode
+// rows with EACH OTHER, so the ticked row's label sat 6px left of the other two
+// and that jitter travelled down the menu as the reader changed mode.
+//
+// IT IS KEYED BY TICK STATE, NOT BY MODE, and that correction came out of a
+// review round. The reading was originally recorded as
+// `{ light: 34, dark: 40, desktop: 40 }`, which reads as a fact about the light
+// row - but the 34 belongs to whichever row was TICKED when the capture was
+// taken, and light was merely the stored mode at the time. Re-measuring the
+// identical defect under a stored mode of dark would legitimately have produced
+// `{ light: 40, dark: 34, desktop: 40 }`, so a premise stated that way changes
+// with state that has nothing to do with the defect. Keyed by tick state the
+// same numbers say what was actually seen, and `inactive` is a pair because two
+// rows are unticked at any moment and both were measured at 40.
+const CHROME_AMENDMENTS = [
+  {
+    id: "mode-row tick gutter",
+    was: { active: 34, inactive: [40, 40] },
+    now: "the same fixed 12px tick box the scheme rows use",
+    why: "the old margin pair left the ticked row's label 6px left of the other two",
+  },
 ];
 
 function declaredAmendmentCoords() {
@@ -573,7 +643,100 @@ app.whenReady().then(async () => {
         diffs.length === 0,
         diffs.join(" | "),
       );
+      /* THE FOREGROUND, AND ITS ABSENCE WAS THE ONE FINDING BOTH REVIEWERS
+         REACHED INDEPENDENTLY. The census recorded backgroundColor alone, so
+         the ink half of the frozen defaults' selection was byte-exact only by
+         ARGUMENT - the argument being that 4bbde83's app-wide rule declared a
+         literal `color: #ffffff` and --on-accent-fg did not yet exist. That
+         argument is sound and it is still written down in styles.css, but an
+         argument is not a measurement: moving --code-selection-fg to #e8e8e8
+         moved no assertion in the suite.
+         It is deliberately NOT amended in either default. The F1 fix changed
+         WHERE the ink comes from (a named --code-selection-fg instead of the
+         app-wide --on-accent-fg) without changing WHAT it is, so both modes
+         must still reproduce the golden exactly, and this is the assertion
+         that says so. */
+      const fgKeys = ["pre", "preCode", "body"].map((p) => p + "Fg");
+      const missingFg = fgKeys.filter((k) => !want[k]);
+      const fgDiffs = fgKeys.filter((k) => got[k] !== want[k]);
+      check(
+        `${mode}: ::selection paints the golden's INK, not just its fill`,
+        missingFg.length === 0 && fgDiffs.length === 0,
+        missingFg.length
+          ? `the golden carries no foreground for [${missingFg.join(", ")}] - re-capture it, do not relax this`
+          : fgDiffs.map((k) => `${k}: golden=${want[k]} now=${got[k]}`).join(" | "),
+      );
+      /* THE ARGUMENT ABOVE, TURNED INTO A MEASUREMENT, using data already in
+         the golden. The objection a review round raised is exact and it is not
+         answered by the check above: the `*Fg` entries were captured AFTER the
+         ink moved to --code-selection-fg, so they are a RE-BASELINE and cannot
+         by themselves prove the pre-change value. Every other amendment in
+         this suite carries a `was` (see DARK_CODE_SELECTION); the ink has
+         none, and none can now be captured.
+
+         AN EARLIER REVISION OF THIS COMMENT RESCUED THAT WITH A CLAIM THIS
+         CHANGE FALSIFIES. It said `bodyFg` is painted by the app-wide
+         ::selection rule "which this change never touched". A later review
+         round measured the rule and it is touched:
+           4bbde83:  ::selection { background: var(--primary-color); color: #ffffff; }
+           now:      ::selection { background: var(--primary-color); color: var(--on-accent-fg); }
+         So the equality below can be satisfied by BOTH halves moving together,
+         and on its own it no longer states the byte-exactness claim.
+
+         What actually preserves the ink is measured and pinned immediately
+         after: --on-accent-fg is #ffffff at :root and is NOT redeclared on
+         body.dark-mode, so both frozen defaults resolve the same white the
+         baseline baked. Only the four scheme blocks move it. The equality
+         below is still worth asserting - it catches a consuming rule that
+         stops consuming - but it is the anchor assertion that carries the
+         fidelity half. It is asserted on the two FROZEN DEFAULTS only: a
+         curated scheme is entitled to a different selection ink for its code,
+         and three of the four use one. */
+      check(
+        `${mode}: the frozen default's code selection ink is still the app-wide selection ink it used to inherit`,
+        got.preFg === got.bodyFg && got.preCodeFg === got.bodyFg,
+        `app-wide=${got.bodyFg} pre=${got.preFg} preCode=${got.preCodeFg}`,
+      );
+      /* THE ANCHOR THE EQUALITY LOST. Both halves of the equality above now
+         resolve through --on-accent-fg, so the pre-change VALUE has to be
+         pinned somewhere, and this is it: the literal the baseline baked into
+         the app-wide ::selection rule. It is read from the live cascade rather
+         than from the stylesheet text so a scheme block leaking into a frozen
+         default would fail it too.
+
+         THE MODE MUST BE APPLIED BEFORE THIS READ, and for a long time it was
+         not. Everything else in this loop reads the CAPTURED census, which
+         carries its own per-mode snapshot; this is the only LIVE read in the
+         section, and captureBothModes() runs light-then-dark and therefore
+         leaves the page in DARK. So both iterations measured dark, and the
+         `light:` assertion was a duplicate of the `dark:` one - a
+         mode-scoped redeclaration in the light `body` block would have gone
+         green. R403 is the proof. The state is restored below so the sections
+         that follow still start from the mode they have always started from. */
+      await exec(applyModeInPage(mode));
+      await waitFor(
+        exec,
+        `document.body.classList.contains('dark-mode') === ${mode === "dark"}`,
+        `${mode} mode for the --on-accent-fg read`,
+      );
+      const onAccent = await exec(
+        `getComputedStyle(document.body).getPropertyValue('--on-accent-fg').trim()`,
+      );
+      check(
+        `${mode}: the frozen default still resolves --on-accent-fg to the white the baseline baked`,
+        onAccent === "#ffffff",
+        `--on-accent-fg=${onAccent} in ${await exec("document.body.classList.contains('dark-mode') ? 'dark' : 'light'")} mode (baseline ::selection baked color: #ffffff)`,
+      );
     }
+    // Put the page back where captureBothModes() left it. The read above is the
+    // only thing in this section that moves the mode, and every later section
+    // was written against a dark page.
+    await exec(applyModeInPage("dark"));
+    await waitFor(
+      exec,
+      `document.body.classList.contains('dark-mode') === true`,
+      "dark mode restored after the --on-accent-fg reads",
+    );
     // The dark amendment's premise, asserted against the golden like every
     // other one: the old value must really have been the near-invisible navy.
     check(
@@ -581,17 +744,46 @@ app.whenReady().then(async () => {
       golden.dark.selectionComputed.pre === DARK_CODE_SELECTION.was,
       `amendment says was=${DARK_CODE_SELECTION.was}, golden says ${golden.dark.selectionComputed.pre}`,
     );
-    // Cheap belt: a rule must still exist and must still route through the
-    // variable, so a scheme can retint it. The computed check above is what
-    // proves it actually paints.
+    // Cheap belt: the rule must still exist and must still route BOTH painted
+    // properties through their variables, so a scheme can retint either.
+    //
+    // TWO THINGS HERE WERE WRONG AND A REVERT (R354) EXPOSED BOTH.
+    //  1. It named only --code-selection-bg. The foreground is the half that
+    //     was actually broken (see the comment on the rule in styles.css), so
+    //     deleting `color: var(--code-selection-fg)` outright left this green.
+    //  2. It was a `some()`. The product then shipped a `::-moz-selection`
+    //     group beside the standard one, and one rule satisfying the claim let
+    //     the other be broken - the recorded disjunction disease, where a claim
+    //     whose subject can be supplied by more than one source measures
+    //     neither. `every()` is what closes that, and it stays `every()` even
+    //     though the moz group has since been deleted, because the collector is
+    //     a filter over the live cascade and a future rule joining it must
+    //     satisfy the claim too rather than hide behind this one.
+    //
+    // THE MOZ GROUP IS NOT CHECKED HERE, AND THAT IS A LIMIT OF THE ORACLE
+    // RATHER THAN AN OMISSION: Chromium drops an unrecognised pseudo-element's
+    // rule at parse time, so such a rule never enters document.styleSheets and
+    // no CSSOM-based probe can see it. An assertion written over this list
+    // could only ever report it as absent - which it did, failing on a clean
+    // tree while a revert that "proved" it looked green. The group was deleted
+    // for exactly that reason (styles.css records the measurement).
     const selRules = now.light.selection.filter((r) =>
       /language-/.test(r.selector),
     );
+    const missingVars = [];
+    for (const v of ["--code-selection-bg", "--code-selection-fg"]) {
+      const re = new RegExp(`var\\(\\s*${v}\\s*[,)]`);
+      if (!selRules.every((r) => re.test(r.css))) missingVars.push(v);
+    }
     check(
-      "code ::selection rules still exist and consume the variable",
-      selRules.length > 0 &&
-        selRules.some((r) => /var\(\s*--code-selection-bg\s*[,)]/.test(r.css)),
-      selRules.map((r) => r.css).join(" ").slice(0, 200),
+      "every code ::selection rule consumes both selection variables",
+      selRules.length > 0 && missingVars.length === 0,
+      selRules.length === 0
+        ? "no code ::selection rule reached the CSSOM at all"
+        : `missing=${missingVars.join(",")} css=${selRules
+            .map((r) => r.css)
+            .join(" ")
+            .slice(0, 200)}`,
     );
 
     // ─── 6. The amendments' premises still hold ─────────────────────────────
@@ -880,6 +1072,81 @@ app.whenReady().then(async () => {
         `found=${JSON.stringify(roleFree)} listed=${JSON.stringify(ROLE_FREE_CELLS[mode])} - a cell that names no role keeps this scheme's literal under EVERY future scheme, so adding one is a decision that has to be recorded here`,
       );
     }
+
+    /* THE SUBSTITUTION-SCOPE GUARD, WIDENED PAST --tok-*. The two assertions
+       above are the strongest guard in this file, and they were also the
+       NARROWEST: their census filters on `prop.indexOf('--tok-') !== 0`, so
+       four theme variables whose values contain var() were never scope-checked
+       at all - --code-inline-bg, --code-inline-fg, --drop-overlay-fg and
+       --welcome-readme-ink-hover. Move any one of them to :root and the
+       defaults still look right (nothing overrides them today), a scheme can
+       still override the variable DIRECTLY, and every existing assertion stays
+       green - while a scheme that overrides only the ROLE it derives from
+       silently stops reaching it. --welcome-readme-ink-hover is not a
+       hypothetical example: a revert in this suite exists because exactly that
+       move repainted the dark welcome screen.
+
+       This one is family-agnostic on purpose. It asks the only question the
+       Chromium rule actually cares about - does this declaration contain
+       var(), and is it declared somewhere <body> can be reached from - so a
+       token family invented next year is covered on the day it is added
+       rather than when someone remembers to widen a prefix filter. */
+    const varScope = JSON.parse(
+      await exec(`(() => {
+        const out = { rootish: [], bodyish: 0, total: 0, names: [] };
+        /* RECURSES THROUGH CSSGroupingRule, because iterating only top-level
+           cssRules made the sweep blind to anything inside @media or
+           @supports - a --foo: var(--bar) declared at :root inside an
+           @media block would be neither reported NOR counted, so it could
+           not even move the pinned total. Both reviewers found this
+           independently. There are no such rules today (measured), so this
+           does not change the count; it makes the guarantee match the claim.
+
+           SELECTOR LISTS ARE SPLIT for the same reason: the old test asked
+           whether the WHOLE selectorText was exactly ":root" or "html", so
+           ":root, .foo" - which declares on the document element and on
+           nothing <body> can reach - classified as safe. */
+        const walk = (rules) => {
+          for (const rule of rules || []) {
+            if (rule.cssRules) walk(rule.cssRules);
+            if (!rule.style || !rule.selectorText) continue;
+            const parts = rule.selectorText.split(',').map((s) => s.trim());
+            const rootParts = parts.filter((p) => /^(:root|html)(?![\\w-])/.test(p));
+            for (const prop of rule.style) {
+              if (prop.indexOf('--') !== 0) continue;
+              const val = rule.style.getPropertyValue(prop);
+              if (!/\\bvar\\(/.test(val)) continue;
+              out.total++;
+              out.names.push(prop);
+              if (rootParts.length)
+                out.rootish.push(prop + ' @ ' + rule.selectorText);
+              else out.bodyish++;
+            }
+          }
+        };
+        for (const sheet of document.styleSheets) {
+          let rules; try { rules = sheet.cssRules; } catch (e) { continue; }
+          walk(rules);
+        }
+        out.names = [...new Set(out.names)].sort();
+        return JSON.stringify(out);
+      })()`),
+    );
+    console.log(
+      `  note  var()-valued custom properties: ${varScope.total} declaration(s), ${varScope.names.length} distinct, ${varScope.rootish.length} at :root/html`,
+    );
+    /* Pinned to the measurement, not floored below it. A sweep that silently
+       stopped matching would drop the count to 0, and an assertion of ABSENCE
+       ("none at :root") passes on an empty set - the fail-open shape this
+       suite has been bitten by before. */
+    const VAR_SCOPE_COUNT = 59;
+    check(
+      "every custom property whose value contains var() is declared where <body> can reach it, never on :root",
+      varScope.rootish.length === 0 && varScope.total === VAR_SCOPE_COUNT,
+      `${varScope.total} var()-valued declaration(s) found (pinned ${VAR_SCOPE_COUNT}), ${varScope.bodyish} at body scope or deeper, ${varScope.rootish.length} at :root/html${
+        varScope.rootish.length ? ": " + varScope.rootish.join(" | ") : ""
+      } - a var() in a custom property is substituted on the element that DECLARES it, so one declared on <html> can never be re-pointed by a body[data-theme] scheme`,
+    );
 
     // THE COMMENT'S NUMBER, MEASURED. src/styles.css claims in two places that
     // a specific number of the 25 fine cells map from a DIFFERENT coarse role
@@ -1288,10 +1555,82 @@ app.whenReady().then(async () => {
         return JSON.stringify(out);
       })()`),
     );
+    /* THE FLOOR IS THE MEASUREMENT, not a comfortable number below it. Review
+       flagged `>= 50` as carrying the same slack this suite has twice called a
+       defect elsewhere (the `>= 30 / >= 200` that was retied to `>= 62 / >= 632`,
+       and the `>= 4` against 9 that R340 exposed): eight required variables
+       could have been converted to var() without the floor noticing. The note
+       below prints what was actually counted so the pinned numbers can be
+       re-derived rather than trusted. */
+    console.log(
+      `  note  base variables light ${cover.baseSize.light} (${cover.requiredSize.light} required) / dark ${cover.baseSize.dark} (${cover.requiredSize.dark} required)`,
+    );
     check(
-      "the derived required-variable list is substantial (the completeness check is not vacuous)",
-      cover.requiredSize.light >= 50 && cover.requiredSize.dark >= 50,
-      `light base declares ${cover.baseSize.light} variables of which ${cover.requiredSize.light} are literal-valued and therefore REQUIRED of a scheme; dark ${cover.baseSize.dark}/${cover.requiredSize.dark} - it is the required count that makes the completeness check non-vacuous, not the declared one`,
+      "the derived required-variable list is the pinned measured size (the completeness check is not vacuous)",
+      cover.requiredSize.light === REQUIRED_COUNTS.light &&
+        cover.requiredSize.dark === REQUIRED_COUNTS.dark,
+      `light base declares ${cover.baseSize.light} variables of which ${cover.requiredSize.light} are literal-valued and therefore REQUIRED of a scheme (pinned ${REQUIRED_COUNTS.light}); dark ${cover.baseSize.dark}/${cover.requiredSize.dark} (pinned ${REQUIRED_COUNTS.dark}) - it is the required count that makes the completeness check non-vacuous, not the declared one`,
+    );
+    /* THE ONE CONTRACT THE STYLESHEET STATES IN PROSE AND NOTHING CHECKED.
+       styles.css says it plainly under the "COLOUR SCHEMES" heading, in the
+       paragraph beginning "POSITION IS LOAD-BEARING": `body[data-theme="x"]`
+       and `body.dark-mode` are both specificity (0,1,1) and declare on the
+       same element, so SOURCE ORDER alone decides which wins. (Cited by
+       heading rather than by line, per the convention custom-styles.css
+       states: a change that adds rules above it silently invalidates a line
+       number, and this citation had already rotted from 473 to 477.) Move the
+       scheme blocks above the dark block and abyss and ember silently lose
+       every cell the dark default also declares.
+       Review found the defect IS caught today - 10c fails, because the dark
+       default's accent reappears everywhere - but by an assertion named for
+       STRANDED ACCENTS, which is the wrong-name failure mode this project
+       rewrote R366's expect to avoid. Worse, the guard is asymmetric: clarity
+       and parchment sit under `body` with no dark block to lose to, so a
+       light-only reorder changes nothing and is not caught at all. This reads
+       the rule indices directly, so it fails for the reason it is named for
+       and covers all four schemes equally.
+
+       IT MUST BE THE **LAST** DARK BLOCK, NOT THE FIRST, AND THAT IS A FACT
+       ABOUT THIS STYLESHEET RATHER THAN A HYPOTHETICAL. `findIndex` was the
+       first form, and styles.css declares TWO top-level `body.dark-mode`
+       rules: the chrome variables, and - three hundred lines later - the
+       whole Tomorrow Night syntax palette. A scheme block pasted between them
+       therefore sits AFTER the first dark block and loses every --syn- and
+       --tok- variable it declares, in dark mode only, with nothing failing.
+       Taking
+       the last index closes that and additionally covers the appended-block
+       accident (a second dark block added at the END of the file would beat
+       all four schemes). The full index list is printed so a third dark block
+       appearing is visible rather than silently absorbed. R394 is the proof;
+       under the old form it passes. */
+    const order = JSON.parse(
+      await exec(`(() => {
+        const out = { dark: -1, darkAll: [], schemes: [], sheet: null };
+        for (const sheet of document.styleSheets) {
+          let rules;
+          try { rules = [...sheet.cssRules]; } catch (e) { continue; }
+          const darkAts = [];
+          rules.forEach((r, i) => { if (r.selectorText === 'body.dark-mode') darkAts.push(i); });
+          if (!darkAts.length) continue;
+          out.sheet = (sheet.href || '').split('/').pop() || '(inline)';
+          out.darkAll = darkAts;
+          out.dark = darkAts[darkAts.length - 1];
+          rules.forEach((r, i) => {
+            const m = r.selectorText && /^body\\[data-theme="([a-z-]+)"\\]$/.exec(r.selectorText);
+            if (m) out.schemes.push({ id: m[1], at: i });
+          });
+          break;
+        }
+        return JSON.stringify(out);
+      })()`),
+    );
+    const misordered = order.schemes.filter((s) => s.at < order.dark).map((s) => s.id);
+    check(
+      "10b: every scheme block is declared AFTER the dark default, which is the only thing that lets it win",
+      order.dark >= 0 && order.schemes.length === 4 && misordered.length === 0,
+      `${order.sheet}: body.dark-mode at rule(s) ${order.darkAll.join(",")} (last ${order.dark}); ${order.schemes
+        .map((s) => `${s.id}@${s.at}`)
+        .join(" ")}${misordered.length ? ` - BEFORE the last dark block: ${misordered.join(", ")}` : ""}`,
     );
     const excusedNames = Object.keys(SCHEME_EXCUSALS);
     const excusalUsed = new Set();
@@ -1978,9 +2317,11 @@ app.whenReady().then(async () => {
        selector list silently stops covering a rule that is renamed, and stops
        growing when a thirteenth glow is added.
        SCANNED ACROSS PROPERTIES, and that was not the first version. Filtering
-       on box-shadow alone quietly dropped .file-update-btn's `background:
-       rgba(var(--accent-glow-rgb), 0.08)` - a glow consumer that simply is not
-       a shadow - and the ONLY symptom was a missing alpha in the frozen list
+       on box-shadow alone quietly dropped `body.drop-active::after`'s
+       `background: rgba(var(--accent-glow-rgb), 0.08)` - the ONE glow consumer
+       in the app that is not a shadow; a later review round measured all 13
+       consumers and it is still the only one - and the ONLY symptom was a
+       missing alpha in the frozen list
        below. The retint and fidelity assertions were happily reporting a clean
        sweep of a subject set one rule short. */
     const GLOW_PROPS = {
@@ -2418,6 +2759,401 @@ app.whenReady().then(async () => {
       staleLiteralExcusals.length === 0,
       `${staleLiteralExcusals.join(", ")} no longer paint a frozen accent literal, so the excusal now only hides a future one`,
     );
+
+    /* ── 10f2: a var() fallback that is a literal colour ────────────────────
+       A LITERAL FALLBACK IS A DEFECT IN EITHER OF THE ONLY TWO STATES IT CAN
+       BE IN, which is what makes this a rule rather than a preference:
+         - the variable is always declared, so the fallback is unreachable -
+           dead paint that reads as a deliberate choice, and that a future
+           editor will change expecting an effect; or
+         - the variable is sometimes undeclared, so the fallback really does
+           paint - a colour belonging to NO scheme, on a surface every scheme
+           believes it controls, which is exactly the stranded-accent defect
+           10c exists to catch, wearing a spelling 10c cannot see.
+       Measured before this was written: the product carried two, both in the
+       theme-menu chrome added by this item (--primary-color -> #2d9cdb, the
+       pre-Folia accent, and --text-secondary -> #777), and both were in the
+       FIRST state - --primary-color resolved to #3DBDC6 on a probe element in
+       the live document, so neither fallback could ever have painted.
+       Deliberately NOT limited to the frozen accent family: the whole point is
+       that these colours belong to no palette, so there is no family to
+       enumerate. */
+    /* THE CLASSIFIER IS THE ENGINE, NOT A SPELLING LIST. The first version
+       tested the fallback against a regex naming five syntaxes (#hex, rgb,
+       hsl, color()), which is a list of the colour notations I happened to
+       think of - it says nothing about `red`, `oklch()`, `lab()`, or whatever
+       CSS Color 6 adds next, and each omission is a silent hole rather than a
+       failure. CSS.supports('color', v) asks the shipped Chromium the exact
+       question the assertion is named for. The only judgement left is the
+       small set of values that ARE valid colours but name no palette entry -
+       currentColor, transparent and the CSS-wide keywords - which are
+       legitimate fallbacks and are excluded explicitly.
+
+       THE var() PARSER IS PAREN-AWARE, AND THAT IS A FIX RATHER THAN A
+       REFINEMENT. The regex it replaces could not see a nested fallback:
+       `var(--a, var(--b, #fff))` handed it ` var(--b, #fff)`, which does not
+       start with a colour, and its lastIndex then skipped past the inner
+       expression entirely - so a literal one level down was invisible. Worse,
+       the negative control in the positive-control set (`a var() chain must
+       NOT be caught`) certified exactly that escape as correct behaviour. The
+       parser now recurses into every fallback, and `-nested-hex` is in the
+       caught set. */
+    const varFbProbe = `(() => {
+      const NON_PALETTE = new Set([
+        'currentcolor', 'transparent', 'inherit', 'initial', 'unset',
+        'revert', 'revert-layer', 'none', 'auto',
+      ]);
+      const wordish = (ch) =>
+        !!ch && (ch === '-' || ch === '_' || (ch >= 'a' && ch <= 'z') || (ch >= 'A' && ch <= 'Z') || (ch >= '0' && ch <= '9'));
+      const isColour = (raw) => {
+        const t = String(raw).trim();
+        if (!t) return false;
+        const k = t.toLowerCase();
+        if (NON_PALETTE.has(k)) return false;
+        if (k.slice(0, 4) === 'var(') return false;
+        try { return CSS.supports('color', t); } catch (e) { return false; }
+      };
+      /* Top-level tokens, so a fallback that is a whole shorthand -
+         box-shadow: var(--glow, 0 0 4px red) - still surrenders its colour,
+         while rgb(1, 2, 3) stays one token. */
+      const topTokens = (s) => {
+        const out = [];
+        let depth = 0, cur = '';
+        for (let i = 0; i < s.length; i++) {
+          const ch = s[i];
+          if (ch === '(') depth++;
+          if (ch === ')') depth--;
+          if (depth === 0 && (ch === ' ' || ch === ',' || ch === '\\t' || ch === '\\n')) {
+            if (cur.trim()) out.push(cur.trim());
+            cur = '';
+          } else cur += ch;
+        }
+        if (cur.trim()) out.push(cur.trim());
+        return out;
+      };
+      const findVars = (s, out) => {
+        /* CSS FUNCTION NAMES ARE CASE-INSENSITIVE AND THE CSSOM DOES NOT
+           NORMALISE THEM. Measured in this Chromium: a rule written
+           'color: VAR(--nope, #ff0000)' serialises back out of cssText as
+           'VAR(--nope, #ff0000)', verbatim. A scanner that compared against the
+           literal lowercase 'var(' therefore walked straight past a perfectly
+           valid literal fallback - the exact escape this section exists to
+           close, and the second one found in it.
+           Quoted strings are skipped for the opposite reason: a rule written
+           'content: "var(--x, red)"' also survives into cssText intact, and
+           reporting the text inside a string as a fallback would be a false
+           accusation.
+           NOTE FOR EDITORS: this comment lives inside an exec() template
+           literal, so it must never contain a backtick - the recorded trap,
+           which bit again while this very comment was being written. */
+        for (let i = 0; i < s.length; i++) {
+          const q = s[i];
+          if (q === '"' || q === "'") {
+            for (i++; i < s.length; i++) {
+              if (s[i] === '\\\\') i++;
+              else if (s[i] === q) break;
+            }
+            continue;
+          }
+          if (s.slice(i, i + 4).toLowerCase() !== 'var(' || wordish(s[i - 1])) continue;
+          let depth = 0, j = i + 3;
+          for (; j < s.length; j++) {
+            if (s[j] === '(') depth++;
+            else if (s[j] === ')') { depth--; if (depth === 0) break; }
+          }
+          if (j >= s.length) break;
+          const inner = s.slice(i + 4, j);
+          let d = 0, comma = -1;
+          for (let k = 0; k < inner.length; k++) {
+            if (inner[k] === '(') d++;
+            else if (inner[k] === ')') d--;
+            else if (inner[k] === ',' && d === 0) { comma = k; break; }
+          }
+          const name = (comma < 0 ? inner : inner.slice(0, comma)).trim();
+          const fb = comma < 0 ? null : inner.slice(comma + 1).trim();
+          out.push({ name: name, fb: fb });
+          if (fb) findVars(fb, out);
+          i = j;
+        }
+      };
+      const scan = () => {
+        const literal = [];
+        const seen = [];
+        const inventory = [];
+        const consumed = {};
+        let rules = 0, fallbacks = 0;
+        const walk = (list) => {
+          for (const rule of list) {
+            if (rule.style) {
+              rules++;
+              const txt = rule.cssText || '';
+              const body = txt.slice(txt.indexOf('{') + 1, txt.lastIndexOf('}'));
+              const found = [];
+              findVars(body, found);
+              for (const v of found) {
+                if (v.fb === null) {
+                  if (!consumed[v.name]) {
+                    consumed[v.name] = rule.selectorText || '<no selector>';
+                  }
+                  continue;
+                }
+                fallbacks++;
+                inventory.push((rule.selectorText || '<no selector>') + ' | ' + v.name + ' -> ' + v.fb);
+                const hit = isColour(v.fb) ? v.fb : (topTokens(v.fb).filter(isColour)[0] || null);
+                if (hit) {
+                  literal.push({
+                    selector: rule.selectorText || '<no selector>',
+                    key: (rule.selectorText || '<no selector>') + '|' + v.name,
+                    text: (rule.selectorText || '<no selector>') + ' { ' + v.name + ' -> ' + hit + ' }',
+                  });
+                }
+              }
+            }
+            if (rule.cssRules && rule.cssRules.length) walk(rule.cssRules);
+          }
+        };
+        for (const sheet of document.styleSheets) {
+          let r;
+          try { r = sheet.cssRules; } catch (e) { continue; }
+          seen.push((sheet.href || '<inline>').split('/').pop());
+          if (r) walk(r);
+        }
+        return {
+          literal: literal, rules: rules, fallbacks: fallbacks,
+          seen: seen, inventory: inventory,
+          consumed: Object.keys(consumed).sort(),
+          consumedBy: consumed,
+        };
+      };
+
+      const before = scan();
+      /* THE PLANT GOES THROUGH THE REAL WALK. Scanning the probe sheet with a
+         private copy of the matcher proves the matcher, not the instrument:
+         a walk that skipped inline sheets, or bailed on the first
+         cross-origin throw, would report a clean document while the private
+         copy went on catching everything it was handed. The probe stylesheet
+         is appended to document.head and picked up by the same
+         document.styleSheets traversal the real claim rests on. */
+      const probe = document.createElement('style');
+      probe.textContent =
+        '.folia-varfb-selfcheck-hex { color: var(--folia-unset-a, #123456) }' +
+        '.folia-varfb-selfcheck-rgb { color: var(--folia-unset-b, rgb(1, 2, 3)) }' +
+        '.folia-varfb-selfcheck-kw { color: var(--folia-unset-e, rebeccapurple) }' +
+        '.folia-varfb-selfcheck-modern { color: var(--folia-unset-f, oklch(0.7 0.1 200)) }' +
+        '.folia-varfb-selfcheck-nested-hex { color: var(--folia-unset-g, var(--folia-unset-h, #abcdef)) }' +
+        '.folia-varfb-selfcheck-inside { box-shadow: var(--folia-unset-i, 0 0 4px red) }' +
+        '.folia-varfb-selfcheck-upper { color: VAR(--folia-unset-l, #654321) }' +
+        '.folia-varfb-selfcheck-ok-chain { color: var(--folia-unset-c, var(--primary-color)) }' +
+        '.folia-varfb-selfcheck-ok-kw { color: var(--folia-unset-d, inherit) }' +
+        '.folia-varfb-selfcheck-ok-transparent { color: var(--folia-unset-j, transparent) }' +
+        '.folia-varfb-selfcheck-ok-quoted::after { content: "var(--folia-unset-m, #ff0000)" }' +
+        '.folia-varfb-selfcheck-ok-length { gap: var(--folia-unset-k, 4px) }';
+      document.head.appendChild(probe);
+      const planted = scan();
+      probe.remove();
+      const after = scan();
+
+      const only = (set) => set.literal.filter((h) => h.selector.indexOf('.folia-varfb-selfcheck') === 0).map((h) => h.selector);
+      return JSON.stringify({
+        before: before,
+        plantedHits: only(planted),
+        plantedSheets: planted.seen.length,
+        plantedRules: planted.rules,
+        plantedFallbacks: planted.fallbacks,
+        afterCount: after.literal.length,
+        afterRules: after.rules,
+      });
+    })()`;
+    const varFb = JSON.parse(await exec(varFbProbe));
+    const varFallbacks = varFb.before;
+    /* POSITIVE CONTROL, and it carries the assertion below: an absence claim
+       over a scan that has stopped matching is satisfied for free. The '-ok-'
+       rules are NEGATIVE controls - a var() chain with no literal at any
+       depth, a CSS-wide keyword, `transparent`, a non-colour length and a
+       var() spelled INSIDE A QUOTED STRING are all legitimate and must NOT be
+       caught, or the rule degenerates into "no fallbacks at all".
+
+       THE LAST TWO ENTRIES ON EACH SIDE WERE ADDED AFTER A REVIEW FINDING AND
+       BOTH HALVES WERE MEASURED FIRST, because a control that cannot
+       discriminate is worse than none:
+         - `VAR(` really does survive into the CSSOM verbatim. Chromium
+           canonicalises a COLOUR on its way in (10i rests on that) but does
+           NOT normalise a FUNCTION NAME's case, so a case-sensitive scanner
+           has a real escape hatch, not a theoretical one.
+         - `content: "var(--x, red)"` also survives intact, so a scanner that
+           does not skip quoted strings reports a literal fallback for a
+           string that paints no colour at all. */
+    const wantCaught = [
+      ".folia-varfb-selfcheck-hex",
+      ".folia-varfb-selfcheck-rgb",
+      ".folia-varfb-selfcheck-kw",
+      ".folia-varfb-selfcheck-modern",
+      ".folia-varfb-selfcheck-nested-hex",
+      ".folia-varfb-selfcheck-inside",
+      ".folia-varfb-selfcheck-upper",
+    ];
+    const wronglyCaught = varFb.plantedHits.filter((s) => s.includes("-ok-"));
+    const missed = wantCaught.filter((s) => !varFb.plantedHits.includes(s));
+    check(
+      "10f2: the literal-fallback scan catches every colour spelling and spares a legitimate one (positive control)",
+      missed.length === 0 && wronglyCaught.length === 0,
+      `caught [${varFb.plantedHits.join(", ")}]; missed [${missed.join(", ")}]; wrongly caught [${wronglyCaught.join(", ")}]`,
+    );
+    /* THE PLANT MUST ALSO GO AWAY. Without this, a scan that returned a stale
+       or cached result would satisfy the control above on the planted run and
+       the claim below on the clean one, with neither ever re-reading the
+       document. */
+    check(
+      "10f2: removing the planted stylesheet returns the scan to a clean document",
+      varFb.afterCount === varFallbacks.literal.length && varFb.afterRules === varFallbacks.rules,
+      `clean ${varFallbacks.literal.length} literal / ${varFallbacks.rules} rules, after-plant-removal ${varFb.afterCount} / ${varFb.afterRules}`,
+    );
+    /* VACUITY FLOORS, AND THE FIRST ATTEMPT AT THEM WAS A PAIR OF GUESSES.
+       The claim is an ABSENCE, so a walk that reached nothing satisfies it
+       perfectly - but `rules >= 500` and `fallbacks >= 5` were numbers I
+       picked, and running them measured 488 rules and exactly ONE var()
+       fallback in the entire product. Guessing had produced a floor the
+       healthy tree fails and a floor no realistic breakage would trip.
+       Both are now MEASURED relationships:
+         - the plant adds an exact number of rules and of fallbacks, so the
+           delta across the same traversal cannot rot as the stylesheets grow;
+           and
+         - the product's var() fallback INVENTORY is pinned by name, the same
+           pattern 10f uses for the glow alphas. That is strictly stronger
+           than a count: it proves the walk reached the product's own rules
+           and not merely the plant, and it makes a new fallback - the thing
+           this section exists to adjudicate - fail loudly and by name rather
+           than slip under a threshold. */
+    const PLANT_RULES = 12;
+    /* TWELVE FALLBACKS FROM TWELVE RULES, AND THE ARITHMETIC IS NOT THE
+       IDENTITY IT LOOKS LIKE - two rules pull it in opposite directions and
+       both are load-bearing:
+         + the -nested-hex rule spells two var() expressions,
+           `var(--g, var(--h, #abcdef))`, and the recursion visits both. The
+           regex this parser replaced saw one, so this is a standing check
+           that the nested walk still happens.
+         - the -ok-quoted rule spells a var() INSIDE A QUOTED STRING, which
+           the parser must skip entirely, so it contributes a rule and NO
+           fallback. Were the quote-skipping removed, this delta would read 13
+           and the count would fail even though the '-ok-' selector would also
+           show up in wronglyCaught - the two controls fail together on
+           purpose, from opposite directions. */
+    const PLANT_FALLBACKS = 12;
+    check(
+      "10f2: the literal-fallback scan really traversed the product's stylesheets",
+      varFallbacks.seen.length >= 2 &&
+        varFb.plantedSheets === varFallbacks.seen.length + 1 &&
+        varFb.plantedRules - varFallbacks.rules === PLANT_RULES &&
+        varFb.plantedFallbacks - varFallbacks.fallbacks === PLANT_FALLBACKS,
+      `${varFallbacks.seen.length} sheet(s) [${varFallbacks.seen.join(", ")}] -> ${varFb.plantedSheets} with the plant; ` +
+        `rules ${varFallbacks.rules} -> ${varFb.plantedRules} (delta ${varFb.plantedRules - varFallbacks.rules}, want ${PLANT_RULES}); ` +
+        `fallbacks ${varFallbacks.fallbacks} -> ${varFb.plantedFallbacks} (delta ${varFb.plantedFallbacks - varFallbacks.fallbacks}, want ${PLANT_FALLBACKS})`,
+    );
+    /* THE RECORDED INVENTORY. One entry, and it is a LENGTH rather than a
+       colour: the table-breakout budget legitimately falls back to 100% when
+       no budget has been published yet. Adding a var() fallback to this
+       codebase is rare enough, and consequential enough, that it should
+       require a line here. */
+    const VAR_FALLBACK_INVENTORY = [".markdown-body .table-container.table-breakout | --mv-breakout-budget -> 100%"];
+    const invActual = (varFallbacks.inventory || []).slice().sort();
+    const invWanted = VAR_FALLBACK_INVENTORY.slice().sort();
+    check(
+      "10f2: the product's var() fallback inventory is exactly what was recorded",
+      invActual.length === invWanted.length && invActual.every((s, i) => s === invWanted[i]),
+      `found [${invActual.join(" ; ")}], recorded [${VAR_FALLBACK_INVENTORY.join(" ; ")}]`,
+    );
+    check(
+      "10f2: no rule falls back to a literal colour when a token is missing",
+      varFallbacks.literal.length === 0,
+      `${varFallbacks.literal.length} literal fallback(s) across ${varFallbacks.rules} rules / ${varFallbacks.fallbacks} var() fallback(s) in [${varFallbacks.seen.join(", ")}]: ${varFallbacks.literal.map((h) => h.text).join(" | ")}`,
+    );
+    /* THE CONVERSE, AND WITHOUT IT THE RULE ABOVE IS A TRADE RATHER THAN A
+       FIX. "No literal fallbacks" removes the safety net; it does not say the
+       net is unnecessary. A declaration reading `var(--text-secondary)` with
+       no fallback becomes INVALID AT COMPUTED-VALUE TIME if the token is
+       missing - for `color` that means it INHERITS, so a scheme block that
+       forgot the token would silently paint the menu caption in the row's own
+       ink. That is exactly the "reads as a row" defect R343 exists to prevent,
+       arriving by a path R343 cannot see, because R343 watches the rule and
+       this failure is in the token.
+       READ IN ALL SIX STATES, because the risk is per-scheme: the defaults can
+       carry every token while a curated block omits one.
+
+       AN EXACT SET, NOT A FILTERED ONE, and that correction came from running
+       it. The first form excluded a recorded list and asserted the remainder
+       empty, on the premise that an unresolved token is always a mistake. It
+       is not: `--tok-block-comment: inherit` is how this stylesheet SAYS
+       "Solarized Light writes no rule for block comments", and a custom
+       property declared `inherit` on body inherits from html, which has none,
+       so it computes to the guaranteed-invalid value and reads back EMPTY -
+       indistinguishable from a token nobody declared. Four light-default cells
+       are deliberately in that state and reproducing it is the whole point of
+       the frozen default.
+       So the claim is equality in BOTH directions against a per-state table.
+       A scheme that forgets a token appears as an EXTRA and fails; a cell that
+       stops being deliberately-inherited appears as a MISSING and fails, which
+       makes the table self-expiring in the same way the drift excusals are -
+       an entry cannot outlive its reason. A filter could only ever have caught
+       the first of those two. */
+    const UNRESOLVED_BY_DESIGN = {
+      /* Published onto the table container by JavaScript
+         (renderer.js:5129 sets --table-breakout-width; --mv-breakout-applied is
+         derived from it in the same rule), so body legitimately has neither. */
+      "*": ["--mv-breakout-applied", "--table-breakout-width"],
+      /* The four cells where Solarized Light declares no rule at all and the
+         stylesheet reproduces that with `inherit` rather than by guessing a
+         value. Every other state declares all four. */
+      "default-light": [
+        "--tok-block-comment",
+        "--tok-function-name",
+        "--tok-namespace",
+        "--tok-operator",
+      ],
+    };
+    const VAR_PROBE = `(() => {
+      const names = ${JSON.stringify(varFallbacks.consumed)};
+      const cs = getComputedStyle(document.body);
+      const empty = [];
+      for (const n of names) {
+        if (!cs.getPropertyValue(n).trim()) empty.push(n);
+      }
+      return JSON.stringify(empty);
+    })()`;
+    const varMissing = [];
+    const VAR_STATES = [
+      ["light", null, "default-light"],
+      ["dark", null, "default-dark"],
+      ...SCHEME_STATES.map(([m, s]) => [m, s, s]),
+    ];
+    for (const [mode, scheme, label] of VAR_STATES) {
+      await applySettled(mode, scheme, `10f3 ${label}`);
+      const empty = JSON.parse(await exec(VAR_PROBE)).sort();
+      const want = [
+        ...UNRESOLVED_BY_DESIGN["*"],
+        ...(UNRESOLVED_BY_DESIGN[label] || []),
+      ].sort();
+      for (const n of empty) {
+        if (!want.includes(n)) {
+          varMissing.push(
+            `${label}: --${n.replace(/^--/, "")} does not resolve, consumed by ${varFallbacks.consumedBy[n]}`,
+          );
+        }
+      }
+      for (const n of want) {
+        if (!empty.includes(n)) {
+          varMissing.push(
+            `${label}: ${n} now resolves, so its by-design entry must go`,
+          );
+        }
+      }
+    }
+    check(
+      "10f3: every token consumed without a fallback resolves, except exactly the cells recorded as deliberately inherited",
+      varFallbacks.consumed.length >= 80 && varMissing.length === 0,
+      `${varFallbacks.consumed.length} fallback-free token(s) consumed (floor 80); ` +
+        `${varMissing.length} mismatch(es): ${varMissing.slice(0, 6).join(" | ")}`,
+    );
+    await applySettled("light", null, "restore after fallback-free token probe");
 
     await applySettled("light", null, "restore after glow probe");
 
@@ -3090,8 +3826,47 @@ app.whenReady().then(async () => {
             for (const cls of CLASSES) {
               if (rule.selectorText.indexOf('.' + cls) === -1) continue;
               if (rule.selectorText.indexOf('::') !== -1) continue;
-              const bare = rule.selectorText.split(',').map(
-                (s) => s.split('.' + cls).join('').trim()).filter(Boolean);
+              /* EACH COMMA PART IS FILTERED AND SPLIT IN TWO, and both halves
+                 of that are fixes rather than tidying.
+
+                 FILTERED: the old form mapped EVERY part of the list as soon as
+                 ONE part carried the state class, so \`.a:hover, .b\` planted
+                 the state on \`.b\` as well - an element with no state rule at
+                 all. Those entries inflated the planned count without adding a
+                 single measurable difference.
+
+                 SPLIT: the old form stripped the class from the WHOLE selector
+                 and then added it back to whatever that selector matched. For
+                 a rule whose state sits on an ANCESTOR - and this product has
+                 seven, e.g. \`.mermaid-container:hover .mermaid-maximize-btn\` -
+                 that put the class on the DESCENDANT, so the rule never
+                 matched and the state was never actually exercised while the
+                 aggregate counts happily went on rising. The flip target is
+                 now the compound that carries the class (up to the first
+                 combinator) and the measure target is the full bare selector,
+                 scoped to that host at query time. */
+              const tok = '.' + cls;
+              const bare = rule.selectorText.split(',')
+                .map((s) => s.trim())
+                .filter((s) => s.indexOf(tok) !== -1)
+                .map((s) => {
+                  const at = s.indexOf(tok);
+                  const head = s.slice(0, at);
+                  const tail = s.slice(at + tok.length);
+                  const m = tail.match(/[\\s>+~]/);
+                  const flip = (head + (m ? tail.slice(0, m.index) : tail)).trim();
+                  const meas = (head + tail).trim();
+                  /* THE THIRD PART IS THE PROOF THAT THE FLIP LANDED. The
+                     installed generation sheets have already had \`:hover\` and
+                     friends rewritten to \`.__st_hov\`, so this comma part, AS
+                     WRITTEN, is the state rule's own selector. Carrying it
+                     through lets the measurement assert that the rule really
+                     matches once the class is applied, rather than assuming the
+                     flip target was chosen correctly. */
+                  return flip && meas
+                    ? flip + ' ||| ' + meas + ' ||| ' + s.trim() : '';
+                })
+                .filter(Boolean);
               for (const b of bare) (found[cls] = found[cls] || []).push(b);
             }
           }
@@ -3114,18 +3889,125 @@ app.whenReady().then(async () => {
       const plan = ${JSON.stringify(plan)};
       const out = {};
       const labels = {};
+      /* ONE RECORD PER PLANNED SELECTOR, REPLACING TWO FLAT STRING LISTS.
+         The lists were \`barren\` and \`unexercised\`, and the pair had three
+         defects that a review round found by reading and that the assertions
+         below could never have found by running.
+         (1) DIFFERENT DOMAINS, IDENTICAL CONSUMER. A selector with no hosts
+         hit \`continue\`, so it could never be a candidate for \`unexercised\`
+         in that mode - while the consumer required a selector to be
+         unexercised in BOTH modes. Every \`body.dark-mode ...\` state rule is
+         barren by construction in light, so it could be dead in dark and still
+         produce an empty intersection. The one assertion R372 is pointed at
+         was structurally incapable of firing for exactly the rule family whose
+         asymmetry its own comment spends a paragraph explaining.
+         (2) DIFFERENT KEYS. \`barren\` was keyed by the flip selector and
+         \`unexercised\` by the sentinel, so the two lists could not even be
+         cross-referenced after the fact to recover the answer.
+         (3) NO ERROR CHANNEL. Both \`catch\` arms fed the healthy path.
+         A record carries the three facts separately - did it have hosts, did
+         the rule match, did the query throw - so the consumer can apply the
+         right domain to each instead of intersecting two different ones. */
+      const sels = {};
       let elements = 0;
       const nameOf = (n) => n.tagName.toLowerCase() +
         (n.className && typeof n.className === 'string' && n.className.trim()
           ? '.' + n.className.trim().split(/\\s+/).join('.') : '') +
         (n.id ? '#' + n.id : '');
       for (const cls of Object.keys(plan)) {
-        for (const sel of plan[cls]) {
-          let els = [];
-          try { els = Array.prototype.slice.call(document.querySelectorAll(sel)); }
-          catch (e) { continue; }
-          for (const el of els.slice(0, 8)) {
-            el.classList.add(cls);
+        for (const entry of plan[cls]) {
+          const bits = entry.split(' ||| ');
+          const flipSel = bits[0];
+          const measSel = bits.length > 1 ? bits[1] : bits[0];
+          const sentSel = bits.length > 2 ? bits[2] : '';
+          let hosts = [];
+          const key = cls + ' ' + entry;
+          const rec = sels[key] || (sels[key] = {
+            cls: cls, flip: flipSel, sent: sentSel,
+            hosts: 0, matched: false, cells: 0, err: '',
+          });
+          /* FAILS CLOSED. This used to be \`catch (e) { continue; }\`, which
+             dropped the selector out of BOTH lists - so a flip target that
+             stopped parsing was reported as neither barren nor unexercised
+             but simply ceased to exist, and every total in the section went
+             on looking healthy. The error is now a recorded fact with its own
+             assertion. */
+          try { hosts = Array.prototype.slice.call(document.querySelectorAll(flipSel)); }
+          catch (e) { rec.err = 'flip: ' + (e && e.message ? e.message : 'threw'); continue; }
+          rec.hosts = hosts.length;
+          if (!hosts.length) continue;
+          /* NO CAP. This was \`hosts.slice(0, 8)\` with nothing recording that a
+             ninth match existed, so a regression on the ninth menu item was
+             invisible and no count ever said so - \`.context-menu-item\` alone
+             matches 30. The cap's recorded justification (putting every match
+             into the state at once repaints pictures the product never draws)
+             was never true of this loop: it flips ONE host, measures it, and
+             removes the class again before touching the next. So the cap was a
+             pure cost bound, and the cost was MEASURED rather than assumed -
+             uncapped the sweep compared 602 cells instead of 376 with no
+             increase in suite runtime, and 632 once the scaffold below reached
+             the surfaces this document never builds. Coverage is bounded by
+             the floors on \`compared\`, which are tied to that measurement. */
+          for (const host of hosts) {
+            host.classList.add(cls);
+            /* MEASURED THROUGH THE SENTINEL, NOT THROUGH A CONTAINMENT FILTER.
+               This was \`querySelectorAll(measSel)\` - the BARE selector, matched
+               document-wide - narrowed with
+               \`.filter((s) => s === host || host.contains(s))\`.
+               Two things were wrong with that, and the first is a live hole:
+
+               A SIBLING RULE CONTRIBUTED NOTHING AND EVERY GUARD STAYED GREEN.
+               The splitter above deliberately handles \`+\` and \`~\`
+               (\`tail.match(/[\\s>+~]/)\`), so \`.a:hover + .b\` yields
+               flip \`.a\`, meas \`.a + .b\`. The element \`.a + .b\` finds is a
+               SIBLING of the host, so \`host.contains(s)\` is false and it was
+               filtered away: zero cells, no \`elements++\`, while \`barren\`
+               saw hosts, the match check saw the sentinel match, and the cell
+               floor could not notice because the loss was already baked into
+               the number the floor was tied to.
+
+               AND A SELF RULE OVER-COUNTED. For \`.a:hover\`, meas is \`.a\`,
+               and the filter admitted any NESTED \`.a\` inside the host - an
+               element the state was never applied to, measured as though it
+               had been.
+
+               The sentinel is the state rule's own selector with the flip
+               class already in it, and exactly ONE host carries that class at
+               a time. So it selects precisely the elements this rule paints
+               for THIS host: siblings included, nested look-alikes excluded,
+               no filter required. It is not a wider net - it is the exact one.
+               The bare-selector path is kept only for a plan entry with no
+               third part, which the collector does not currently emit. */
+            let subs = [];
+            try {
+              subs = sentSel
+                ? Array.prototype.slice.call(document.querySelectorAll(sentSel))
+                : Array.prototype.slice.call(document.querySelectorAll(measSel))
+                    .filter((s) => s === host || host.contains(s));
+            } catch (e) {
+              if (!rec.err) rec.err = 'meas: ' + (e && e.message ? e.message : 'threw');
+              subs = [];
+            }
+            /* DID THE STATE RULE ACTUALLY MATCH? Everything else in this sweep
+               is blind to the answer: the cells are read off whatever the
+               measure selector finds, so a flip that lands on the wrong element
+               yields exactly the same cell set, with the state simply never
+               applied. That is not hypothetical - it is what the flip did for
+               seven ancestor-state rules, silently, while the totals rose.
+               ONCE ACROSS HOSTS, NOT PER HOST, and that is a correction rather
+               than a softening: a descendant rule cannot match for a host that
+               has no such descendant, and the product has plenty - not every
+               context menu item carries an icon. Requiring it per host reported
+               a rule as dead when it was merely inapplicable to one of thirty.
+               It is now READ OFF THE SAME QUERY THAT PRODUCES THE CELLS rather
+               than off a second, independent \`querySelector(sentSel)\` call.
+               That retires the last fail-open arm in this loop - the old one
+               was \`catch (e) { everMatched = true; }\`, which recorded an
+               unparseable sentinel as exercised - and it removes the state
+               where a selector could report "matched" while contributing zero
+               cells, because now one query decides both. */
+            if (subs.length) rec.matched = true;
+            for (const el of subs) {
             elements++;
             const nodes = [el].concat(
               Array.prototype.slice.call(el.querySelectorAll('*')));
@@ -3148,16 +4030,20 @@ app.whenReady().then(async () => {
               if (!fg) continue;
               out[cls + '@' + pathOf(el) + '>' + pathOf(n) + ':' + kind] =
                 rnd(fg) + ' on ' + rnd(surfaceOf(n));
+              rec.cells++;
               labels[cls + '@' + pathOf(el) + '>' + pathOf(n) + ':' + kind] =
                 cls.replace('__st_', ':') + ' ' + nameOf(el) +
                 (n === el ? '' : ' > ' + nameOf(n)) +
                 (n.textContent ? ' "' + n.textContent.trim().slice(0, 24) + '"' : '');
             }
-            el.classList.remove(cls);
+            }
+            host.classList.remove(cls);
           }
         }
       }
-      return JSON.stringify({ cells: out, labels: labels, elements: elements });
+      return JSON.stringify({
+        cells: out, labels: labels, elements: elements, sels: sels,
+      });
     })()`;
     const removeHead = `(() => {
       for (const s of Array.prototype.slice.call(
@@ -3172,6 +4058,81 @@ app.whenReady().then(async () => {
 
     const gen = {};
     let installedCount = 0;
+    /* THIRTEEN OF THE SIXTY-TWO PLANNED STATE SELECTORS MATCHED NOTHING, and
+       nothing said so until `barren` was surfaced. They are surfaces this
+       suite's document never builds - no tab bar, no note, no mermaid diagram,
+       no copied/disabled variant - so a hover-colour regression on any of them
+       was invisible to the frozen-default sweep. They are scaffolded rather
+       than driven: this sweep swaps STYLESHEETS and compares the two results,
+       so its subject only has to be an element carrying the right classes in
+       the right ancestry. Both halves of the swap see the identical scaffold
+       (the DOM is JS-built and is NOT swapped), so a scaffold whose markup is
+       wrong yields the same cells twice and reports no drift - it can under-
+       report, never false-report. Same precedent as section 9, which injects
+       elements carrying Prism classes no bundled grammar emits.
+       The ancestry is not guessed: `.mermaid-maximize-btn` and `.img-zoom-btn`
+       are nested because their rules put the state on the CONTAINER, and every
+       other flip target is a bare compound. Each carries text or an icon,
+       because the probe records only nodes that paint ink.
+       THE ATTACHMENT CHECK IS A MANIFEST, NOT A COUNT. It was `scaffolded >=
+       17` against a real 20 - a magic floor of exactly the shape this section
+       removes elsewhere, with three of twenty in slack, so the note-tooltip
+       pair and the note label could all have been deleted while the assertion
+       named for attaching them went on passing. A bare count is also blind to
+       the thing that actually matters here: a review round pointed out that a
+       scaffold can keep its element count while losing the ANCESTRY a rule
+       depends on, in which case the sweep proves the scaffold rather than the
+       product. Each required node is now asserted through the descendant path
+       its state rule needs, and the total is pinned exactly. */
+    const SCAFFOLD_MANIFEST = [
+      ".tab-bar > .tab > .tab-title",
+      ".tab-bar > .tab > .tab-close",
+      ".context-menu > .context-menu-item.disabled",
+      ".context-menu-item.disabled > svg",
+      ".tools-menu-recent-item",
+      ".mermaid-container > .mermaid-maximize-btn",
+      ".img-zoom-container > .img-zoom-btn",
+      ".code-copy-btn.copied",
+      ".notes-item",
+      ".note-label",
+      ".note-tooltip > .note-tooltip-close",
+    ];
+    const SCAFFOLD_NODES = 20;
+    const SCAFFOLD = `(() => {
+      const d = document.createElement('div');
+      d.id = '__st_scaffold';
+      d.innerHTML =
+        '<div class="tab-bar"><div class="tab"><span class="tab-title">scaffold.md</span>' +
+        '<button class="tab-close">x</button></div></div>' +
+        '<div class="context-menu"><div class="context-menu-item disabled">' +
+        '<svg width="16" height="16" viewBox="0 0 24 24" fill="none" ' +
+        'stroke="currentColor" stroke-width="2"><rect x="4" y="4" width="16" ' +
+        'height="16"></rect></svg><span>Disabled item</span></div></div>' +
+        '<div class="tools-menu-recent-item">recent.md</div>' +
+        '<div class="mermaid-container"><button class="mermaid-maximize-btn">M</button></div>' +
+        '<div class="img-zoom-container"><button class="img-zoom-btn">Z</button></div>' +
+        '<button class="code-copy-btn copied">Copied</button>' +
+        '<div class="notes-item"><span>A scaffolded note</span></div>' +
+        '<span class="note-label">label</span>' +
+        '<div class="note-tooltip"><button class="note-tooltip-close">x</button></div>';
+      document.body.appendChild(d);
+      const missing = [];
+      for (const sel of ${JSON.stringify(SCAFFOLD_MANIFEST)}) {
+        if (d.querySelectorAll(sel).length !== 1) missing.push(sel);
+      }
+      return JSON.stringify({
+        nodes: document.querySelectorAll('#__st_scaffold *').length,
+        missing: missing,
+      });
+    })()`;
+    const scaffold = JSON.parse(await exec(SCAFFOLD));
+    const scaffolded = scaffold.nodes;
+    check(
+      "the state-sweep scaffold really attached the surfaces this document never builds",
+      scaffolded === SCAFFOLD_NODES && scaffold.missing.length === 0,
+      `${scaffolded} scaffold elements attached (expected ${SCAFFOLD_NODES}); ` +
+        `missing ancestry: ${scaffold.missing.join(" | ") || "none"}`,
+    );
     for (const which of ["tree", "head"]) {
       installedCount = await exec(installGen(genSheets[which]));
       const sels = JSON.parse(await exec(COLLECT_STATE_SELECTORS));
@@ -3193,14 +4154,50 @@ app.whenReady().then(async () => {
       }
     }
     const leftOver = await exec(removeHead);
+    const scaffoldLeft = await exec(`(() => {
+      const d = document.getElementById('__st_scaffold');
+      if (d) d.remove();
+      return document.querySelectorAll('#__st_scaffold').length;
+    })()`);
     await applySettled("light", null, "restore working-tree stylesheets");
 
     check(
       "both stylesheet generations really were installed and then removed again",
-      installedCount === 2 && leftOver === 0,
-      `installed ${installedCount} sheets, ${leftOver} left behind`,
+      installedCount === 2 && leftOver === 0 && scaffoldLeft === 0,
+      `installed ${installedCount} sheets, ${leftOver} left behind, ` +
+        `${scaffoldLeft} scaffold roots left behind`,
     );
     const planned = Object.values(plan).reduce((n, l) => n + l.length, 0);
+    /* THE THREE PREDICATES, EACH READ OVER ITS OWN DOMAIN. Every planned
+       selector produces one record per mode; the record separates "did it have
+       hosts" from "did the rule match" from "did a query throw", which the two
+       flat lists this replaces could not do. Keyed by the plan entry itself so
+       the same selector lines up across modes - the old lists used the flip
+       selector on one side and the sentinel on the other, so they could not
+       even be cross-referenced. */
+    const selKeys = [
+      ...new Set([
+        ...Object.keys(gen.tree.byMode.light.sels),
+        ...Object.keys(gen.tree.byMode.dark.sels),
+      ]),
+    ];
+    const barrenKeys = [];
+    const unexercisedKeys = [];
+    const selectorErrors = [];
+    for (const key of selKeys) {
+      const recs = ["light", "dark"]
+        .map((m) => gen.tree.byMode[m].sels[key])
+        .filter(Boolean);
+      const display = (recs[0].cls + " " + (recs[0].sent || recs[0].flip)).trim();
+      for (const r of recs) if (r.err) selectorErrors.push(`${display}: ${r.err}`);
+      // Barren only when NO mode could reach it - a rule scoped to one mode is
+      // legitimately unreachable in the other.
+      if (recs.every((r) => r.hosts === 0)) barrenKeys.push(display);
+      const withHosts = recs.filter((r) => r.hosts > 0);
+      if (withHosts.length && withHosts.every((r) => !r.matched)) {
+        unexercisedKeys.push(display);
+      }
+    }
     const drift = [];
     let compared = 0;
     for (const mode of ["light", "dark"]) {
@@ -3219,8 +4216,65 @@ app.whenReady().then(async () => {
     }
     console.log(
       `  note  cascade comparison: ${planned} state selectors, ` +
-        `${gen.tree.byMode.light.elements} elements put into state, ` +
-        `${compared} cells compared`,
+        `${gen.tree.byMode.light.elements} light / ` +
+        `${gen.tree.byMode.dark.elements} dark elements put into state, ` +
+        `${compared} cells compared; barren [${barrenKeys.join(", ") || "none"}]`,
+    );
+    /* A PLANNED SELECTOR THAT MATCHES NOTHING CONTRIBUTES NO CELLS AT ALL, and
+       the aggregate counts go on rising regardless - which is exactly how the
+       seven ancestor-state rules stayed unexercised while this sweep reported
+       healthy totals. Thirteen selectors were barren before the scaffold above
+       was added; the assertion is what keeps that from silently returning.
+       IT IS EVALUATED ACROSS BOTH MODES, and that is not a detail: the flip
+       target of `body.dark-mode .tab-close:hover` is `body.dark-mode
+       .tab-close`, which CANNOT match in light mode by construction. A
+       single-mode reading would have reported it permanently barren and either
+       failed forever or been "fixed" by an excusal for a non-defect. Only a
+       selector unreachable in BOTH modes is genuinely out of the sweep. */
+    check(
+      "every planned state selector reaches an element in at least one mode",
+      barrenKeys.length === 0,
+      `barren in both modes: ${barrenKeys.join(", ")}`,
+    );
+    /* THE FLIP MUST LAND ON THE ELEMENT THE RULE IS ABOUT, and this is the only
+       assertion in the section that can tell. Everything else reads cells off
+       the measured elements, which a mis-aimed flip does not change - so the
+       ancestor-state defect produced an identical cell count with the state
+       never applied, and was invisible to drift, to the floors, to `barren`
+       and to the element counts alike. Measured, not assumed: putting the old
+       whole-selector flip back moves not one number in this section.
+
+       THE DOMAIN IS "MODES WHERE THE SELECTOR HAD HOSTS", NOT "BOTH MODES",
+       and that correction is the whole point of the rewrite above. The old
+       form intersected `unexercised` across both modes exactly as `barren` is
+       intersected - but the two predicates do not share a domain. A selector
+       with no hosts never reached the match check at all, so it was absent
+       from that mode's `unexercised` list; requiring membership in BOTH lists
+       therefore made the assertion unable to fire for every rule that is
+       barren-by-construction in one mode. That is precisely the
+       `body.dark-mode ...:hover` family - including the file's own worked
+       example - so the guard was structurally blind to the rules its own
+       comment was written about. Reading only the modes that had hosts keeps
+       the asymmetry handled (a light-barren rule is judged on dark alone)
+       without letting it excuse a dead rule. */
+    check(
+      "every state rule really matched once its element was put into the state",
+      unexercisedKeys.length === 0,
+      `had hosts but never matched: ${unexercisedKeys.slice(0, 8).join(", ")}` +
+        (unexercisedKeys.length > 8 ? ` (+${unexercisedKeys.length - 8} more)` : ""),
+    );
+    /* NEITHER OF THE TWO ABOVE CAN SEE A SELECTOR THAT STOPPED PARSING, and
+       before this both `catch` arms fed the healthy path: a throwing flip
+       query `continue`d out of both lists, and a throwing sentinel query was
+       recorded as a successful match. So a selector the browser rejected was
+       reported as neither barren nor unexercised - it simply stopped existing,
+       silently, while every total in the section went on looking right. That
+       is this project's "an absence check that fails open" disease, twice in
+       one loop. The errors now have their own subject and their own name. */
+    check(
+      "no planned state selector was dropped because a query threw",
+      selectorErrors.length === 0,
+      `${selectorErrors.length} selector(s) threw: ${selectorErrors.slice(0, 5).join(" | ")}`,
     );
     /* THE ONE THING THE SWAP CANNOT HOLD STILL. Only the CSS is exchanged; the
        DOM is built by JavaScript, which the swap leaves at the working tree's
@@ -3232,8 +4286,14 @@ app.whenReady().then(async () => {
        and its continued necessity is asserted, so it cannot quietly widen into
        a licence for the chrome around it. */
     const DEFAULT_DRIFT_EXCUSALS = {
-      "theme-scheme-group":
-        "the 'Light schemes' and 'Dark schemes' group headings are chrome this change introduces; HEAD has no rule for them, so the HEAD half measures the menu's inherited ink and the tree half the muted heading colour they were given",
+      /* EMPTY, AND THAT IS A RESULT RATHER THAN AN OMISSION. This carried one
+         entry - the "Light schemes" / "Dark schemes" group headings - for as
+         long as that chrome was uncommitted. Once it landed at HEAD both halves
+         of the swap render it from the same rule, the drift disappeared, and
+         the stale-excusal guard below FAILED and named it. Removed on that
+         measurement. An excusal here is a statement about what HEAD lacks, so
+         it expires the moment the change is committed; the guard is what stops
+         one outliving its reason and quietly pardoning a real regression. */
     };
     const driftExcusalUsed = new Set();
     const realDrift = drift.filter((d) => {
@@ -3242,9 +4302,35 @@ app.whenReady().then(async () => {
       }
       return true;
     });
+    /* FLOORS TIED TO A MEASUREMENT, NOT TO ROUND NUMBERS. These stood at
+       `planned >= 30 && compared >= 200` against a measured 62 and 376 - so the
+       sweep could have lost half its selectors and 47% of its cells and still
+       reported itself pinned, which is the same magic-number disease as the
+       licence guard's `> 200` against a real 220. Retied to what the sweep
+       actually measures, printed on every run in the note above. A legitimate
+       CSS change that removes a state rule will lower `planned` and fail here:
+       that is the intended cost, because the alternative is a floor nobody
+       re-reads. Raise them only after reading the printed counts.
+
+       SPLIT OUT OF THE DRIFT CLAIM, and the split is a fix rather than tidying.
+       The floors used to be `&&`-ed into the assertion named "neither frozen
+       default has changed a single state colour since HEAD" - so R373
+       (reinstate the 8-match cap) and R374 (remove the scaffold), neither of
+       which changes a single colour, both failed under a name announcing a
+       colour regression in the frozen defaults. This project treats a failure
+       naming the wrong thing as the most expensive kind and rewrote R366's
+       expect for exactly that reason; the same standard applies here. The two
+       claims are now separate subjects with separate names, and the reverts
+       point at the one they actually break. */
+    check(
+      "the state-cascade sweep still covers as much as it was measured to cover",
+      planned >= 62 && compared >= 632,
+      `${planned} state selectors planned (floor 62), ` +
+        `${compared} cells compared against HEAD (floor 632)`,
+    );
     check(
       "neither frozen default has changed a single state colour since HEAD",
-      planned >= 30 && compared >= 200 && realDrift.length === 0,
+      realDrift.length === 0,
       `${planned} state selectors planned, ${compared} cells compared against HEAD; ` +
         realDrift.slice(0, 12).join(" | ") +
         (realDrift.length > 12 ? ` (+${realDrift.length - 12} more)` : ""),
@@ -3256,6 +4342,19 @@ app.whenReady().then(async () => {
       "every default-drift excusal still names chrome that HEAD really lacks",
       staleDriftExcusals.length === 0,
       `no longer drifting, so the entries must go: ${staleDriftExcusals.join(", ")}`,
+    );
+    /* THE GUARD ABOVE IS INERT WHILE THE TABLE IS EMPTY - `[].every(...)` is
+       true, so it has nothing to say and cannot fail. That is correct for what
+       it checks, but it means the table's SIZE is unpinned, and an excusal
+       added by hand would arrive silently and pardon a real regression from its
+       first run. Asserted separately rather than folded in, because the two
+       fail for different reasons and each should name its own: this one says an
+       excusal was ADDED, the one above says an existing excusal EXPIRED. The
+       measured count is 0 - see the table's own comment for why it emptied. */
+    check(
+      "the default-drift excusal table is still empty",
+      Object.keys(DEFAULT_DRIFT_EXCUSALS).length === 0,
+      `excusals present: ${Object.keys(DEFAULT_DRIFT_EXCUSALS).join(", ")}`,
     );
 
     for (const [mode, scheme] of SCHEME_STATES) {
@@ -3334,6 +4433,743 @@ app.whenReady().then(async () => {
         ambiguous.map((b) => `${b.sel} rest=${b.rest} state=${b.state}`).join(" | "),
     );
     await applySettled("light", null, "restore after hover probe");
+
+    /* ── 10l: SELECTED CODE - the surface the product paints, not the one the
+       stylesheet appears to describe ────────────────────────────────────────
+       --code-selection-bg was the last colour in this item chosen rather than
+       measured, and it is the only themed surface that is TRANSLUCENT on
+       purpose, which is why no other section reaches it:
+         - 10d skips fully transparent surfaces and reads RESTING backgrounds,
+           and a ::selection background is neither;
+         - 10g replays a rule's declarations onto a real element, and a
+           pseudo-element cannot be selected, so it is skipped by construction;
+         - the golden records painted colours, and nothing is selected while it
+           is captured.
+
+       THE FIRST VERSION OF THIS SECTION SCORED THE WRONG INK, and it is worth
+       recording exactly how, because the mistake was invisible from the CSS.
+       It composited the selection tint over the code background and scored the
+       TOKEN colours against the result - which is what the stylesheet looks
+       like it does, since the code ::selection rule overrides `background`.
+       But the app-wide `::selection` rule further down also declares `color`,
+       and nothing was overriding THAT, so selecting code replaced the entire
+       syntax palette with one flat ink. Captured pixels settled it: an
+       unselected block paints 1264 distinct colours and a selected one paints
+       128. The section reported 3.5-4.4:1 for the four schemes while the
+       reader was actually looking at 1.36, 1.55, 2.18 and 2.15. (Those last
+       two were first written down as 1.48 and 1.59, which were honest readings
+       taken before abyss's and ember's highlight alphas were raised to their
+       shipped 35% and 32%. The two light schemes' pastels are opaque, so their
+       figures could not go stale the same way - which is exactly how the
+       staleness was spotted.)
+
+       SO THE REGIME IS MEASURED FIRST, AND ASSERTED. Two are possible:
+         FLAT    - a ::selection colour is declared, every token is painted in
+                   it, and the thing to score is that ONE ink. It is body text
+                   on a background, so the bar is 4.5:1.
+         THROUGH - no ::selection colour is declared, the token colours survive
+                   (Chromium does this for `color: currentColor`, measured),
+                   and the thing to score is EVERY token. A syntax palette
+                   cannot realistically hold 4.5:1 against a tinted background,
+                   so the bar is 3:1, WCAG 1.4.11.
+       Which regime the product is in is detected by reading the ::selection
+       colour of tokens that have DIFFERENT resting colours: one distinct value
+       across many distinct inks is flat by definition. It is asserted as well
+       as detected, so flipping the regime is a decision someone has to make
+       out loud rather than a side effect.
+
+       THE VISIBILITY FLOOR IS THE OTHER HALF, and without it the section is
+       trivially satisfiable: a nearly transparent selection scores perfectly
+       on legibility while ceasing to be a selection at all. Both are asserted,
+       and the floors are RECORDED MEASUREMENTS per state rather than one
+       chosen number, because the light schemes highlight with opaque pastels
+       (~1.27) and the dark ones with translucent accent tints (~1.95); a
+       single shared bar would have to sit under the lower pair and would then
+       be unable to see a regression in the higher four. The shared 1.2 is kept
+       underneath as an absolute backstop for a scheme added later.
+
+       THE SUBJECT IS EVERY RENDERED CODE BLOCK, not the first one. The fixture
+       renders 13, and an earlier draft read only `querySelector` - the
+       JavaScript block - so the worst ink in the HTML block was outside the
+       claim while the assertion said "every token". */
+    const SELECTION_FLAT_MIN = 4.5;
+    const SELECTION_TOKEN_MIN = 3.0;
+    /* Recorded from a run, then pinned. The light default's 12.05 is Solarized
+       Light's own opaque navy and is by far the most visible highlight in the
+       product; the light schemes' ~1.27 is a deliberate pastel. */
+    const SELECTION_VISIBLE_FLOOR = {
+      "light default": 12.0,
+      "dark default": 1.9,
+      clarity: 1.27,
+      parchment: 1.26,
+      abyss: 1.9,
+      ember: 1.9,
+    };
+    /* The lower bar applied to a dimmed cell's EFFECTIVE ratio - see the
+       assertion that consumes it for why a dimmed cell needs two bars. */
+    const SELECTION_DIMMED_EFFECTIVE_MIN = 3.0;
+    const selectionByState = {};
+    for (const [mode, scheme] of [["light", null], ["dark", null], ...SCHEME_STATES]) {
+      const label = scheme || mode + " default";
+      await applySettled(mode, scheme, label + " (selection)");
+      selectionByState[label] = JSON.parse(
+        await exec(`(() => {
+          const parse = (v) => {
+            const m = String(v).match(/rgba?\\(([^)]+)\\)/);
+            if (!m) return null;
+            const p = m[1].split(',').map((s) => parseFloat(s.trim()));
+            return { r: p[0], g: p[1], b: p[2], a: p.length > 3 ? p[3] : 1 };
+          };
+          const lum = (c) => {
+            const f = (v) => { v /= 255; return v <= 0.03928 ? v / 12.92 : Math.pow((v + 0.055) / 1.055, 2.4); };
+            return 0.2126 * f(c.r) + 0.7152 * f(c.g) + 0.0722 * f(c.b);
+          };
+          const ratio = (a, b) => {
+            const l1 = lum(a), l2 = lum(b);
+            return (Math.max(l1, l2) + 0.05) / (Math.min(l1, l2) + 0.05);
+          };
+          const over = (fg, bg) => ({
+            r: fg.r * fg.a + bg.r * (1 - fg.a),
+            g: fg.g * fg.a + bg.g * (1 - fg.a),
+            b: fg.b * fg.a + bg.b * (1 - fg.a),
+            a: 1,
+          });
+          /* THE BACKDROP IS RESOLVED PER NODE, not once for the block. A token
+             can carry its own background - .token.entity does, and it is the
+             cell 10a distinguishes from operator BY that background - so the
+             selection over an entity composites onto a different colour than
+             the selection over the code panel. Translucent layers in between
+             are composited too rather than skipped.
+
+             THE ALPHA THRESHOLDS MATCH THE OTHER FOUR BACKDROP WALKERS IN THIS
+             FILE (10d, 10g, 10h, 10i) EXACTLY, and they did not always: this
+             one was written with "> 0.001" / "> 0.999" while the rest use
+             "> 0" / ">= 0.999". A layer at exactly a=0.999 was therefore
+             OPAQUE to the other four and TRANSLUCENT here, so two sections
+             could score the same stack against different backdrops and neither
+             would look wrong on its own. Nothing in the product sits at that
+             alpha today, which is precisely why it had to be fixed by reading
+             rather than waiting for a failure.
+             (NOTE THE QUOTES: this comment lives inside an exec() template
+             literal, so a backtick here becomes a tagged template call. That
+             has now cost seven diagnoses in this project.) */
+          const backdropOf = (node) => {
+            const stack = [];
+            let n = node;
+            while (n) {
+              const c = parse(getComputedStyle(n).backgroundColor);
+              if (c && c.a > 0) {
+                stack.push(c);
+                if (c.a >= 0.999) break;
+              }
+              n = n.parentElement;
+            }
+            let base = { r: 255, g: 255, b: 255, a: 1 };
+            for (let i = stack.length - 1; i >= 0; i--) base = over(stack[i], base);
+            return base;
+          };
+          /* Opacity is CUMULATIVE and it thins the ink. An earlier draft
+             skipped any token with opacity < 1, which silently dropped
+             --tok-namespace - a cell that exists precisely because Solarized
+             leaked an opacity of .7 into it. */
+          const opacityOf = (node, stop) => {
+            let o = 1, n = node;
+            while (n) {
+              const v = parseFloat(getComputedStyle(n).opacity);
+              if (!isNaN(v)) o *= v;
+              if (n === stop) break;
+              n = n.parentElement;
+            }
+            return o;
+          };
+          const pres = [...document.querySelectorAll('.markdown-body pre[class*="language-"]')];
+          if (!pres.length) return JSON.stringify({ error: 'no highlighted code block rendered' });
+          /* THE FILL IS READ FROM THE CASCADE, NOT FROM THE VARIABLE.
+             This used to paint a probe span with the DECLARED value of
+             --code-selection-bg and measure that:
+
+               probe.style.background = getComputedStyle(pres[0])
+                 .getPropertyValue('--code-selection-bg').trim();
+
+             which answers "what does the variable say" rather than "what does
+             a selection paint". Every number this section reports - the
+             composite, each legibility ratio, the visibility floor - is scored
+             against that fill, so if the code ::selection rule ever stopped
+             WINNING (a scheme-scoped rule at higher specificity, a rule that
+             consumes a different variable, or the whole rule being dropped at
+             parse time) the section would go on reporting a colour that no
+             longer paints anything. That is the disjunction disease in its
+             purest form, inside the section written to close it - and it is
+             observable: under R357 the rule is annihilated and the real
+             highlight becomes var(--primary-color), yet the old code still
+             composited --code-selection-bg.
+
+             getComputedStyle(el, '::selection') is a real end-to-end oracle in
+             this Chromium - theme-census.js relies on it for the golden - and
+             measured across all six states it returns EXACTLY the declared
+             value today, so this change moves no number on a clean tree. It
+             only removes the way the numbers could go phantom. */
+          const paintedFill = getComputedStyle(pres[0], '::selection').backgroundColor;
+          const selRaw = parse(paintedFill);
+          if (!selRaw) return JSON.stringify({ error: 'unparseable selection colour' });
+          /* The declared value is still read, but only to report whether the
+             two agree. Keeping it as a SEPARATE observation is the point: it
+             says "the rule routes through the variable" without being allowed
+             to answer "this is what paints". */
+          const probe = document.createElement('span');
+          pres[0].appendChild(probe);
+          probe.style.background = getComputedStyle(pres[0]).getPropertyValue('--code-selection-bg').trim();
+          const declaredFill = getComputedStyle(probe).backgroundColor;
+          probe.remove();
+          /* THE INK NEEDS THE SAME PAIR, and it did not have one. The fill was
+             the only channel with a painted-vs-declared comparison, which made
+             it the only assertion able to notice the code selection rule being
+             lost entirely in the four SCHEMES - the golden covers the two
+             frozen defaults alone, and every contrast assertion here scores the
+             DECLARED variables, so it stays green while the screen is wrong.
+             Measured: that is exactly what R357 does.
+             READ ACROSS EVERY BLOCK, not just the first. A rule targeting one
+             language - code[class*="language-js"]::selection - would retint a
+             single block and a first-block sample would never see it. */
+          const inkProbe = document.createElement('span');
+          pres[0].appendChild(inkProbe);
+          inkProbe.style.color = getComputedStyle(pres[0]).getPropertyValue('--code-selection-fg').trim();
+          const declaredInk = getComputedStyle(inkProbe).color;
+          inkProbe.remove();
+          const paintedFills = [...new Set(pres.map((p) => getComputedStyle(p, '::selection').backgroundColor))];
+          const paintedInks = [...new Set(pres.map((p) => getComputedStyle(p, '::selection').color))];
+
+          const cells = [];
+          const seen = new Set();
+          const restInks = new Set();
+          const selInks = new Set();
+          let tokenCount = 0;
+          for (const pre of pres) {
+            const subjects = [[':not(.token)', pre]];
+            for (const t of pre.querySelectorAll('.token')) subjects.push([t.className.trim().split(/\\s+/).join('.'), t]);
+            for (const [name, node] of subjects) {
+              tokenCount++;
+              const cs = getComputedStyle(node);
+              const rest = parse(cs.color);
+              if (!rest) continue;
+              restInks.add(cs.color);
+              const selCol = getComputedStyle(node, '::selection').color;
+              if (selCol) selInks.add(selCol);
+              const painted = parse(selCol) || rest;
+              const o = opacityOf(node, pre.parentElement);
+              const bg = over(selRaw, backdropOf(node));
+              const ink = o < 0.999 ? over({ r: painted.r, g: painted.g, b: painted.b, a: o }, bg) : painted;
+              const key = name + '|' + selCol + '|' + Math.round(bg.r) + ',' + Math.round(bg.g) + ',' + Math.round(bg.b) + '|' + o;
+              if (seen.has(key)) continue;
+              seen.add(key);
+              cells.push({
+                name: name,
+                rest: cs.color,
+                painted: selCol,
+                opacity: o,
+                on: 'rgb(' + Math.round(bg.r) + ', ' + Math.round(bg.g) + ', ' + Math.round(bg.b) + ')',
+                ratio: ratio(ink, bg),
+                choice: ratio(painted, bg),
+              });
+            }
+          }
+          cells.sort((a, b) => a.ratio - b.ratio);
+          /* THE INLINE HIGHLIGHTED SURFACE, which every assertion above is
+             blind to. The code selection rule is scoped to
+             code[class*="language-"] as well as to pre, so it applies to
+             INLINE highlighted code too - and inline code sits on
+             --code-inline-bg, a different backdrop from --code-bg. The
+             selection alphas were derived by measuring against --code-bg
+             alone, so nothing had ever checked that the same translucent tint
+             stays legible on the inline surface. The fixture renders one
+             deliberately.
+             NOTE FOR EDITORS: never a backtick in here. */
+          const inlines = [...document.querySelectorAll('.markdown-body :not(pre) > code[class*="language-"]')];
+          const inlineCells = [];
+          const inlineSeen = new Set();
+          for (const el of inlines) {
+            const subjects = [[':not(.token)', el]];
+            for (const t of el.querySelectorAll('.token')) subjects.push([t.className.trim().split(/\\s+/).join('.'), t]);
+            for (const [name, node] of subjects) {
+              const cs = getComputedStyle(node);
+              const rest = parse(cs.color);
+              if (!rest) continue;
+              const selCol = getComputedStyle(node, '::selection').color;
+              const painted = parse(selCol) || rest;
+              const o = opacityOf(node, el.parentElement);
+              const inlineFill = parse(getComputedStyle(el, '::selection').backgroundColor) || selRaw;
+              const bg = over(inlineFill, backdropOf(node));
+              const ink = o < 0.999 ? over({ r: painted.r, g: painted.g, b: painted.b, a: o }, bg) : painted;
+              const key = name + '|' + selCol + '|' + Math.round(bg.r) + ',' + Math.round(bg.g) + ',' + Math.round(bg.b) + '|' + o;
+              if (inlineSeen.has(key)) continue;
+              inlineSeen.add(key);
+              inlineCells.push({
+                name: name,
+                painted: selCol,
+                opacity: o,
+                on: 'rgb(' + Math.round(bg.r) + ', ' + Math.round(bg.g) + ', ' + Math.round(bg.b) + ')',
+                ratio: ratio(ink, bg),
+              });
+            }
+          }
+          inlineCells.sort((a, b) => a.ratio - b.ratio);
+          const inlineBehind = inlines.length ? backdropOf(inlines[0].parentElement) : null;
+          const inlineOwn = inlines.length ? backdropOf(inlines[0]) : null;
+          const inlineFill0 = inlines.length
+            ? (parse(getComputedStyle(inlines[0], '::selection').backgroundColor) || selRaw)
+            : null;
+          const behind = backdropOf(pres[0]);
+          const effective = over(selRaw, behind);
+          return JSON.stringify({
+            declared: getComputedStyle(pres[0]).getPropertyValue('--code-selection-bg').trim(),
+            declaredFg: getComputedStyle(pres[0]).getPropertyValue('--code-selection-fg').trim(),
+            paintedFill: paintedFill,
+            declaredFill: declaredFill,
+            declaredInk: declaredInk,
+            paintedFills: paintedFills,
+            paintedInks: paintedInks,
+            alpha: selRaw.a,
+            blocks: pres.length,
+            langs: pres.map((p) => (String(p.className).match(/language-[\\w+#-]+/) || ['?'])[0]),
+            tokenCount: tokenCount,
+            restInks: restInks.size,
+            selInks: [...selInks],
+            effective: 'rgb(' + Math.round(effective.r) + ', ' + Math.round(effective.g) + ', ' + Math.round(effective.b) + ')',
+            behind: 'rgb(' + Math.round(behind.r) + ', ' + Math.round(behind.g) + ', ' + Math.round(behind.b) + ')',
+            visible: ratio(effective, behind),
+            inlineBlocks: inlines.length,
+            inlineFill: inlines.length ? getComputedStyle(inlines[0], '::selection').backgroundColor : null,
+            inlineInk: inlines.length ? getComputedStyle(inlines[0], '::selection').color : null,
+            inlineOn: inlineOwn ? 'rgb(' + Math.round(inlineOwn.r) + ', ' + Math.round(inlineOwn.g) + ', ' + Math.round(inlineOwn.b) + ')' : null,
+            inlineEffective: inlineOwn && inlineFill0
+              ? (function () { const e = over(inlineFill0, inlineOwn); return 'rgb(' + Math.round(e.r) + ', ' + Math.round(e.g) + ', ' + Math.round(e.b) + ')'; })()
+              : null,
+            inlineVisible: inlineOwn && inlineFill0 ? ratio(over(inlineFill0, inlineOwn), inlineOwn) : null,
+            inlineBehind: inlineBehind ? 'rgb(' + Math.round(inlineBehind.r) + ', ' + Math.round(inlineBehind.g) + ', ' + Math.round(inlineBehind.b) + ')' : null,
+            inlineCells: inlineCells,
+            cells: cells,
+          });
+        })()`),
+      );
+    }
+    await applySettled("light", null, "restore after selection probe");
+
+    const selStates = Object.keys(selectionByState);
+    const selErrors = selStates.filter((s) => selectionByState[s].error);
+    /* THE BLOCK COVERAGE CLAIM IS AN EXACT IDENTITY, NOT A LOWER BOUND.
+       This used to read `blocks < 12` while the fixture renders 13, under an
+       assertion named "across EVERY rendered block" - so the worst block could
+       stop rendering and the claim would still pass, and the comment justifying
+       it even said "nearly all of them", which is not what the name promises.
+       That is the guessed-floor shape this project keeps deleting.
+
+       The set below is MEASURED, not chosen: twelve language-tagged fences plus
+       one untagged fence that Prism classes `language-none`. Pinning the
+       identity rather than the count means a fence losing its language (falling
+       back to `none`) is caught too, which a count of 13 would wave through. */
+    const SELECTION_LANGS = [
+      "language-bash",
+      "language-c",
+      "language-cpp",
+      "language-csharp",
+      "language-css",
+      "language-html",
+      "language-java",
+      "language-javascript",
+      "language-json",
+      "language-none",
+      "language-python",
+      "language-sql",
+      "language-typescript",
+    ];
+    const langsOf = (s) => (selectionByState[s].langs || []).slice().sort().join(",");
+    /* VACUITY GUARD. An empty or thin cell list clears every bar below it for
+       free, so the subject is pinned before anything is scored.
+
+       THE FLOORS ARE MEASURED, NOT CHOSEN. They used to be a bare `8` on both
+       counts, which is the magic-number disease this file has already cured
+       twice (the `entries.length > 200` licence guard against a real 220, and
+       `SELECTION_VISIBLE_FLOOR["light default"]` sitting at a placeholder 1.0).
+       A floor nothing can fail is not an assertion: the real subject is
+       13 blocks / 8-9 resting inks / 55 cells in every one of the six states,
+       so `>= 8` cells had 47 cells of slack and would have waved through a
+       sweep that lost 85% of its coverage. The `note:` line below now prints
+       all three counts per state on every run, so the floor can never again
+       pass silently at a number nobody has read.
+
+       WHY 55 IS THE SAME IN ALL SIX STATES, and why `>= 55` is therefore safe
+       rather than brittle: a cell's key is `classSet|selectedInk|backdrop|
+       opacity`, and every state here is FLAT (one selected ink across the whole
+       block - see the regime note below), so the selected-ink component is
+       constant and the partition is decided by the FIXTURE, not the palette.
+       A future scheme that selected THROUGH (preserving token colours) would
+       only ever ADD cells, so the floor cannot false-fail on one.
+
+       THE OPACITY PARTITION CLAUSE THAT USED TO LIVE HERE WAS A TAUTOLOGY:
+       it added the `>= 0.999` and `< 0.999` buckets and compared the sum to
+       cells.length. Those two predicates are exact complements over every real
+       number, and `opacityOf` seeds `o = 1` and multiplies only when
+       `!isNaN(v)`, so `opacity` can never be NaN - the one value that could
+       have made it fire. It asserted a hazard the code had already made
+       impossible. What actually needs guarding is that BOTH buckets are
+       non-empty where they should be, and the assertions below do that. */
+    const thinStates = selStates.filter(
+      (s) =>
+        !selectionByState[s].error &&
+        (langsOf(s) !== SELECTION_LANGS.slice().sort().join(",") ||
+          selectionByState[s].blocks < 13 ||
+          selectionByState[s].restInks < 8 ||
+          selectionByState[s].cells.length < 55),
+    );
+    check(
+      "10l: every theme state measured selected code across every rendered block",
+      selStates.length === 6 && selErrors.length === 0 && thinStates.length === 0,
+      `${selStates.length} state(s); errors [${selErrors.map((s) => s + ": " + selectionByState[s].error).join(", ")}]; thin [${thinStates
+        .map(
+          (s) =>
+            `${s}: ${selectionByState[s].blocks} blocks [${langsOf(s)}] / ${selectionByState[s].restInks} inks / ${selectionByState[s].cells.length} cells`,
+        )
+        .join(", ")}]`,
+    );
+    /* THE FILL EVERY RATIO IS SCORED AGAINST MUST BE THE ONE THAT PAINTS.
+       10l reads it from getComputedStyle(el, '::selection') rather than from
+       --code-selection-bg (see the probe), and this assertion is what makes
+       that meaningful in the other direction: the painted fill must still AGREE
+       with the variable, so the rule is demonstrably routing through it and a
+       scheme can retint it. Measured across all six states, the two are
+       byte-identical; a divergence means some other rule has taken the fill
+       over and every number this section reports is describing the wrong
+       colour. */
+    const fillDrift = selStates.filter(
+      (s) =>
+        !selectionByState[s].error &&
+        selectionByState[s].paintedFill !== selectionByState[s].declaredFill,
+    );
+    check(
+      "10l: the selection fill that paints is the one --code-selection-bg declares",
+      selErrors.length === 0 && fillDrift.length === 0,
+      fillDrift
+        .map(
+          (s) =>
+            `${s}: paints ${selectionByState[s].paintedFill} but the variable says ${selectionByState[s].declaredFill}`,
+        )
+        .join(" | "),
+    );
+    /* AND THE INK, which had no such pair until a revert run proved it needed
+       one. R357 deletes the whole code-selection rule; the fill assertion above
+       is the ONLY thing in this section that notices for the four schemes,
+       because the golden covers the two frozen defaults and every contrast
+       assertion scores the DECLARED variables rather than what paints. An ink
+       regression on the same path had nothing at all. */
+    const inkDrift = selStates.filter(
+      (s) =>
+        !selectionByState[s].error &&
+        selectionByState[s].paintedInks[0] !== selectionByState[s].declaredInk,
+    );
+    check(
+      "10l: the selection ink that paints is the one --code-selection-fg declares",
+      selErrors.length === 0 && inkDrift.length === 0,
+      inkDrift
+        .map(
+          (s) =>
+            `${s}: paints ${selectionByState[s].paintedInks[0]} but the variable says ${selectionByState[s].declaredInk}`,
+        )
+        .join(" | "),
+    );
+    /* BOTH CHANNELS, ACROSS EVERY BLOCK. The two assertions above sample the
+       first block, which is enough for a rule that targets the whole surface
+       and blind to one that does not: code[class*="language-js"]::selection is
+       the same specificity and would retint exactly one of the thirteen. */
+    const blockSpread = selStates.filter(
+      (s) =>
+        !selectionByState[s].error &&
+        (selectionByState[s].paintedFills.length !== 1 || selectionByState[s].paintedInks.length !== 1),
+    );
+    check(
+      "10l: every rendered block paints the same selection fill and ink, not just the first",
+      selErrors.length === 0 && blockSpread.length === 0 && selStates.length === 6,
+      blockSpread
+        .map(
+          (s) =>
+            `${s}: fills [${selectionByState[s].paintedFills.join(", ")}] inks [${selectionByState[s].paintedInks.join(", ")}]`,
+        )
+        .join(" | "),
+    );
+    /* THE RECORDED FLOORS MUST DESCRIBE THE STATES THAT EXIST, and this guard
+       is now the ONLY thing standing between a new scheme and an unfloored
+       visibility bar.
+       It used to share that job with a `Math.max(SELECTION_VISIBLE_MIN, MAP[label] || 0)`
+       backstop at the consumer, which was dead code pretending to be a safety
+       net: every recorded floor is >= 1.26, the backstop was 1.2, so the
+       Math.max always returned the floor and the `|| 0` branch was
+       unreachable - precisely BECAUSE this assertion forbids a state without
+       an entry. A backstop that can only be reached by first failing another
+       assertion protects nothing, and it made the real floors look optional.
+       The consumer now reads the floor directly, so a state that ever did slip
+       through would compare against `undefined` and fail loudly rather than
+       quietly clearing a bar every scheme passes by construction.
+       Every other recorded map in this file (wantDimmed, SCHEME_EXCUSALS,
+       NEEDLE_EXCUSALS, DEFAULT_DRIFT_EXCUSALS) carries this guard; this one
+       was the exception. */
+    const floorKeys = Object.keys(SELECTION_VISIBLE_FLOOR).sort().join(",");
+    check(
+      "10l: every measured state has a recorded visibility floor, and no floor is left over",
+      floorKeys === selStates.slice().sort().join(","),
+      `floors [${floorKeys}] vs states [${selStates.slice().sort().join(",")}]`,
+    );
+    /* THE DIMMED BRANCH MUST BE EXERCISED, AND BY EXACTLY THE STATES THAT CAN
+       EXERCISE IT. The second legibility bar below scores dimmed cells on their
+       colour CHOICE, which is a weaker test than the effective ratio; an empty
+       dimmed bucket makes it vacuous. It is empty in the three DARK states and
+       that is correct rather than a hole: amendment 2 sets
+       --tok-namespace-opacity to 1 in body.dark-mode, so no dark token is
+       dimmed at all, and every dark cell is therefore scored on the STRICTER
+       bar. The light states inherit Solarized Light's own 0.7 and do carry one.
+       Asserting the exact split - rather than "at least one somewhere" - is
+       what stops dimming quietly appearing in dark (which would move cells onto
+       the weaker bar unnoticed) or quietly vanishing from light (which would
+       leave the weaker bar checking nothing). */
+    const dimmedStates = selStates.filter(
+      (s) => !selectionByState[s].error && selectionByState[s].cells.some((c) => c.opacity < 0.999),
+    );
+    const wantDimmed = ["light default", "clarity", "parchment"];
+    check(
+      "10l: exactly the light states carry a dimmed selected token, matching amendment 2's reach",
+      dimmedStates.slice().sort().join(",") === wantDimmed.slice().sort().join(","),
+      `dimmed in [${dimmedStates.join(", ")}], expected [${wantDimmed.join(", ")}]`,
+    );
+    /* THE REGIME, ASSERTED RATHER THAN ASSUMED. One distinct ::selection colour
+       across many distinct resting colours is a flat repaint by definition;
+       many distinct values means the tokens survive. The product is flat in
+       every state today, and it must be, because --code-selection-fg is what
+       carries the legibility of the four schemes - three of which have no
+       readable flat default available (their --on-accent-fg is near-black ink
+       meant for a light accent button). If this ever flips, the bar below
+       changes with it and that is a decision, not a detail. */
+    const regime = {};
+    for (const s of selStates) {
+      const st = selectionByState[s];
+      regime[s] = st.error ? "error" : st.selInks.length === 1 && st.restInks > 1 ? "flat" : "through";
+    }
+    const notFlat = selStates.filter((s) => regime[s] !== "flat");
+    check(
+      "10l: selected code is repainted in one flat ink in every state, not left as the syntax palette",
+      notFlat.length === 0,
+      notFlat
+        .map((s) => `${s}: ${regime[s]} (${(selectionByState[s].selInks || []).length} selection ink(s) over ${selectionByState[s].restInks} resting)`)
+        .join(" | ") || "all six flat",
+    );
+    for (const label of selStates) {
+      const st = selectionByState[label];
+      const bar = regime[label] === "through" ? SELECTION_TOKEN_MIN : SELECTION_FLAT_MIN;
+      /* THE SAME SPLIT 10g USES, and for the same reason. A cell painted at
+         full opacity is scored as the reader sees it. A cell the syntax layer
+         DIMS is scored on the colour choice BEFORE the dimming, because the
+         dimming is not the scheme's decision: --tok-namespace-opacity is 0.7
+         in :root, leaked from Solarized Light, and every light scheme inherits
+         it - the same leak amendment 2 identified and fixed for dark mode.
+         Measured, this is not academic: parchment's dimmed namespace cell
+         renders at 3.84:1 through its highlight while the ink it chose is
+         7.86:1 there. Holding the scheme to 3.84 would demand a darker ink
+         than any colour parchment declares, to compensate for a dimming it
+         does not own; dropping the bar to 3:1 for dimmed cells would be the
+         convenient answer rather than the right one. Scoring the choice is
+         what 10g already decided, so 10l follows it instead of inventing a
+         third rule.
+         Compared RAW - rounding to two decimals before the test lets 4.496
+         pass a 4.5 bar; the rounding belongs in the message only. */
+      const undimmed = (st.cells || []).filter((c) => c.opacity >= 0.999 && c.ratio < bar);
+      const dimmed = (st.cells || []).filter((c) => c.opacity < 0.999 && c.choice < bar);
+      const where = `${st.declared} over ${st.behind} = ${st.effective}, ink ${st.declaredFg || "(inherited)"}`;
+      check(
+        `${label}: selected code at full opacity is legible against its own highlight (${bar}:1)`,
+        !st.error && undimmed.length === 0,
+        `${where}; ${undimmed.length} of ${(st.cells || []).length} cell(s) below: ` +
+          undimmed
+            .slice(0, 6)
+            .map((c) => `${c.name} ${c.painted} on ${c.on} ${c.ratio.toFixed(2)}`)
+            .join(" | "),
+      );
+      check(
+        `${label}: selected code that inherits dimming chose a colour that was legible before it (${bar}:1)`,
+        !st.error && dimmed.length === 0,
+        `${where}; ${dimmed.length} dimmed cell(s) whose choice is below: ` +
+          dimmed
+            .slice(0, 6)
+            .map((c) => `${c.name} ${c.painted} @${c.opacity} on ${c.on} choice ${c.choice.toFixed(2)} effective ${c.ratio.toFixed(2)}`)
+            .join(" | "),
+      );
+      const floor = SELECTION_VISIBLE_FLOOR[label];
+      check(
+        `${label}: the selection highlight is still visible against the code behind it`,
+        !st.error && st.visible >= floor,
+        `${st.effective} against ${st.behind} = ${(st.visible || 0).toFixed(2)}, recorded floor ${floor}`,
+      );
+      /* A DIMMED CELL NEEDS A FLOOR OF ITS OWN, and until now it had none.
+         The bar above scores dimmed cells on their colour CHOICE - the ratio
+         the ink would have had before the inherited opacity - because the
+         scheme owns the choice and 10g already decided that the dimming is
+         Solarized Light's, not the scheme's. That is the right subject for
+         blame, but it means the ratio the READER actually sees was bounded by
+         nothing at all: parchment's namespace token renders at 3.84:1 today,
+         under an assertion whose name says 4.5, and a scheme could take it to
+         1.5 with the suite still green.
+         So the effective ratio is floored too, one bar lower. 3:1 is not a
+         second opinion about 4.5 - it is the large-text threshold, and it pins
+         the 3.84 that ships without demanding parchment fix a dimming it does
+         not own. */
+      const dimmedFaint = (st.cells || []).filter(
+        (c) => c.opacity < 0.999 && c.ratio < SELECTION_DIMMED_EFFECTIVE_MIN,
+      );
+      check(
+        `${label}: selected code that inherits dimming is still readable after it (${SELECTION_DIMMED_EFFECTIVE_MIN}:1)`,
+        !st.error && dimmedFaint.length === 0,
+        `${where}; ${dimmedFaint.length} dimmed cell(s) below: ` +
+          dimmedFaint
+            .slice(0, 6)
+            .map((c) => `${c.name} ${c.painted} @${c.opacity} on ${c.on} effective ${c.ratio.toFixed(2)}`)
+            .join(" | "),
+      );
+      /* THE INLINE HIGHLIGHTED SURFACE. Everything above measures
+         `pre[class*="language-"]`, but the code ::selection rule's selector
+         list also names `code[class*="language-"]`, which matches INLINE
+         highlighted code. That surface was in the rule's scope and outside
+         every measurement of it.
+
+         I EXPECTED THIS TO BE A DEFECT AND THE MEASUREMENT SAID OTHERWISE,
+         which is the only reason the premise is now asserted rather than
+         assumed. The suspicion was that inline code sits on --code-inline-bg,
+         a different variable from the --code-bg the theme-7-contrast alphas
+         were swept against, so the derived tints might not clear there. They
+         do, because the backdrop is not what I read: the ported Prism rule
+         `:not(pre) > code[class*="language-"] { background-color:
+         var(--code-bg) }` wins over `.markdown-body code`, so inline
+         HIGHLIGHTED code is painted on the very same --code-bg as a block.
+         Measured on abyss, whose two variables differ: the painted backdrop is
+         rgb(26,32,41) = --code-bg, not its --code-inline-bg #1e2531.
+         --code-inline-bg paints only UNHIGHLIGHTED inline code, which carries
+         no language- class and is therefore not matched by the code
+         ::selection rule at all - it takes the app-wide accent selection, and
+         is out of this section's scope by construction rather than by
+         omission.
+         That identity is asserted below, because it is the entire reason one
+         swept alpha covers both surfaces. If it ever stops holding, the two
+         bars here go on passing against a backdrop nobody derived them for.
+
+         THE INK IS SINGLE BY CONSTRUCTION, and that is a fact about the
+         PRODUCT rather than about the fixture: renderer.js highlightNewElements
+         selects `pre code:not(.prism-highlighted)`, so Prism never runs on
+         inline code and it carries no tokens at all. The loop below is written
+         over whatever cells the probe finds anyway, so if that selector is ever
+         widened the new token inks are scored without this assertion changing. */
+      const inlineBar = regime[label] === "through" ? SELECTION_TOKEN_MIN : SELECTION_FLAT_MIN;
+      const inlineFaint = (st.inlineCells || []).filter((c) => c.ratio < inlineBar);
+      check(
+        `${label}: selected INLINE highlighted code is legible against its own highlight (${inlineBar}:1)`,
+        !st.error && (st.inlineCells || []).length > 0 && inlineFaint.length === 0,
+        `${st.declared} over ${st.inlineOn} = ${st.inlineEffective}, ink ${st.inlineInk || "(inherited)"}; ` +
+          `${inlineFaint.length} of ${(st.inlineCells || []).length} cell(s) below: ` +
+          inlineFaint
+            .slice(0, 6)
+            .map((c) => `${c.name} ${c.painted} on ${c.on} ${c.ratio.toFixed(2)}`)
+            .join(" | "),
+      );
+      /* The SAME recorded floors as the block surface, and that is sound only
+         because of the backdrop identity asserted below - not because the two
+         numbers happened to come out close. */
+      check(
+        `${label}: the selection highlight is still visible against INLINE code's own background`,
+        !st.error && Number.isFinite(st.inlineVisible) && st.inlineVisible >= floor,
+        `${st.inlineEffective} against ${st.inlineOn} = ` +
+          `${Number.isFinite(st.inlineVisible) ? st.inlineVisible.toFixed(2) : "n/a"}, recorded floor ${floor}`,
+      );
+    }
+    /* THE PREMISE, asserted once across all six states: inline highlighted code
+       is painted on the SAME backdrop as a code block. Every alpha in
+       theme-7-contrast was derived by sweeping against that one backdrop, so
+       this identity is what lets a single derived tint cover both surfaces.
+       Point the inline rule at --code-inline-bg instead - which reads like an
+       obvious correction, since the variable is literally named for inline
+       code - and the swept alphas no longer describe the surface they land on.
+       Compared against the BLOCK's measured backdrop rather than against a
+       literal colour, so it holds for every scheme added later. */
+    const inlineBackdrop = selStates.filter(
+      (s) => selectionByState[s].error || selectionByState[s].inlineOn !== selectionByState[s].behind,
+    );
+    check(
+      "inline highlighted code sits on the same backdrop the selection alphas were derived against",
+      inlineBackdrop.length === 0,
+      inlineBackdrop
+        .map((s) => `${s}: inline ${selectionByState[s].inlineOn} vs block ${selectionByState[s].behind}`)
+        .join(" | ") || "all six states match",
+    );
+    /* THE SCOPE CLAIM, separate from the two bars above because it is the
+       CAUSE and they are the consequence. If inline code ever stops matching
+       the code ::selection rule it falls back to the app-wide accent selection
+       - which is opaque, not a tint - and the bars would go on measuring
+       something legible while the product had silently changed surface.
+       Comparing the inline fill against the BLOCK fill is what pins "the same
+       rule paints both", and it needs no literal colour of its own to do it. */
+    const inlineScope = selStates.filter(
+      (s) =>
+        selectionByState[s].error ||
+        !selectionByState[s].inlineBlocks ||
+        selectionByState[s].inlineFill !== selectionByState[s].paintedFill,
+    );
+    check(
+      "inline highlighted code is painted by the same code ::selection rule as a block",
+      inlineScope.length === 0,
+      inlineScope
+        .map(
+          (s) =>
+            `${s}: n=${selectionByState[s].inlineBlocks} inline ${selectionByState[s].inlineFill} vs block ${selectionByState[s].paintedFill}`,
+        )
+        .join(" | ") || "all six states match",
+    );
+    console.log(
+      `  note: selection - ` +
+        selStates
+          .map((s) => {
+            const st = selectionByState[s];
+            const und = (st.cells || []).filter((c) => c.opacity >= 0.999);
+            const dim = (st.cells || []).filter((c) => c.opacity < 0.999);
+            const worstU = und.reduce((m, c) => (m && m.ratio <= c.ratio ? m : c), null);
+            const worstD = dim.reduce((m, c) => (m && m.choice <= c.choice ? m : c), null);
+            const wU = worstU ? worstU.ratio : Infinity;
+            const wD = worstD ? worstD.choice : Infinity;
+            const d = dim.length;
+            const n = (x) => (Number.isFinite(x) ? x.toFixed(2) : "n/a");
+            /* THE WORST CELL IS NAMED, NOT JUST SCORED. A bare ratio in a note
+               is exactly the "a passing assertion never says what it passed
+               at" gap that left SELECTION_VISIBLE_FLOOR sitting at a
+               placeholder 1.0 - and it cost a diagnosis cycle again when three
+               dark states moved and the note could not say whether the WORST
+               CELL had changed or merely its ink. The name and the backdrop
+               make that readable at a glance on every run. */
+            const tag = (c) => (c ? `${c.name}@${c.on}` : "-");
+            return (
+              `${s} ${regime[s]} undimmed ${n(wU)} [${tag(worstU)}] ` +
+              `dimmed(choice) ${n(wD)} [${tag(worstD)}] x${d} vis ${(st.visible || 0).toFixed(2)} ` +
+              `subject ${st.blocks}b/${st.restInks}i/${(st.cells || []).length}c`
+            );
+          })
+          .join(", "),
+    );
+    console.log(
+      `  note: selection (inline highlighted code) - ` +
+        selStates
+          .map((s) => {
+            const st = selectionByState[s];
+            const ic = st.inlineCells || [];
+            const worst = ic.reduce((m, c) => (m && m.ratio <= c.ratio ? m : c), null);
+            const n = (x) => (Number.isFinite(x) ? x.toFixed(2) : "n/a");
+            return (
+              `${s} n=${st.inlineBlocks} cells=${ic.length} on ${st.inlineOn} -> ${st.inlineEffective} ` +
+              `worst ${n(worst && worst.ratio)} [${worst ? worst.name : "-"}] vis ${n(st.inlineVisible)}`
+            );
+          })
+          .join(", "),
+    );
 
     // ── 10h: the glyphs no element sweep can see ────────────────────────────
     // 10d walks document.querySelectorAll('*'), so its subject set is elements.
@@ -3557,11 +5393,26 @@ app.whenReady().then(async () => {
     /* THE FLOOR IS ON THE PRODUCT'S RULES, NOT ON THE CELL COUNT, because the
        cell count is dominated by the heading arrows and would stay comfortably
        above any threshold while every hand-written rule in custom-styles.css
-       quietly stopped matching. Measured: 4 glyph rules (two ticks, the
-       drop-overlay label, the heading arrow written as one six-part list). */
+       quietly stopped matching.
+
+       THE FLOOR SAID 4 AND THE MEASUREMENT SAYS 9, so it carried five rules of
+       slack and would have passed with every tick and overlay rule deleted,
+       leaving only heading arrows - the exact magic-floor shape this file
+       removed from the selection sweep. `rules` counts COMMA-SEPARATED PARTS,
+       one push per part, which is where the old count went wrong: it named the
+       six-part heading list and then counted it as one.
+       Measured inventory, 9 parts over 3 rules:
+         styles.css        body.drop-active::after                     1
+         styles.css        .markdown-body h1..h6::before  (six-part)   6
+         custom-styles.css .custom-theme-option.active::before,
+                           .custom-scheme-option.active::before        2
+       (`custom-styles.css` .custom-*-option::before with `content: ""` is
+       correctly excluded by the GLYPH predicate - it paints no glyph.)
+       The count is printed in the `note:` line below on every run, so this
+       floor cannot drift back into being unreadable. */
     check(
       "the pseudo-element sweep found the product's glyph-painting rules",
-      pseudoBase.light.rules.length >= 4 && pseudoBase.dark.rules.length >= 4,
+      pseudoBase.light.rules.length >= 9 && pseudoBase.dark.rules.length >= 9,
       `light ${pseudoBase.light.rules.length}, dark ${pseudoBase.dark.rules.length} rule(s): ${pseudoBase.light.rules.join(" | ")}`,
     );
     check(
@@ -3758,6 +5609,26 @@ app.whenReady().then(async () => {
         localStorage.removeItem(K.light);
         localStorage.removeItem(K.dark);
 
+        /* THE EXPORTED FUNCTION MUST BE TOTAL OVER THE STORED VALUE DOMAIN.
+           themeMode is light|dark|desktop, so "desktop" is a legitimate thing
+           for a caller to hold - but it is not a SCHEME mode, and passing it
+           through unresolved read the literal localStorage key "undefined",
+           matched nothing, and returned undefined from baseSchemeFor because
+           no scheme carries mode "desktop". applyScheme() then throws on
+           scheme.base inside a click handler, outside the one try that guards
+           the parse-time call. Every internal caller happens to resolve the
+           mode first, which is exactly why this was reachable only through the
+           exported surface and invisible to every other assertion here. */
+        try {
+          const d = T.schemeFor('desktop');
+          out.desktopTotal = d && d.id ? d.id : 'returned ' + String(d);
+        } catch (e) {
+          out.desktopTotal = 'threw: ' + e.message;
+        }
+        out.desktopExpected = matchMedia('(prefers-color-scheme: dark)').matches
+          ? 'default-dark'
+          : 'default-light';
+
         // An export owns the appearance until it has finished rasterising.
         localStorage.setItem('themeMode', 'dark');
         T.setScheme('ember');
@@ -3802,6 +5673,11 @@ app.whenReady().then(async () => {
       "a scheme id stored under the other mode's key is not applied",
       beh.foreignModeFallback === "default-light",
       `schemeFor('light') returned ${beh.foreignModeFallback}`,
+    );
+    check(
+      "schemeFor is total over the themeMode value domain, including 'desktop'",
+      beh.desktopTotal === beh.desktopExpected,
+      `schemeFor('desktop') -> ${beh.desktopTotal} (the OS preference resolves to ${beh.desktopExpected}); anything else means the exported surface can hand applyScheme an undefined scheme and throw inside a click handler`,
     );
     check(
       "an export parks the scheme, so a dark scheme is not printed onto white paper",
@@ -3913,6 +5789,79 @@ app.whenReady().then(async () => {
       const h = document.querySelector('.header');
       out.headerDisplay = h ? getComputedStyle(h).display : 'ABSENT';
       out.printMediaActive = window.matchMedia('print').matches;
+      /* THE CAUSE, NOT ONLY THE SYMPTOM. The colour comparison below can only
+         see a transition that has already moved a sampled surface off its
+         settled value, which makes it depend on how long the probe's own IPC
+         round trip took - a hidden latency bet a review round called out. This
+         reading does not: it names every animation that is RUNNING and whose
+         target the print stylesheet actually paints, which is the invariant
+         the export relies on regardless of when the sample lands.
+         checkVisibility() is the filter because @media print hides the
+         chrome - the header and its buttons, the search, notes, index and
+         editor panels, and (since this work) the three in-content overlay
+         buttons - that owns every transition still running at this moment.
+         Measured at the ready signal: 31 running, 0 of them visible. */
+      const nm = (el) => !el || !el.tagName ? 'none' : el.tagName.toLowerCase() +
+        (el.className && typeof el.className === 'string' && el.className.trim()
+          ? '.' + el.className.trim().split(/\\s+/).join('.') : '');
+      /* PRINT-HIDDEN, NOT SCREEN-HIDDEN - and the difference is a real flake.
+         checkVisibility() answers a question about the SCREEN while this
+         assertion is named for what printToPDF captures, which is the same
+         subject/measurement mismatch this suite calls a disjunction elsewhere.
+         .code-copy-btn rests at opacity 0 and fades in, so the opacity filter
+         below excludes it at rest and at full fade - but catches it MID-fade,
+         where opacity is fractional and checkVisibility() says "visible". That
+         reported "still animating a printed surface: background-color on
+         button.code-copy-btn" in 5 of 6 states on one run in four, while
+         @media print hides the button outright and it can never reach the PDF.
+         So the print-hidden set is derived from the print stylesheet's own
+         display:none rules rather than assumed, and an animation whose target
+         matches one of them is excluded regardless of what the screen is
+         doing. Deriving it means a chrome element that STOPS being hidden in
+         print starts being policed here on the same day. */
+      out.printHiddenSels = [];
+      try {
+        for (const sheet of document.styleSheets) {
+          let rules; try { rules = sheet.cssRules; } catch (e) { continue; }
+          for (const r of rules || []) {
+            if (!r.media || !/\\bprint\\b/.test(r.conditionText || r.media.mediaText || '')) continue;
+            for (const inner of r.cssRules || []) {
+              if (!inner.style || !inner.selectorText) continue;
+              const d = (inner.style.getPropertyValue('display') || '').trim();
+              if (d === 'none') out.printHiddenSels.push(inner.selectorText);
+            }
+          }
+        }
+      } catch (e) { out.printHiddenSels = []; }
+      const hiddenInPrint = (el) => {
+        for (const sel of out.printHiddenSels) {
+          try { if (el.matches(sel) || el.closest(sel)) return true; } catch (e) {}
+        }
+        return false;
+      };
+      out.runningVisible = [];
+      out.runningPrintHidden = 0;
+      try {
+        for (const a of document.getAnimations()) {
+          if (a.playState !== 'running') continue;
+          const t = a.effect && a.effect.target;
+          if (!t || typeof t.checkVisibility !== 'function') continue;
+          /* ALL THREE OPTIONS, and the default call is WRONG here. Bare
+             checkVisibility() answers "is it laid out" - it does NOT consider
+             opacity, so .code-copy-btn, which rests at opacity 0 and fades in
+             on hover, reports VISIBLE and produced five false positives the
+             first time this was run. The question this arm asks is "would a
+             reader see it move", so the filter has to be the painting one. */
+          if (!t.checkVisibility({
+            opacityProperty: true,
+            visibilityProperty: true,
+            contentVisibilityAuto: true,
+          })) continue;
+          if (hiddenInPrint(t)) { out.runningPrintHidden++; continue; }
+          out.runningVisible.push(
+            (a.transitionProperty || a.animationName || 'anim') + ' on ' + nm(t));
+        }
+      } catch (e) { out.runningVisible = ['PROBE FAILED: ' + (e && e.message)]; }
       out.residue = (document.body.getAttribute('data-theme') || 'none') + '/' +
         (document.body.classList.contains('dark-mode') ? 'dark' : 'light');
       return JSON.stringify(out);
@@ -3930,6 +5879,7 @@ app.whenReady().then(async () => {
     const printPrepared = {};
     const mermaidCfg = {};
     const prepFailures = [];
+    const printAtReady = {};
     let printAttached = false;
     const printRestored = {};
     try {
@@ -3952,20 +5902,68 @@ app.whenReady().then(async () => {
            predicate. A predicate like "data-theme is absent" is ALREADY TRUE
            for default-light and would have measured nothing there while
            looking identical to a real wait. */
+        /* COUNTED, NOT `once`. `ipcMain.once` resolves on the first signal and
+           stops listening, so a handler that emitted `pdf-export-ready` TWICE
+           - which makes main.js call printToPDF twice and produce a corrupt or
+           duplicated export - was completely invisible to this section. The
+           listener now stays attached for the whole state and reports how many
+           signals really arrived. */
+        let readySignals = 0;
         let settleReady;
+        const onReady = () => {
+          readySignals++;
+          if (settleReady) settleReady("READY");
+        };
         const ready = new Promise((resolve) => {
           settleReady = resolve;
-          ipcMain.once("pdf-export-ready", resolve);
+          ipcMain.on("pdf-export-ready", onReady);
         });
-        const timer = setTimeout(() => {
-          ipcMain.removeListener("pdf-export-ready", settleReady);
-          settleReady("TIMEOUT");
-        }, 15000);
+        const timer = setTimeout(() => settleReady("TIMEOUT"), 15000);
+        const t0 = Date.now();
         await exec(
           `(() => { require('electron').ipcRenderer.emit('prepare-for-pdf-export'); return 1; })()`,
         );
-        if ((await ready) === "TIMEOUT") prepFailures.push(`${label}: no pdf-export-ready`);
+        const readyOutcome = await ready;
+        if (readyOutcome === "TIMEOUT") prepFailures.push(`${label}: no pdf-export-ready`);
         clearTimeout(timer);
+        /* THE PAGE AS IT STANDS THE INSTANT THE PRODUCT SAYS "READY", captured
+           BEFORE the settle loop below. main.js calls printToPDF the moment
+           this signal arrives, so this - not the settled page measured after
+           the loop - is what a reader's PDF actually contains.
+           The handler reports ready after a double rAF (~18ms) while themed
+           transitions run 0.2-0.3s, so a review round rated this a probable
+           mid-transition capture. MEASURED, it is not one, for two independent
+           reasons: document content carries no colour transitions at all
+           (custom-styles.css replaced the inherited `transition: all` with
+           targeted transitions on chrome), and every transition still running
+           at this moment targets an element @media print hides - measured 31
+           running, 0 of them visible under the print stylesheet.
+           So the double rAF is sufficient BY ACCIDENT OF THE STYLESHEET, not
+           by construction, and that is exactly why it needs pinning: adding
+           `transition: background-color` to a printed surface would silently
+           start capturing half-faded colours, with the settled measurement
+           below still reporting everything correct.
+           RECORDED ONLY WHEN THE SIGNAL REALLY ARRIVED. This used to be an
+           unconditional assignment after the timeout branch, which made the
+           whole assertion FAIL OPEN in the one regression it exists for: if
+           the handler stopped emitting `pdf-export-ready`, the probe ran 15
+           seconds later against a fully settled page, `readyDiffs` came back
+           empty, six entries existed, and an assertion named "the page is
+           already settled the instant the export reports ready" passed for six
+           states in which nothing had reported ready. The outcome and the
+           signal count now travel WITH the reading instead of being delegated
+           to a separate `prepFailures` assertion that names something else. */
+        printAtReady[label] = {
+          ok: readyOutcome === "READY",
+          signals: readySignals,
+          latencyMs: 0,
+          probe: null,
+        };
+        printAtReady[label].probe = JSON.parse(await exec(PRINT_PROBE));
+        printAtReady[label].latencyMs = Date.now() - t0;
+        // Now that the reading is taken, a late second signal is still a defect
+        // and is still counted - the listener stays attached until the state's
+        // export cycle has been released below.
         for (let i = 0; i < 60; i++) {
           const running = await settleTransitions();
           maxRunning = Math.max(maxRunning, running);
@@ -3981,6 +5979,22 @@ app.whenReady().then(async () => {
             `{ success: true, path: 'C:/tmp/10i-probe.pdf' }); return 1; })()`,
         );
         await new Promise((r) => setTimeout(r, 60));
+        /* WAITED ON THE PRODUCT'S OWN MERMAID SETTLE RATHER THAN ONLY ON A
+           SLEEP, because the result handler is async and its tail is
+           unbounded: setExportTheme() awaits updateMermaidTheme() and then
+           whenMermaidSettled(), which PERF-07 defers in idle chunks. Left as a
+           fixed sleep, a document with enough diagrams would still be
+           re-theming state N while state N+1 was being measured.
+           MEASURED, so the sleep above is not load-bearing for the assertion
+           below and is kept only to let the handler reach its first await:
+           both observables this section reads - data-theme and the dark class -
+           land SYNCHRONOUSLY. restoreExportScheme() sets the attribute
+           directly, and setExportTheme() toggles the class before its first
+           await. Timed on this fixture and on a 12-diagram variant, both
+           reached their final value in 0.1-0.2 ms. */
+        await exec(
+          `(async () => { if (typeof whenMermaidSettled === 'function') await whenMermaidSettled(); return 1; })()`,
+        );
         /* THE OTHER HALF OF THE PARK, MEASURED THROUGH ITS REAL CALL SITE.
            parkExportScheme()'s call site is pinned by R317; its partner's was
            not, because every test that exercises restore called the function
@@ -3995,6 +6009,12 @@ app.whenReady().then(async () => {
               ` dark: document.body.classList.contains('dark-mode') })`,
           ),
         );
+        /* DETACHED ONLY HERE, at the end of the state's whole export cycle, so
+           a signal that arrives LATE - after the reading, during the settle, or
+           on the way through the result handler - is still counted against this
+           state rather than leaking into the next one's tally. */
+        ipcMain.removeListener("pdf-export-ready", onReady);
+        printAtReady[label].signals = readySignals;
       }
     } finally {
       if (printAttached) {
@@ -4096,6 +6116,120 @@ app.whenReady().then(async () => {
       printDiffs.slice(0, 5).join(" | "),
     );
 
+    /* THE HANDSHAKE ITSELF. Everything above measures the page AFTER this
+       suite settled the transitions; main.js does not settle anything - it
+       calls printToPDF as soon as pdf-export-ready arrives. So without this,
+       a printed surface that faded into place over 0.3s would be captured
+       half-way and every assertion above would still report it perfect.
+       Compared against the settled reading of the same state rather than
+       against a frozen table, so it stays a statement about TIMING alone and
+       cannot drift into a second copy of the fidelity oracles.
+       THREE INDEPENDENT ARMS, and the split is deliberate.
+       (1) The SIGNAL arm: the state must have reported ready exactly once.
+       Without it the whole check failed open on a handler that stopped
+       signalling, and it was blind to a handler that signalled twice - which
+       makes main.js call printToPDF twice.
+       (2) The CAUSE arm: no animation that the print stylesheet actually
+       paints may be running at that instant. This is the real invariant and
+       it does not depend on when the sample lands.
+       (3) The SYMPTOM arm: no sampled colour may differ from its settled
+       value. This one DOES depend on the probe's IPC latency - it can only
+       see a transition that has already moved - which is why the latency is
+       measured and printed rather than assumed, and why arm (2) exists. */
+    const readyDiffs = [];
+    let worstLatency = 0;
+    for (const label of printedStates) {
+      const atReady = printAtReady[label];
+      if (!atReady) {
+        readyDiffs.push(`${label}: never measured at the ready signal`);
+        continue;
+      }
+      worstLatency = Math.max(worstLatency, atReady.latencyMs);
+      if (!atReady.ok) {
+        readyDiffs.push(`${label}: never reported ready, so nothing was measured at it`);
+        continue;
+      }
+      if (atReady.signals !== 1) {
+        readyDiffs.push(
+          `${label}: ${atReady.signals} pdf-export-ready signal(s), so printToPDF would run ${atReady.signals} time(s)`,
+        );
+      }
+      if (atReady.probe.runningVisible.length) {
+        readyDiffs.push(
+          `${label} still animating a printed surface: ${atReady.probe.runningVisible.slice(0, 3).join(", ")}`,
+        );
+      }
+      if (atReady.probe.residue !== printPrepared[label].residue) {
+        readyDiffs.push(
+          `${label} residue: atReady=${atReady.probe.residue} settled=${printPrepared[label].residue}`,
+        );
+      }
+      for (const sel of measuredSels) {
+        if (atReady.probe.cells[sel] !== printPrepared[label].cells[sel]) {
+          readyDiffs.push(
+            `${label} ${sel}: atReady=${atReady.probe.cells[sel]} settled=${printPrepared[label].cells[sel]}`,
+          );
+        }
+      }
+    }
+    /* THE EXCLUSION MUST NOT BE ABLE TO SWALLOW THE ASSERTION. The probe now
+       drops animations whose target the print stylesheet hides, which is
+       correct but is also a filter standing between a real defect and a green
+       run: derive a selector list that happens to match everything (a stray
+       `*`, or a rule set gaining `display:none` on a container) and the arm
+       above silently stops policing anything. So the derived list is pinned to
+       its measured size and the number of animations it swallowed is printed
+       on every run. */
+    const printHidden = Object.values(printAtReady)
+      .map((s) => s && s.probe && s.probe.printHiddenSels)
+      .find((x) => Array.isArray(x)) || [];
+    const swallowed = Object.entries(printAtReady)
+      .map(([k, s]) => `${k}=${(s && s.probe && s.probe.runningPrintHidden) || 0}`)
+      .join(" ");
+    console.log(
+      `  note  print-hidden selectors derived: ${printHidden.length}; running animations excluded per state: ${swallowed}`,
+    );
+    const PRINT_HIDDEN_SELS = 5;
+    check(
+      "10i: the print-hidden exclusion is derived from the print stylesheet and is the pinned measured size",
+      printHidden.length === PRINT_HIDDEN_SELS &&
+        !printHidden.some((s) => /^\s*\*\s*$/.test(s)),
+      `derived ${printHidden.length} display:none selector(s) from @media print (pinned ${PRINT_HIDDEN_SELS}): ${printHidden.join(", ")} - this list is what the settle probe is allowed to ignore, so it growing unexpectedly is how that assertion goes quiet`,
+    );
+    const OVERLAY_BTNS = [".code-copy-btn", ".mermaid-maximize-btn", ".table-maximize-btn"];
+    const overlayUnhidden = OVERLAY_BTNS.filter(
+      (sel) => !printHidden.some((h) => h.split(",").some((p) => p.trim() === sel)),
+    );
+    check(
+      "10i: the in-content overlay buttons are hidden in print, so a hovered copy or maximise button cannot print over the content",
+      overlayUnhidden.length === 0,
+      `${overlayUnhidden.join(", ") || "none"} still printable - each rests at opacity 0 and fades in on hover, so it is absent from a PDF only until something hovers it, and each is positioned ON TOP of content that does print`,
+    );
+    check(
+      "10i: the page is already settled the instant the export reports ready, so printToPDF cannot capture a half-finished transition",
+      readyDiffs.length === 0 &&
+        printedStates.length === PRINT_STATES.length &&
+        Object.keys(printAtReady).length === PRINT_STATES.length,
+      `${Object.keys(printAtReady).length}/${PRINT_STATES.length} states, worst probe latency ` +
+        `${worstLatency}ms; ${readyDiffs.slice(0, 5).join(" | ")}`,
+    );
+    /* THE ARM ABOVE THAT COMPARES COLOURS IS ONLY AS SHARP AS THIS NUMBER.
+       The reading is taken one IPC round trip after the signal, so if that trip
+       ever grew past the length of a transition the comparison would sample a
+       settled page and report success for a page that had been in flight -
+       vacuous, and indistinguishable from a real pass. Measured rather than
+       assumed, printed on every run, and floored here so the assumption cannot
+       rot silently. The ceiling is deliberately generous against the measured
+       value: this is a guard against the assumption collapsing, not a
+       performance budget, and a tight bound would false-fail on a loaded
+       machine. R375's 0.5s transition delay sits above it by design, so that
+       revert stays valid for any latency this assertion permits. */
+    check(
+      "10i: the ready-moment reading is taken close enough to the signal to still be a reading of that moment",
+      worstLatency > 0 && worstLatency < 400,
+      `worst probe latency after pdf-export-ready: ${worstLatency}ms (ceiling 400ms)`,
+    );
+
     /* POSITIVE CONTROL FOR THE PARK, and the reason the assertion above is not
        a tautology. It measures the SAME six states under the SAME print media
        with the export preparation NOT run, and requires them to disagree - so
@@ -4104,7 +6238,13 @@ app.whenReady().then(async () => {
        IF THIS EVER FAILS, the print CSS has been widened to neutralise schemes
        and tokens on its own. That is an improvement, not a regression: check
        that the park is still wanted, then retire this control deliberately.
-       It must not be "fixed" by loosening it. */
+       It must not be "fixed" by loosening it.
+       THE BAR IS THE RELATIONSHIP, NOT A THRESHOLD. It used to read `>= 3` of
+       5, a number with nothing behind it, which would have gone on passing
+       after the print stylesheet quietly neutralised two of the four schemes.
+       What the comment above actually claims is that the stylesheet neutralises
+       NONE of them, so every non-reference state must differ - and that is what
+       is asserted, with no room left between the claim and the check. */
     const rawRef = printRaw["default-light"] ? printRaw["default-light"].cells : {};
     const rawDiffering = printedStates.filter(
       (label) =>
@@ -4113,8 +6253,9 @@ app.whenReady().then(async () => {
     );
     check(
       "10i: the print stylesheet alone does not neutralise a scheme, so the export park is load-bearing (control)",
-      rawDiffering.length >= 3,
-      `only ${rawDiffering.length} of ${printedStates.length - 1} states printed differently without the export preparation (${rawDiffering.join(",")}) - see the note above before changing this`,
+      printedStates.length === PRINT_STATES.length &&
+        rawDiffering.length === printedStates.length - 1,
+      `${rawDiffering.length} of ${printedStates.length - 1} states printed differently without the export preparation (${rawDiffering.join(",")}) - see the note above before changing this`,
     );
 
     /* THE MERMAID BOUNDARY. custom-theme.js:69-74 records in prose that mermaid
@@ -4136,31 +6277,785 @@ app.whenReady().then(async () => {
       "if the two modes produce the same config, the invariance above is satisfied by a function that discriminates nothing",
     );
 
+    /* WHAT THE PRODUCT ACTUALLY HANDS TO MERMAID, which is a strictly different
+       claim from the two above. Those call getMermaidConfig(true)/(false) with
+       booleans THIS FILE supplies, so between them they establish only that a
+       PURE FUNCTION is deterministic and discriminates on its argument. A
+       mermaid that became scheme-aware through its own initialisation path - a
+       call site keyed on data-theme, or a getMermaidConfig() that started
+       consulting the scheme rather than its parameter - satisfies both of them
+       while drawing six visibly different diagrams.
+
+       The product has exactly TWO initialisation sites, and they take the
+       boolean from different places, so both are covered here:
+         renderer.js:102   ensureMermaid()'s onload  -> mermaidDesiredDark
+         renderer.js:1751  applyMermaidTheme(isDark) -> its own parameter,
+                           reached from the #darkModeToggle handler, which
+                           reads the boolean off document.body's class list.
+
+       MERMAID IS LAZY (PERF-03) AND THE THEME FIXTURE CONTAINS NO DIAGRAMS, so
+       window.mermaid does not exist by default and BOTH sites are unreachable -
+       measured: a first attempt at this captured 0 calls across all six states
+       and read exactly like a product that never themes its diagrams. The
+       bundle is therefore loaded through the product's OWN loader first. */
+    const mermaidLoaded = await exec(`(async () => {
+      try { await ensureMermaid(); } catch (e) { return 'failed: ' + e.message; }
+      return typeof window.mermaid === 'object' && typeof window.mermaid.initialize === 'function'
+        ? 'ok' : 'absent';
+    })()`);
+    check(
+      "10i: the mermaid bundle really loaded, so its initialisation path is reachable at all (control)",
+      mermaidLoaded === "ok",
+      `ensureMermaid() left window.mermaid as: ${mermaidLoaded} - without it the capture below is vacuous`,
+    );
+
+    const mermaidReal = {};
+    await exec(`(() => {
+      window.__foliaMermaidCalls = [];
+      window.__foliaMermaidWrapped = window.mermaid.initialize;
+      window.mermaid.initialize = function (cfg) {
+        window.__foliaMermaidCalls.push(JSON.stringify(cfg));
+        return window.__foliaMermaidWrapped.apply(this, arguments);
+      };
+      return 1;
+    })()`);
+    try {
+      for (const [mode, scheme, label] of PRINT_STATES) {
+        /* Entered from the OPPOSITE mode on purpose. applyTheme() delegates to
+           #darkModeToggle only `if (wantDark !== isDark)` (custom-theme.js:132),
+           which is correct product behaviour - a same-mode scheme switch has
+           nothing to tell a binary palette - but it means a straight walk down
+           PRINT_STATES produces one initialise call in six. Forcing a genuine
+           mode change per state makes every state exercise the re-theme site
+           rather than inheriting the previous state's configuration. */
+        await applySettled(mode === "dark" ? "light" : "dark", null, `10i mermaid pre-${label}`);
+        await exec(`(() => { window.__foliaMermaidCalls = []; return 1; })()`);
+        await applySettled(mode, scheme, `10i mermaid ${label}`);
+        await exec(`(async () => { await whenMermaidSettled(); return 1; })()`);
+        mermaidReal[label] = JSON.parse(
+          await exec(`JSON.stringify({
+            calls: window.__foliaMermaidCalls,
+            /* The load-time site's argument, read as that site itself spells
+               it - so a state that legitimately makes no re-theme call is
+               still covered on the axis that decides the NEXT document. */
+            onLoad: JSON.stringify(getMermaidConfig(mermaidDesiredDark)),
+          })`),
+        );
+      }
+    } finally {
+      await exec(`(() => {
+        if (window.__foliaMermaidWrapped) {
+          window.mermaid.initialize = window.__foliaMermaidWrapped;
+          delete window.__foliaMermaidWrapped;
+        }
+        delete window.__foliaMermaidCalls;
+        return 1;
+      })()`);
+    }
+    const wantByMode = {
+      light: JSON.stringify(cfgPair.light),
+      dark: JSON.stringify(cfgPair.dark),
+    };
+    const realMisses = [];
+    let realCalls = 0;
+    for (const [mode, , label] of PRINT_STATES) {
+      const rec = mermaidReal[label] || { calls: [], onLoad: null };
+      realCalls += rec.calls.length;
+      if (!rec.calls.length) {
+        realMisses.push(`${label}: a real mode change produced no initialise call`);
+      }
+      const wrong = rec.calls.filter((c) => c !== wantByMode[mode]);
+      if (wrong.length) {
+        realMisses.push(
+          `${label}: ${wrong.length}/${rec.calls.length} re-theme call(s) did not match getMermaidConfig(${mode === "dark"})`,
+        );
+      }
+      if (rec.onLoad !== wantByMode[mode]) {
+        realMisses.push(`${label}: the load-time site would initialise with the other mode's palette`);
+      }
+    }
+    check(
+      "10i: the configuration the product really hands to mermaid.initialize is chosen by the mode alone",
+      realMisses.length === 0 && realCalls >= PRINT_STATES.length,
+      `${realCalls} initialise call(s) captured across ${PRINT_STATES.length} states: ${realMisses.slice(0, 4).join(" | ")}`,
+    );
+
     /* THE POPUP BOUNDARY. Every popup is a separate BrowserWindow whose CSS is
        built in the MAIN process from a literal hex table selected by an
        isDarkMode boolean (main.js:1289 mermaid, :1653 image, :1962 table), so
-       no scheme can reach one. Asserted where the boundary actually lives -
-       the renderer cannot observe a window it does not own - and paired with a
-       positive control, because a matcher that has stopped matching reports an
-       absence as satisfied. */
-    const mainSrc = fs.readFileSync(path.join(__dirname, "..", "src", "main.js"), "utf8");
-    const NON_BASE_IDS = ["clarity", "parchment", "abyss", "ember"];
-    const schemeLeaks = [];
-    for (const id of NON_BASE_IDS) {
-      if (mainSrc.includes('"' + id + '"') || mainSrc.includes("'" + id + "'")) {
-        schemeLeaks.push(id);
+       no scheme can reach one.
+
+       THE MARKER SWEEP BELOW IS THE WEAKER HALF AND IT IS KEPT AS A SECOND
+       LAYER, NOT AS THE CLAIM. It looks for scheme ids and `data-theme` in
+       main.js text, so a scheme forwarded under a NEUTRAL key - `theme`,
+       `palette`, `accent` - and consumed there under that name trips nothing:
+       the main process would carry the scheme without ever spelling one.
+       The leak can only originate in the renderer, at the five
+       `ipcRenderer.send('open-*-popup', {...})` sites, so that is where the
+       boundary is now asserted: the PAYLOAD'S OWN KEY SET, parsed out of the
+       real object literals rather than matched against a marker list. A key
+       named anything at all fails, which is exactly the case a marker list
+       cannot express. */
+    const rendererSrc = fs.readFileSync(
+      path.join(__dirname, "..", "src", "renderer.js"),
+      "utf8",
+    );
+    const POPUP_CHANNELS = ["open-mermaid-popup", "open-image-popup", "open-table-popup"];
+    /* THE ONLY KEYS A POPUP PAYLOAD MAY CARRY. `isDarkMode` is the whole theme
+       surface - a boolean - and everything else is document content. Frozen
+       deliberately per channel rather than as one union, so a key legitimate on
+       one surface cannot silently appear on another. */
+    const POPUP_PAYLOAD_KEYS = {
+      "open-mermaid-popup": ["svgContent", "isDarkMode"],
+      "open-image-popup": ["src", "alt", "isDarkMode"],
+      "open-table-popup": ["tableData", "isDarkMode"],
+    };
+    /* Reads the top-level keys of the object literal that follows a send call.
+       Brace-matched rather than regex-scanned so a nested object (tableData is
+       built by a call, but a future payload may not be) cannot contribute its
+       own keys and read as a leak, and so a `}` inside a string cannot end the
+       literal early. */
+    const popupSites = [];
+    for (const channel of POPUP_CHANNELS) {
+      const needle = "'" + channel + "'";
+      let at = rendererSrc.indexOf(needle);
+      while (at !== -1) {
+        const open = rendererSrc.indexOf("{", at);
+        const comma = rendererSrc.indexOf(",", at + needle.length);
+        if (open === -1 || comma === -1 || open < comma) {
+          popupSites.push({ channel, keys: null, why: "no object literal argument" });
+        } else {
+          let depth = 0;
+          let end = -1;
+          let quote = "";
+          for (let i = open; i < rendererSrc.length; i++) {
+            const ch = rendererSrc[i];
+            if (quote) {
+              if (ch === "\\") i++;
+              else if (ch === quote) quote = "";
+              continue;
+            }
+            if (ch === '"' || ch === "'" || ch === "`") {
+              quote = ch;
+              continue;
+            }
+            if (ch === "{" || ch === "[" || ch === "(") depth++;
+            else if (ch === "}" || ch === "]" || ch === ")") {
+              depth--;
+              if (depth === 0) {
+                end = i;
+                break;
+              }
+            }
+          }
+          const body = end === -1 ? "" : rendererSrc.slice(open + 1, end);
+          // Split on commas at depth 0 only, then take the identifier before
+          // the colon - or the whole fragment, for shorthand properties.
+          const keys = [];
+          const frags = [];
+          let depth2 = 0;
+          let quote2 = "";
+          let piece = "";
+          const flush = () => {
+            const frag = piece.trim();
+            piece = "";
+            if (!frag) return;
+            const colon = frag.indexOf(":");
+            keys.push((colon === -1 ? frag : frag.slice(0, colon)).trim());
+            frags.push(frag);
+          };
+          for (let i = 0; i < body.length; i++) {
+            const ch = body[i];
+            if (quote2) {
+              piece += ch;
+              if (ch === "\\") piece += body[++i];
+              else if (ch === quote2) quote2 = "";
+              continue;
+            }
+            if (ch === '"' || ch === "'" || ch === "`") quote2 = ch;
+            if (ch === "{" || ch === "[" || ch === "(") depth2++;
+            else if (ch === "}" || ch === "]" || ch === ")") depth2--;
+            if (ch === "," && depth2 === 0) {
+              flush();
+              continue;
+            }
+            piece += ch;
+          }
+          flush();
+          /* THE VALUE, NOT JUST THE KEY. Everything above this point reduces a
+             payload to its key NAMES, which is exactly enough to miss the
+             likeliest scheme leak of all: the key stays `isDarkMode` and its
+             VALUE learns about the scheme, e.g. `isDarkMode || dataset.theme
+             === "ember"`. Two of the five sites spell the boolean as a
+             shorthand backed by a local const on the preceding line, so the
+             expression is not inside the literal at all and has to be resolved
+             backwards from the send site before it can be compared. */
+          let darkExpr = null;
+          const darkFrag = frags.find((f) => /^isDarkMode\b/.test(f));
+          if (darkFrag) {
+            const colon = darkFrag.indexOf(":");
+            if (colon !== -1) darkExpr = darkFrag.slice(colon + 1).trim();
+            else {
+              const back = rendererSrc.slice(Math.max(0, at - 600), at);
+              const decl = /(?:const|let|var)\s+isDarkMode\s*=\s*([^;]+);/g;
+              let d;
+              let last = null;
+              while ((d = decl.exec(back)) !== null) last = d[1];
+              darkExpr = last === null ? null : last.trim();
+            }
+          }
+          /* EXACTLY ONE ARGUMENT AFTER THE CHANNEL. The key sweep reads the
+             first object literal and stops, so a second argument carrying the
+             scheme would be neither parsed nor sent through any assertion -
+             and the runtime probe records args[0] alone, so it could not see
+             one either. */
+          let tail = "";
+          if (end !== -1) {
+            const rest = rendererSrc.slice(end + 1);
+            const m = rest.match(/^\s*(.)/);
+            tail = m ? m[1] : "";
+          }
+          popupSites.push({
+            channel,
+            keys,
+            raw: body,
+            darkExpr,
+            singleArg: tail === ")",
+            why: end === -1 ? "unterminated literal" : "",
+          });
+        }
+        at = rendererSrc.indexOf(needle, at + needle.length);
       }
     }
-    for (const marker of ["data-theme", "--syn-", "--tok-"]) {
-      if (mainSrc.includes(marker)) schemeLeaks.push(marker);
-    }
-    const POPUP_CHANNELS = ["open-mermaid-popup", "open-image-popup", "open-table-popup"];
-    const popupsFound = POPUP_CHANNELS.filter((c) => mainSrc.includes('"' + c + '"'));
-    const darkAware = (mainSrc.match(/isDarkMode/g) || []).length;
+    const popupKeyLeaks = popupSites.filter(
+      (s) =>
+        !s.keys ||
+        s.keys.length === 0 ||
+        s.keys.some((k) => !POPUP_PAYLOAD_KEYS[s.channel].includes(k)),
+    );
+    /* THE POSITIVE CONTROL. The parse walks source text, so a renamed channel,
+       a reformat that puts the literal on the next argument, or a broken
+       brace-matcher all yield an EMPTY subject set - and an empty set has no
+       leaks. Every channel must have been found and every site parsed, or
+       "no leaks" is describing nothing.
+
+       THE COUNTS ARE MEASURED, NOT A FLOOR. A `>= 5` bar stood here and 5 was
+       a number with nothing behind it: it happened to equal the real total, so
+       it read like a measurement while being unable to notice a site
+       DISAPPEARING as long as another appeared. The per-channel counts below
+       were read off the source (renderer.js: mermaid at 4545 and 7988, table
+       at 4891 and 8069, image at 5193 - the context-menu path and the
+       maximise-button path for each surface that has both). An added site is a
+       new payload literal that nobody has looked at, and a removed one silently
+       narrows every leak claim below; both must be a decision. */
+    const POPUP_SITE_COUNTS = {
+      "open-mermaid-popup": 2,
+      "open-image-popup": 1,
+      "open-table-popup": 2,
+    };
+    const siteCountFaults = POPUP_CHANNELS.filter(
+      (c) => popupSites.filter((s) => s.channel === c && s.keys).length !== POPUP_SITE_COUNTS[c],
+    ).map(
+      (c) =>
+        `${c}: ${popupSites.filter((s) => s.channel === c && s.keys).length} parsed, expected ${
+          POPUP_SITE_COUNTS[c]
+        }`,
+    );
     check(
-      "10i: every popup surface exists and is themed by a boolean (positive control)",
-      popupsFound.length === POPUP_CHANNELS.length && darkAware >= 20,
-      `found ${popupsFound.length}/${POPUP_CHANNELS.length} popup channels, ${darkAware} isDarkMode references`,
+      "10i: every popup-open payload in the renderer was really parsed (positive control)",
+      siteCountFaults.length === 0 && popupSites.every((s) => s.keys),
+      `${popupSites.length} send site(s): ${popupSites
+        .map((s) => `${s.channel}[${s.keys ? s.keys.join("+") : s.why}]`)
+        .join(" ")}${siteCountFaults.length ? " | " + siteCountFaults.join(" | ") : ""}`,
+    );
+    check(
+      "10i: no popup-open payload carries anything but its content and the mode boolean",
+      popupKeyLeaks.length === 0,
+      `${popupKeyLeaks
+        .map((s) => `${s.channel} sends {${s.keys ? s.keys.join(", ") : s.why}}`)
+        .join(" | ")} - a popup is themed by a boolean in the main process, so a scheme reaching one moves a recorded scope boundary and needs a decision, not a passing test`,
+    );
+
+    /* AND THE SAME CLAIM AT RUNTIME, because the parse above reads what is
+       WRITTEN and this reads what is SENT. Driven through the real
+       .table-maximize-btn on the real rendered table, with ipcRenderer.send
+       intercepted and swallowed so no BrowserWindow is opened. The table is the
+       only popup surface the census fixture reaches - it has no diagram and no
+       image - which is why the structural half above exists to cover the other
+       four sites. */
+    const popupSent = {};
+    let popupProbeErr = "";
+    try {
+      await exec(`(() => {
+        const { ipcRenderer } = require('electron');
+        window.__popupSends = [];
+        /* THE RAW METHOD, not a bound copy. Restoring a bound wrapper would
+           leave ipcRenderer.send a DIFFERENT function object than the one this
+           probe found, which is invisible today and breaks the moment anything
+           compares the method by identity. */
+        window.__popupRealSend = ipcRenderer.send;
+        const realSend = window.__popupRealSend;
+        ipcRenderer.send = (channel, ...args) => {
+          if (typeof channel === 'string' && /^open-.*-popup$/.test(channel)) {
+            window.__popupSends.push([channel, args[0]]);
+            return;
+          }
+          return realSend.call(ipcRenderer, channel, ...args);
+        };
+        return 'ok';
+      })()`);
+      for (const [mode, scheme, label] of PRINT_STATES) {
+        await applySettled(mode, scheme, `10i popup ${label}`);
+        popupSent[label] = JSON.parse(
+          await exec(`(() => {
+            window.__popupSends.length = 0;
+            const btn = document.querySelector('.table-maximize-btn');
+            if (btn) btn.click();
+            const [channel, payload] = window.__popupSends[0] || [null, null];
+            return JSON.stringify({
+              clicked: !!btn,
+              channel,
+              keys: payload ? Object.keys(payload).sort() : null,
+              isDarkMode: payload ? payload.isDarkMode : null,
+              /* SPELLED OUT RATHER THAN LEFT TO JSON.stringify's undefined
+                 BEHAVIOUR. NOTE FOR EDITORS: this comment lives inside an
+                 exec() template literal, so it must never contain a backtick.
+                 JSON.stringify(undefined) returns the VALUE undefined, not a
+                 string, so a payload that had lost its tableData entirely
+                 produced 'content: undefined', which the outer stringify then
+                 DROPPED from the object - and every state read back
+                 identically absent, so "the content is the same in every
+                 scheme" passed on a payload carrying no content at all. An
+                 empty string is a value the assertion below can see. */
+              content:
+                payload && payload.tableData !== undefined
+                  ? JSON.stringify(payload.tableData)
+                  : '',
+              bodyDark: document.body.classList.contains('dark-mode'),
+              scheme: document.body.getAttribute('data-theme') || '',
+            });
+          })()`),
+        );
+      }
+    } catch (e) {
+      popupProbeErr = String((e && e.message) || e);
+    } finally {
+      await exec(`(() => {
+        const { ipcRenderer } = require('electron');
+        if (window.__popupRealSend) ipcRenderer.send = window.__popupRealSend;
+        delete window.__popupRealSend;
+        delete window.__popupSends;
+        return 'ok';
+      })()`).catch(() => {});
+    }
+    const popupStates = Object.keys(popupSent);
+    const popupContents = new Set(popupStates.map((l) => popupSent[l].content));
+    /* THE CONTENT MUST BE REAL BEFORE "IDENTICAL" MEANS ANYTHING. A set of one
+       is satisfied just as well by six states that all sent nothing, so the
+       sameness claim needs a subject: the payload has to carry a JSON object
+       with at least one non-empty quoted cell in it. Measured on the census
+       fixture's table, this is a few hundred characters; the floor is
+       deliberately loose because what is being defended is "there is content",
+       not its size. */
+    const popupEmpty = popupStates.filter(
+      (l) =>
+        typeof popupSent[l].content !== "string" ||
+        popupSent[l].content.length < 10 ||
+        !/"[^"]+"/.test(popupSent[l].content),
+    );
+    const popupRuntimeMisses = popupStates.filter((l) => {
+      const p = popupSent[l];
+      return (
+        !p.clicked ||
+        p.channel !== "open-table-popup" ||
+        !p.keys ||
+        p.keys.join(",") !== POPUP_PAYLOAD_KEYS["open-table-popup"].slice().sort().join(",") ||
+        p.isDarkMode !== p.bodyDark
+      );
+    });
+    check(
+      "10i: the payload a popup really receives is the same in every scheme but for the mode boolean",
+      !popupProbeErr &&
+        popupStates.length === PRINT_STATES.length &&
+        popupRuntimeMisses.length === 0 &&
+        popupEmpty.length === 0 &&
+        popupContents.size === 1,
+      `${popupProbeErr || ""}${popupStates.length}/${PRINT_STATES.length} states; ${
+        popupContents.size
+      } distinct payload content(s)${
+        popupEmpty.length ? `; ${popupEmpty.length} state(s) sent no table content: ${popupEmpty.join(", ")}` : ""
+      }; misses: ${
+        popupRuntimeMisses
+          .map((l) => `${l}=${JSON.stringify(popupSent[l])}`)
+          .slice(0, 2)
+          .join(" | ") || "none"
+      }`,
+    );
+
+    const mainSrc = fs.readFileSync(path.join(__dirname, "..", "src", "main.js"), "utf8");
+    const NON_BASE_IDS = ["clarity", "parchment", "abyss", "ember"];
+    /* COMMENTS ARE REMOVED BEFORE THE SWEEP, AND THE IDS ARE MATCHED AS WORDS.
+       Two shapes were tried here and each fails in the opposite direction:
+         - a BARE substring test (what shipped) reports a leak for the word
+           `Remember` in prose, because `ember` sits inside it;
+         - a QUOTED-LITERAL test cannot see the leak that actually matters,
+           because a popup handler builds its CSS as a TEMPLATE LITERAL, where
+           `body[data-theme=ember]` carries no quotes around the id at all.
+       Stripping comments removes the entire prose false-positive class at its
+       source, after which a word-boundary match is both broad and quiet: the
+       boundary rejects `Remember` (the preceding `m` is a word character)
+       while accepting `data-theme=ember` and `.scheme-ember`. Both halves are
+       planted and measured below rather than argued.
+
+       The stripper treats a backtick as an ordinary quote and does NOT descend
+       into an interpolation, so code inside one is scanned as if it were string
+       content - which can only ever ADD subjects, never remove them. */
+    const stripJsComments = (src) => {
+      let out = "";
+      let quote = "";
+      /* REGEX LITERALS ARE A THIRD STATE, and leaving them out is not a
+         cosmetic gap. src/main.js contains .replace(/"/g, "&quot;"): with no
+         regex state the lone quote inside that literal opens phantom string
+         mode, and everything after it is scanned with a desynchronised quote -
+         measured at 83 of 464 comment lines surviving the strip. Today that
+         direction is safe (a surviving comment can only ADD a hit, and there
+         are none), but the same desync lets a // inside a real string be
+         stripped as a comment, which DELETES code from the sweep's view and
+         fails silently open. main.js already carries such shapes nearby
+         (/^file:\/\/(?!\/)/i). Deciding regex-vs-division needs the previous
+         significant token, which is what lastSig/lastWord carry. */
+      let lastSig = "";
+      let lastWord = "";
+      const REGEX_OK_AFTER = "(,=:[!&|?{};+-*%^~<>";
+      const REGEX_OK_WORDS = [
+        "return",
+        "typeof",
+        "instanceof",
+        "in",
+        "of",
+        "new",
+        "delete",
+        "void",
+        "throw",
+        "do",
+        "else",
+        "case",
+        "yield",
+        "await",
+      ];
+      for (let i = 0; i < src.length; i++) {
+        const ch = src[i];
+        if (quote) {
+          out += ch;
+          if (ch === "\\") out += src[++i] || "";
+          else if (ch === quote) quote = "";
+          continue;
+        }
+        if (ch === '"' || ch === "'" || ch === "`") {
+          quote = ch;
+          out += ch;
+          lastSig = ch;
+          lastWord = "";
+          continue;
+        }
+        if (ch === "/" && src[i + 1] === "/") {
+          while (i < src.length && src[i] !== "\n") i++;
+          out += "\n";
+          continue;
+        }
+        if (ch === "/" && src[i + 1] === "*") {
+          const close = src.indexOf("*/", i + 2);
+          i = close === -1 ? src.length : close + 1;
+          out += " ";
+          continue;
+        }
+        if (
+          ch === "/" &&
+          (lastSig === "" || REGEX_OK_AFTER.includes(lastSig) || REGEX_OK_WORDS.includes(lastWord))
+        ) {
+          out += ch;
+          let inClass = false;
+          let j = i + 1;
+          for (; j < src.length; j++) {
+            const c2 = src[j];
+            if (c2 === "\n") break;
+            out += c2;
+            if (c2 === "\\") {
+              out += src[++j] || "";
+              continue;
+            }
+            if (c2 === "[") inClass = true;
+            else if (c2 === "]") inClass = false;
+            else if (c2 === "/" && !inClass) break;
+          }
+          i = j;
+          lastSig = "/";
+          lastWord = "";
+          continue;
+        }
+        out += ch;
+        if (!/\s/.test(ch)) {
+          lastWord = /[A-Za-z0-9_$]/.test(ch) ? lastWord + ch : "";
+          lastSig = ch;
+        }
+      }
+      return out;
+    };
+    const schemeMentions = (text) => {
+      const code = stripJsComments(text);
+      const hits = [];
+      for (const id of NON_BASE_IDS) {
+        if (new RegExp("\\b" + id + "\\b").test(code)) hits.push(id);
+      }
+      for (const marker of ["data-theme", "--syn-", "--tok-"]) {
+        if (code.includes(marker)) hits.push(marker);
+      }
+      return hits;
+    };
+    /* THE PLANTED CONTROL. The sweep's whole value is that it finds nothing,
+       and a matcher that has stopped matching also finds nothing - the recorded
+       "an absence check fails open" disease. Each fragment below states one
+       half of the claim, and a wrong answer on any of them means the real
+       sweep's silence describes the matcher rather than main.js.
+
+       THE ID PLANTS DELIBERATELY SPELL NO MARKER. A fragment written as
+       `body[data-theme=ember]` is caught by the `data-theme` marker whatever
+       the id matcher does, so it cannot isolate the id path - measured, and it
+       is why R362 first bit on only one plant. The two paths are planted
+       separately. */
+    const SWEEP_PLANTS = [
+      ["unquoted id in a template literal", "const css = `body.theme-ember h1 { color: red }`;", true],
+      ["hyphenated id in a string", 'el.className = "scheme-abyss";', true],
+      ["quoted id", "if (name === 'parchment') return 1;", true],
+      ["marker in a template literal", "const css = `body[data-theme=x] { color: red }`;", true],
+      ["token variable", "const c = `var(--tok-keyword)`;", true],
+      ["prose in a line comment", "// Remember to keep this in sync with the renderer.\n", false],
+      ["prose in a block comment", "/* Kept separate for clarity, not for speed. */", false],
+      ["an unrelated word", "const remembered = memberOf(list);", false],
+      ["a themeless string", 'const s = "no scheme is named here";', false],
+      /* THE REGEX-LITERAL PLANT. Without regex state the quote inside /"/g
+         opens phantom string mode, the trailing line comment is never
+         recognised as one, and its prose "ember" is reported as a leak. This
+         plant fails on the old stripper and passes on the fixed one, which is
+         what makes the fix a measurement rather than a claim. */
+      [
+        "a regex literal holding a quote does not desync the scanner",
+        'x.replace(/"/g, "&q;");\n// this comment names ember and must be stripped\n',
+        false,
+      ],
+      /* AND THE OTHER DIRECTION, which is the dangerous one: a // inside a
+         STRING must survive, because a stripper that eats it deletes real code
+         from the sweep's view and fails open. */
+      ["a protocol-relative path in a string", 'const u = "//host/share/ember.css";', true],
+      /* THE TWO INTERPOLATION PLANTS, and they exist because the two review
+         models DISAGREED about them: one held that `${...}` hides a scheme
+         reference from the sweep, the other traced the scanner and called it
+         sound. Neither reading is worth carrying as an opinion, so both
+         directions are planted and the suite decides on every run.
+
+         The first is the CLAIM ITSELF. A backtick is a quote character here,
+         so an interpolation's contents are scanned as string content - but
+         every character is still EMITTED, so a scheme id inside `${}` remains
+         visible to the id matcher. If that ever stops being true this plant
+         goes clean and the sweep has a blind spot the size of every template
+         in the file.
+
+         The second is the failure that would actually matter: a nested
+         template toggles the quote state twice, and an ODD number of toggles
+         would leave the scanner desynchronised and start eating real code as
+         comments. Balanced nesting must come back in sync, which is what the
+         trailing comment measures - it can only be stripped if the scanner is
+         back in code state at the end of the statement. */
+      [
+        "a scheme id inside a template interpolation is still visible",
+        "const css = `body{color:${'ember'}}`;",
+        true,
+      ],
+      [
+        "a nested template inside an interpolation leaves the scanner in sync",
+        "const s = `a${b ? `c` : d}e`;\n// this comment names abyss and must be stripped\n",
+        false,
+      ],
+    ];
+    const plantFaults = SWEEP_PLANTS.filter(
+      ([, frag, wantCaught]) => schemeMentions(frag).length > 0 !== wantCaught,
+    ).map(([name, , wantCaught]) => `${name}: expected ${wantCaught ? "caught" : "clean"}`);
+    check(
+      "10i: the scheme-leak sweep catches an unquoted id and ignores the same letters in prose (control)",
+      plantFaults.length === 0 && SWEEP_PLANTS.length === 13,
+      `${SWEEP_PLANTS.length} plants, ${plantFaults.length} wrong: ${
+        plantFaults.join(" | ") || "none"
+      }`,
+    );
+    /* THE LAZY-LOAD SITE'S ARGUMENT, which no runtime capture in this suite can
+       reach. renderer.js:102 runs once inside ensureMermaid()'s onload, before
+       any spy in section 10i exists and with no way to re-drive it: both
+       `window.mermaid` and `mermaidLoadPromise` latch, and the latter is module
+       scope, so the load path cannot be replayed from a probe. The runtime
+       assertion therefore evaluates the site's own expression -
+       getMermaidConfig(mermaidDesiredDark) - after every state, which pins the
+       VALUE that expression yields but not the expression itself: rewrite :102
+       to getMermaidConfig(false) and the recomputation is unchanged and green.
+       R339 covers the other half (the recording), so what is left unguarded is
+       exactly the argument text, and text is what this reads.
+       BOTH sites are pinned as a set rather than the load site alone: a fix
+       that pinned one and left the other addressable by index would move on the
+       next edit that adds an initialise call. */
+    const initArgs = [];
+    /* SCANNED WITH COMMENTS STRIPPED, and that is not incidental: renderer.js
+       has a comment at :2358 that spells mermaid.initialize() while explaining
+       what the recording is for. Reading raw text found three sites and the
+       third had an empty argument list - a measurement of prose. The count
+       below is therefore also the control that the strip worked. */
+    const rendererCode = stripJsComments(rendererSrc);
+    const INIT_RE = /mermaid\.initialize\(/g;
+    let initM;
+    while ((initM = INIT_RE.exec(rendererCode)) !== null) {
+      const open = INIT_RE.lastIndex - 1;
+      let depth = 0;
+      let endI = -1;
+      let q = "";
+      for (let i = open; i < rendererCode.length; i++) {
+        const ch = rendererCode[i];
+        if (q) {
+          if (ch === "\\") i++;
+          else if (ch === q) q = "";
+          continue;
+        }
+        if (ch === '"' || ch === "'" || ch === "`") {
+          q = ch;
+          continue;
+        }
+        if (ch === "(" || ch === "[" || ch === "{") depth++;
+        else if (ch === ")" || ch === "]" || ch === "}") {
+          depth--;
+          if (depth === 0) {
+            endI = i;
+            break;
+          }
+        }
+      }
+      initArgs.push(endI === -1 ? "<unterminated>" : rendererCode.slice(open + 1, endI).trim());
+    }
+    const MERMAID_INIT_ARGS = ["getMermaidConfig(mermaidDesiredDark)", "getMermaidConfig(isDark)"];
+    const initFaults = initArgs
+      .filter((a) => !MERMAID_INIT_ARGS.includes(a.replace(/\s+/g, " ").trim()))
+      .map((a) => a.replace(/\s+/g, " ").slice(0, 90));
+    check(
+      "10i: both mermaid.initialize sites pass a palette chosen by a plain mode flag, spelled that way in the source",
+      initArgs.length === 2 &&
+        initFaults.length === 0 &&
+        new Set(initArgs.map((a) => a.replace(/\s+/g, " ").trim())).size === 2,
+      `${initArgs.length} initialise site(s) (expected 2): ${initArgs
+        .map((a) => a.replace(/\s+/g, " ").slice(0, 60))
+        .join(" | ")}${
+        initFaults.length ? ` - unexpected argument(s): ${initFaults.join(" | ")}` : ""
+      }`,
+    );
+
+    const schemeLeaks = schemeMentions(mainSrc);
+    /* THE POPUP PAYLOADS, BY VALUE. The two checks near the parse reduce each
+       payload to its key NAMES, and the runtime probe below drives exactly one
+       of the five send sites (the census fixture has a table but no diagram and
+       no image). Between them they leave the likeliest leak of all uncovered:
+       the key stays `isDarkMode` and its VALUE learns about the scheme. Written
+       out, the attack is `isDarkMode: isDarkMode || dataset.theme === "ember"` -
+       an allowed key, an untouched key set, and at a site no click reaches.
+       Placed here rather than beside the parse because it reuses schemeMentions,
+       whose planted control sits directly above: the matcher this depends on is
+       proven before it is trusted. */
+    const MODE_EXPR = "document.body.classList.contains('dark-mode')";
+    const norm = (s) => (s || "").replace(/\s+/g, "").replace(/"/g, "'");
+    const popupValueFaults = [];
+    for (const s of popupSites) {
+      if (!s.keys) continue;
+      if (s.darkExpr === null || s.darkExpr === undefined) {
+        popupValueFaults.push(`${s.channel}: no isDarkMode value could be resolved`);
+        continue;
+      }
+      if (norm(s.darkExpr) !== norm(MODE_EXPR)) {
+        popupValueFaults.push(`${s.channel}: isDarkMode = ${s.darkExpr.trim()}`);
+      }
+      const leaked = schemeMentions(s.raw + ";" + s.darkExpr);
+      if (leaked.length) popupValueFaults.push(`${s.channel}: payload mentions ${leaked.join("+")}`);
+      if (!s.singleArg) popupValueFaults.push(`${s.channel}: send carries more than the payload`);
+    }
+    check(
+      "10i: every popup payload derives its mode boolean from the mode alone, and carries nothing else",
+      popupValueFaults.length === 0 && popupSites.filter((s) => s.keys).length === 5,
+      `${popupSites.filter((s) => s.keys).length}/5 sites resolved; ${
+        popupValueFaults.join(" | ") || "no faults"
+      } - the key name is not the boundary, the expression behind it is`,
+    );
+    /* THE POSITIVE CONTROL FOR THE RESOLVER, and it is not optional: two of the
+       five sites spell the boolean as a bare shorthand, so the expression lives
+       on a preceding line and is found by searching BACKWARDS. A resolver that
+       silently returned null for those would make the check above pass on three
+       sites while reporting five, which is the same shape as every vacuity this
+       suite has been bitten by. Both spellings must therefore be present. */
+    const shorthandSites = popupSites.filter((s) => s.keys && !/isDarkMode\s*:/.test(s.raw));
+    const inlineSites = popupSites.filter((s) => s.keys && /isDarkMode\s*:/.test(s.raw));
+    check(
+      "10i: the payload resolver really read both spellings of the mode boolean (control)",
+      shorthandSites.length === 2 &&
+        inlineSites.length === 3 &&
+        shorthandSites.every((s) => s.darkExpr && s.darkExpr.includes("classList")),
+      `${shorthandSites.length} shorthand site(s) (expected 2), ${inlineSites.length} inline (expected 3); shorthand resolved to: ${
+        shorthandSites.map((s) => JSON.stringify(s.darkExpr)).join(", ") || "nothing"
+      }`,
+    );
+    const popupsFound = POPUP_CHANNELS.filter((c) => mainSrc.includes('"' + c + '"'));
+    /* THE POPUP HANDLERS, SLICED. `darkAware >= 20` used to stand here as the
+       positive control, and 20 was a number with no relationship behind it -
+       the real count is 56, so the sweep would have gone on passing after two
+       of the three popup surfaces stopped being boolean-themed entirely.
+       What is asserted instead is a property of EACH handler: it is bounded,
+       it decides on isDarkMode, it paints literal colours, and it consumes NO
+       custom property at all. That last one is the boundary itself rather than
+       a proxy for it - a popup that reads a `var(--...)` is by construction
+       participating in the token layer, whatever the variable is called, and it
+       is the case a scheme-id marker list cannot express. Measured: 0 in all
+       three handlers today. */
+    const HANDLER_RE = /ipcMain\.on\(/g;
+    const handlerStarts = [];
+    for (let m = HANDLER_RE.exec(mainSrc); m; m = HANDLER_RE.exec(mainSrc)) {
+      handlerStarts.push(m.index);
+    }
+    const popupHandlers = {};
+    for (const c of POPUP_CHANNELS) {
+      const at = mainSrc.indexOf('ipcMain.on("' + c + '"');
+      if (at === -1) continue;
+      const next = handlerStarts.find((i) => i > at);
+      popupHandlers[c] = mainSrc.slice(at, next === undefined ? mainSrc.length : next);
+    }
+    const handlerFaults = [];
+    for (const c of POPUP_CHANNELS) {
+      const body = popupHandlers[c];
+      if (!body) {
+        handlerFaults.push(`${c}: no handler`);
+        continue;
+      }
+      // Bounded: a slice running to end-of-file would swallow every later
+      // handler and make the absence claims below meaningless.
+      if (body.length === 0 || body.length >= mainSrc.length * 0.5) {
+        handlerFaults.push(`${c}: slice ${body.length}/${mainSrc.length}`);
+      }
+      if (!/isDarkMode\s*\?/.test(body)) handlerFaults.push(`${c}: no isDarkMode decision`);
+      if (!/#[0-9a-fA-F]{3,8}/.test(body)) handlerFaults.push(`${c}: no literal colours`);
+      const vars = body.match(/var\(--[\w-]+/g) || [];
+      if (vars.length) handlerFaults.push(`${c}: reads ${[...new Set(vars)].join(", ")}`);
+      // Same matcher as the file-wide sweep, so the two cannot drift apart and
+      // a handler is judged by exactly the rule the whole file is judged by.
+      for (const marker of schemeMentions(body)) {
+        handlerFaults.push(`${c}: mentions ${marker}`);
+      }
+    }
+    check(
+      "10i: every popup handler paints literal colours chosen by isDarkMode and reads no token-layer variable",
+      popupsFound.length === POPUP_CHANNELS.length && handlerFaults.length === 0,
+      `found ${popupsFound.length}/${POPUP_CHANNELS.length} popup channels; ${
+        handlerFaults.join(" | ") || "no faults"
+      }`,
     );
     check(
       "10i: the main process, which owns every popup window, knows nothing about colour schemes",
@@ -4198,7 +7093,7 @@ app.whenReady().then(async () => {
        elementFromPoint ignores pointer-events:none, so a decorative overlay is
        invisible to it.) */
     const MENU_PATH_PROBE = `(() => {
-      const out = { missing: [], steps: [] };
+      const out = { missing: [], steps: [], unreachable: [] };
       /* Start from a known-closed menu through the product's own dismissal
          path rather than by stripping classes by hand. */
       document.body.click();
@@ -4209,10 +7104,33 @@ app.whenReady().then(async () => {
         if (!el[id]) out.missing.push(id);
       }
       if (out.missing.length) return JSON.stringify(out);
+      /* HIT-TESTED, NOT JUST CLICKED. A bare .click() dispatches on a node
+         whether or not a reader could ever reach it - a zero-size button, one
+         behind an overlay, or one scrolled out of the panel all accept the
+         event silently, and the step then reports the path as open. The scheme
+         rows below are already hit-tested by REACH_PROBE for exactly that
+         reason; the two ancestors that lead to them were not, so the very
+         first two steps of "the real hamburger -> View -> Theme path" were the
+         only ones not measured against the reader's ability to perform them. */
+      const reach = (el, name) => {
+        const r = el.getBoundingClientRect();
+        if (r.width < 1 || r.height < 1) { out.unreachable.push(name + ':zero-size'); return; }
+        const hit = document.elementFromPoint(
+          Math.round(r.left + r.width / 2),
+          Math.round(r.top + r.height / 2),
+        );
+        if (!hit) { out.unreachable.push(name + ':no-hit'); return; }
+        if (hit !== el && !el.contains(hit)) {
+          out.unreachable.push(name + ':occluded-by-' + (hit.id || hit.className || hit.tagName));
+        }
+      };
+      reach(el.menuBtn, 'menuBtn');
       el.menuBtn.click();
       out.steps.push(['mainMenu', el.mainMenu.classList.contains('visible')]);
+      reach(el.viewBtn, 'viewBtn');
       el.viewBtn.click();
       out.steps.push(['viewMenu', el.viewMenu.classList.contains('visible')]);
+      reach(el.customThemeMenuItem, 'customThemeMenuItem');
       /* mouseenter does not bubble and is what custom-theme.js listens for -
          the grace-period hover, not a click. */
       el.customThemeMenuItem.dispatchEvent(new MouseEvent('mouseenter'));
@@ -4265,10 +7183,12 @@ app.whenReady().then(async () => {
 
     check(
       "10j: the Themes submenu opens through the real hamburger -> View -> Theme path",
-      menuPath.missing.length === 0 && menuPath.steps.every(([, ok]) => ok),
-      `missing ${menuPath.missing.join(",") || "none"}; ${menuPath.steps
-        .map(([k, v]) => `${k}=${v}`)
-        .join(" ")}`,
+      menuPath.missing.length === 0 &&
+        menuPath.steps.every(([, ok]) => ok) &&
+        menuPath.unreachable.length === 0,
+      `missing ${menuPath.missing.join(",") || "none"}; unreachable ${
+        menuPath.unreachable.join(",") || "none"
+      }; ${menuPath.steps.map(([k, v]) => `${k}=${v}`).join(" ")}`,
     );
 
     const MENU_IDS = ["default-light", "clarity", "parchment", "default-dark", "abyss", "ember"];
@@ -4286,6 +7206,506 @@ app.whenReady().then(async () => {
       "10j: no scheme row is reachable while the menu is closed (positive control)",
       menuClosedReach.total === MENU_IDS.length && menuClosedReach.reachable.length === 0,
       `${menuClosedReach.reachable.length}/${menuClosedReach.total} reachable with the menu shut: ${menuClosedReach.reachable.join(",")}`,
+    );
+
+    /* THE SUBMENU'S CHROME, WHICH THE STATE ASSERTIONS BELOW ARE STRUCTURALLY
+       BLIND TO. Everything else in 10j reads CLASSES: `schemeTicked` is
+       `.custom-scheme-option.active` mapped to its data-scheme, so it answers
+       "did markActive() mark the right row" and nothing else. What turns that
+       class into something a reader can see is a handful of CSS rules in
+       custom-styles.css, and MEASURED by deleting the tick rule outright, the
+       whole suite stayed green at 242/242: every row lost its checkmark, the
+       menu became unreadable, and not one assertion moved.
+       So this measures the RENDERED form of the same claim. R340 is that exact
+       edit, kept permanently.
+
+       LABEL ALIGNMENT IS THE STRONGER HALF, and it is why the gutter is
+       checked by geometry rather than by reading any declaration. This
+       assertion FAILED on its first run and named a real product defect: the
+       rows inherit `justify-content: space-between` from .tools-submenu-item,
+       which pushed every tick to the far left edge and every label to the far
+       right, so the labels formed a 64px-ragged column and each tick sat ~140px
+       from the row it marked. Both halves of the fix are load-bearing - packing
+       from the start edge, and giving the ::before a WIDTH so a ticked and an
+       unticked row reserve the same space - and reverting either one alone is
+       enough to misalign the column, which is why R341 and R342 are separate.
+       A Range over a SCHEME row's contents measures where the text really
+       begins - the pseudo is not part of it - so nothing here restates a
+       length. A MODE row is not the same shape: its first child is an inline
+       SVG, so the same Range starts at the icon. That number is kept, named
+       for the gutter it actually measures, and the mode label is read
+       separately from its own text node. */
+    const CHROME_PROBE = `(() => {
+      const rows = Array.from(document.querySelectorAll('.custom-scheme-option'));
+      const out = { rows: [], modeRows: [], captions: [], seps: [], rowFont: 0, open: false };
+      /* THE PROBE'S OWN PRECONDITION, MEASURED RATHER THAN INHERITED. Every
+         geometric claim below is read off getBoundingClientRect, and a closed
+         submenu is display:none - so every rect collapses to zero, every label
+         inset becomes exactly 0, and the alignment spread reads a perfect 0.
+         A vacuous pass and a perfect result are the same number here, which is
+         the one shape this project treats as unacceptable. The section leaves
+         the menu open above; this records that it really was, so a future edit
+         that reorders the section fails loudly instead of silently measuring
+         an unpainted menu.
+
+         THE SIZE CHECK IS THE LOAD-BEARING HALF AND 'open' ALONE WOULD NOT
+         DO - measured, not assumed. R363 dismisses the menu through the
+         product's own document.body.click() path and the probe still reports
+         open=true: that click closes the PARENT dropdown, and nothing
+         removes 'theme-open' from the item (custom-theme.js drops it only on a
+         row click or the 200ms hover grace timer). So the class outlives the
+         painted panel, and only the rects can tell. Both are reported so a
+         failure names which half went.
+         NOTE FOR EDITORS: never a backtick in here - this comment lives inside
+         an exec() template literal and a backtick terminates it. */
+      const host = document.getElementById('customThemeMenuItem');
+      out.open = !!host && host.classList.contains('theme-open');
+      for (const row of rows) {
+        const cs = getComputedStyle(row, '::before');
+        const rng = document.createRange();
+        rng.selectNodeContents(row);
+        const tr = rng.getBoundingClientRect();
+        const rr = row.getBoundingClientRect();
+        out.rows.push({
+          id: row.dataset.scheme || '?',
+          active: row.classList.contains('active'),
+          /* An absent ::before computes content as 'none'; an empty one as a
+             pair of quote characters. Both are "paints no glyph", and they are
+             kept distinct in the report so a failure names which happened. */
+          content: cs.content,
+          /* THE GUTTER BOX'S OWN display. An inline-block display was
+             declared on this rule and was DEAD: a generated box that is a flex
+             item is BLOCKIFIED, so it computed to block regardless. Measured
+             here, then deleted from the stylesheet - and the measurement is
+             kept because it is load-bearing in its own right. If the row ever
+             stops being a flex container this gutter becomes an inline box,
+             a width on an inline box is ignored, and the whole fixed-width
+             tick column silently stops working while every inset above still
+             reads uniform.
+
+             RECORDED COVERAGE GAP, in the same rule: the centred text-align is
+             real and is NOT asserted anywhere. No DOM measurement can reach
+             it - a pseudo-element has no client rect and its generated text
+             cannot be put in a Range - so it was verified in PIXELS off a
+             capturePage of the real open menu: at dpr 1.5 the tick's
+             horizontal ink centroid inside this 12px box measures 9.83
+             centred, 6.83 left-aligned, 12.76 right-aligned. That A/B is not
+             promoted to an assertion on purpose: it would make this suite
+             depend on window foreground state, and capturePage is known in
+             this project to return stale frames, which is exactly how a suite
+             that must survive a multi-hour revert run goes flaky.
+             NOTE FOR EDITORS: never a backtick in here. */
+          beforeDisplay: cs.display,
+          labelLeft: Math.round(tr.left * 100) / 100,
+          rowLeft: Math.round(rr.left * 100) / 100,
+          w: Math.round(rr.width),
+          h: Math.round(rr.height),
+        });
+        out.rowFont = parseFloat(getComputedStyle(row).fontSize) || 0;
+      }
+      /* THE MODE ROWS - Light / Dark / Follow Desktop - are PRE-EXISTING
+         product UI that this work changed and nothing measured. At ca1ac9e
+         their tick gutter was a pair of hand-tuned margins (6px beside the
+         checkmark, 20px in place of it); it is now the same fixed 12px box the
+         scheme rows use, so the whole submenu aligns as one column. That is a
+         deliberate change to surfaces outside the scheme feature, and it is
+         recorded here as a measurement rather than left as an omission. */
+      for (const row of document.querySelectorAll('.custom-theme-option')) {
+        const rng = document.createRange();
+        rng.selectNodeContents(row);
+        const tr = rng.getBoundingClientRect();
+        const rr = row.getBoundingClientRect();
+        /* A MODE ROW'S CONTENTS BEGIN WITH ITS ICON, NOT ITS TEXT. The scheme
+           rows are built by assigning row.textContent, so a range over their
+           contents really is a range over the label; the mode rows are built
+           from an innerHTML string that puts an inline SVG first, so the same
+           range starts at that icon. That makes the number above a measure of
+           where the TICK GUTTER ends - useful, and asserted as such below - but
+           it is not the label, and reading it as one hides an icon retune that
+           pushes every mode label sideways while the gutter stays put. The text
+           is therefore measured on its own node. NOTE FOR EDITORS: this comment
+           lives inside an exec() template literal, so it must never contain a
+           backtick. In a flex container the trailing text is an anonymous flex
+           item and its leading whitespace is stripped, so this is the painted
+           glyph start rather than the source string's. */
+        let textLeft = null;
+        const last = row.lastChild;
+        if (last && last.nodeType === 3 && last.textContent.trim()) {
+          const r2 = document.createRange();
+          r2.selectNode(last);
+          textLeft = Math.round(r2.getBoundingClientRect().left * 100) / 100;
+        }
+        const icon = row.querySelector('svg');
+        out.modeRows.push({
+          id: row.dataset.mode || '?',
+          active: row.classList.contains('active'),
+          labelLeft: Math.round(tr.left * 100) / 100,
+          textLeft,
+          iconW: icon ? Math.round(icon.getBoundingClientRect().width * 100) / 100 : 0,
+          rowLeft: Math.round(rr.left * 100) / 100,
+          w: Math.round(rr.width),
+          h: Math.round(rr.height),
+        });
+      }
+      for (const cap of document.querySelectorAll('.theme-scheme-group')) {
+        const r = cap.getBoundingClientRect();
+        const cs = getComputedStyle(cap);
+        out.captions.push({
+          text: (cap.textContent || '').trim(),
+          w: Math.round(r.width), h: Math.round(r.height),
+          font: parseFloat(cs.fontSize) || 0,
+          cursor: cs.cursor,
+          submenuItem: cap.classList.contains('tools-submenu-item'),
+        });
+      }
+      for (const s of document.querySelectorAll('.theme-scheme-sep')) {
+        out.seps.push(parseFloat(getComputedStyle(s).marginTop) || 0);
+      }
+      /* THE BASE SEPARATOR, MEASURED IN THE SAME PROBE, because without it the
+         gap assertion is a disjunction: .theme-scheme-sep is applied ALONGSIDE
+         .tools-menu-separator, whose own rule already sets a top margin, so
+         "the margin is greater than zero" is satisfied whether or not the
+         scheme rule contributes anything at all. Comparing the two is the only
+         form of the claim that names this rule. A computed length is readable
+         on a display:none subtree, so the tools menu being shut is fine. */
+      const baseSep = document.querySelector('.tools-menu-separator:not(.theme-scheme-sep)');
+      out.baseSep = baseSep ? parseFloat(getComputedStyle(baseSep).marginTop) || 0 : -1;
+      return JSON.stringify(out);
+    })()`;
+    const chrome = JSON.parse(await exec(CHROME_PROBE));
+    /* THE ONE DECLARATION IN THE GUTTER RULE THAT IS INERT IN THE SHIPPED
+       LAYOUT BUT NOT DEAD, measured under the condition it exists for.
+
+       The submenu panel is shrink-to-fit, so an over-long label widens the
+       panel (measured 1005px) instead of compressing anything - which means
+       `flex: 0 0 auto` can never bite as the product stands, and a plain
+       revert of it would come back VACUOUS. Bounding the panel is an entirely
+       ordinary future edit, and under it the default `flex: 0 1 auto` squeezes
+       this fixed column on the OVERFLOWING ROW ALONE: measured inset 32 -> 28
+       while its siblings hold at 32. That is precisely the per-row
+       misalignment the fixed width exists to prevent, and it is invisible to
+       every resting measurement above.
+
+       So the panel is bounded and a label planted, deliberately, and the real
+       rule is measured under it. The perturbation is undone and the undo is
+       itself asserted, since a stranded max-width would silently reshape every
+       later measurement.
+       NOTE FOR EDITORS: never a backtick in here - this comment lives inside
+       an exec() template literal and a backtick terminates it. */
+    const SHRINK_PROBE = `(() => {
+      const rows = Array.from(document.querySelectorAll('.custom-scheme-option'));
+      if (rows.length < 2) return JSON.stringify({ error: 'no scheme rows' });
+      const victim = rows[0];
+      const panel = victim.parentElement;
+      const oldLabel = victim.textContent;
+      const oldMax = panel.style.maxWidth;
+      const insets = () => rows.map((r) => {
+        const rr = r.getBoundingClientRect();
+        const rng = document.createRange();
+        rng.selectNodeContents(r);
+        return { id: r.dataset.scheme || '?', inset: Math.round((rng.getBoundingClientRect().left - rr.left) * 100) / 100 };
+      });
+      const style = document.createElement('style');
+      style.id = '__shrink_probe';
+      document.head.appendChild(style);
+      const out = { victim: victim.dataset.scheme || '?' };
+      out.before = insets();
+      try {
+        victim.textContent = 'A scheme name far too long for a bounded panel to hold without overflowing it';
+        panel.style.maxWidth = '120px';
+        void panel.offsetWidth;
+        out.overflow = { scrollW: victim.scrollWidth, clientW: victim.clientWidth };
+        out.shipped = insets();
+        /* The counterfactual, applied to the REAL rule at the real
+           specificity rather than to a copy of it on a probe node.
+           THE SELECTOR MUST TRACK THE SHIPPED ONE. When the tick gutter was
+           scoped under #customThemeMenuItem to match its packing rule, this
+           injection - still written at the old class-only specificity - simply
+           lost the cascade, the gutter did not move, and this control failed
+           by name. That is the control working: an override that cannot
+           override would have made the two assertions above vacuous without
+           it. Same specificity, later in the sheet, so source order decides. */
+        style.textContent = '#customThemeMenuItem .custom-theme-option::before, #customThemeMenuItem .custom-scheme-option::before { flex: 0 1 auto; }';
+        void panel.offsetWidth;
+        out.defaulted = insets();
+      } finally {
+        style.remove();
+        victim.textContent = oldLabel;
+        panel.style.maxWidth = oldMax;
+        void panel.offsetWidth;
+      }
+      out.restored = insets();
+      out.restoredLabel = victim.textContent;
+      out.beforeLabel = oldLabel;
+      out.restoredMax = panel.style.maxWidth;
+      out.beforeMax = oldMax;
+      out.styleGone = !document.getElementById('__shrink_probe');
+      return JSON.stringify(out);
+    })()`;
+    const shrink = JSON.parse(await exec(SHRINK_PROBE));
+    const spread = (list) => {
+      const v = list.map((r) => r.inset);
+      return Math.round((Math.max(...v) - Math.min(...v)) * 100) / 100;
+    };
+    check(
+      "10j: the bounded-panel perturbation really does overflow the row it plants a label in (control)",
+      !shrink.error &&
+        shrink.overflow &&
+        shrink.overflow.scrollW > shrink.overflow.clientW,
+      `victim=${shrink.victim} scrollWidth=${shrink.overflow && shrink.overflow.scrollW} clientWidth=${
+        shrink.overflow && shrink.overflow.clientW
+      } - without a real overflow flex-shrink is never applied and the two assertions below are vacuous`,
+    );
+    check(
+      "10j: the tick gutter keeps its width when the panel is bounded and a label overflows",
+      !shrink.error && shrink.shipped && spread(shrink.shipped) === 0,
+      `insets under a bounded panel: ${
+        shrink.shipped && shrink.shipped.map((r) => `${r.id}=${r.inset}`).join(" ")
+      } - a squeezed gutter on the overflowing row alone is exactly the misalignment the fixed width exists to prevent`,
+    );
+    check(
+      "10j: dropping flex-shrink:0 really would squeeze that gutter (control)",
+      !shrink.error && shrink.defaulted && spread(shrink.defaulted) > 0,
+      `insets with the default flex: ${
+        shrink.defaulted && shrink.defaulted.map((r) => `${r.id}=${r.inset}`).join(" ")
+      } - if these are uniform too then the counterfactual changed nothing and the assertion above is not measuring this declaration`,
+    );
+    check(
+      "10j: the bounded-panel perturbation was undone before anything else was measured",
+      /* Restoration is judged against the insets measured BEFORE the
+         perturbation, NOT against a uniform spread. Those are different
+         claims: a uniform spread also asserts the gutter rule is correct, so
+         any revert that breaks the rule would report a stranded perturbation
+         it did not cause - a failure naming the wrong thing, which this
+         project treats as the most expensive kind. */
+      !shrink.error &&
+        shrink.styleGone &&
+        shrink.restored &&
+        shrink.before &&
+        JSON.stringify(shrink.restored) === JSON.stringify(shrink.before) &&
+        shrink.restoredLabel === shrink.beforeLabel &&
+        shrink.restoredMax === shrink.beforeMax,
+      `styleGone=${shrink.styleGone} before=${JSON.stringify(
+        shrink.before,
+      )} restored=${JSON.stringify(shrink.restored)} label ${JSON.stringify(
+        shrink.beforeLabel,
+      )} -> ${JSON.stringify(shrink.restoredLabel)} maxWidth ${JSON.stringify(
+        shrink.beforeMax,
+      )} -> ${JSON.stringify(shrink.restoredMax)}`,
+    );
+    const paintsGlyph = (c) => !!c && c !== "none" && !/^["'][\s]*["']$/.test(c);
+    const tickedRows = chrome.rows.filter((r) => r.active);
+    const untickedRows = chrome.rows.filter((r) => !r.active);
+    const rowsPainted = chrome.rows.length > 0 && chrome.rows.every((r) => r.w > 0 && r.h > 0);
+    check(
+      "10j: the scheme submenu was open and painted when its chrome was measured (probe self-guard)",
+      chrome.open && rowsPainted && chrome.rows.length === MENU_IDS.length,
+      `open=${chrome.open} rows=${chrome.rows.length}/${MENU_IDS.length} sizes ${chrome.rows
+        .map((r) => `${r.id}=${r.w}x${r.h}`)
+        .join(" ")}`,
+    );
+    check(
+      "10j: a ticked scheme row really paints a checkmark, not just an .active class",
+      tickedRows.length >= 2 && tickedRows.every((r) => paintsGlyph(r.content)),
+      `${tickedRows.length} ticked row(s): ${tickedRows
+        .map((r) => `${r.id} content=${r.content}`)
+        .join(" | ")}`,
+    );
+    check(
+      "10j: an unticked scheme row paints no checkmark (control)",
+      untickedRows.length >= 2 && untickedRows.every((r) => !paintsGlyph(r.content)),
+      `${untickedRows.length} unticked row(s): ${untickedRows
+        .filter((r) => paintsGlyph(r.content))
+        .map((r) => `${r.id} content=${r.content}`)
+        .join(" | ")}`,
+    );
+    const labelLefts = chrome.rows.map((r) => Math.round((r.labelLeft - r.rowLeft) * 100) / 100);
+    const labelSpread = labelLefts.length
+      ? Math.max(...labelLefts) - Math.min(...labelLefts)
+      : -1;
+    check(
+      "10j: every scheme label starts at the same x, so the tick gutter is reserved on unticked rows too",
+      chrome.rows.length === MENU_IDS.length &&
+        rowsPainted &&
+        labelSpread >= 0 &&
+        labelSpread <= 1,
+      `label insets ${chrome.rows
+        .map((r, i) => `${r.id}${r.active ? "*" : ""}=${labelLefts[i]}`)
+        .join(" ")} (spread ${labelSpread}, painted ${rowsPainted})`,
+    );
+    /* THE CAPTIONS' OWN CODE COMMENT MAKES A CLAIM - "not focusable, not
+       clickable, and deliberately not a .tools-submenu-item so the hover
+       highlight cannot make them look actionable" - and this is that claim as
+       a measurement rather than as prose. The font relationship is asserted
+       against the row's own resolved size rather than against 10px, so it
+       cannot rot when either size is retuned. */
+    check(
+      "10j: each scheme group carries a caption that renders, and reads as a caption rather than a row",
+      chrome.captions.length >= 2 &&
+        chrome.rowFont > 0 &&
+        chrome.captions.every(
+          (c) =>
+            c.text.length > 0 &&
+            c.w > 0 &&
+            c.h > 0 &&
+            c.font > 0 &&
+            c.font < chrome.rowFont &&
+            c.cursor !== "pointer" &&
+            !c.submenuItem,
+        ),
+      `rows render at ${chrome.rowFont}px; captions ${JSON.stringify(chrome.captions)}`,
+    );
+    check(
+      "10j: the divider above the scheme groups opens a WIDER gap than an ordinary menu separator",
+      chrome.seps.length >= 1 &&
+        chrome.baseSep > 0 &&
+        chrome.seps.every((m) => m > chrome.baseSep),
+      `scheme divider margin-top [${chrome.seps.join(
+        ",",
+      )}] against the base separator's ${chrome.baseSep} - equal values here mean this rule contributes nothing and the claim is being met by .tools-menu-separator alone`,
+    );
+    const gutterDisplays = [...new Set(chrome.rows.map((r) => r.beforeDisplay))];
+    check(
+      "10j: the tick gutter is a blockified flex item, which is what makes its fixed width mean anything",
+      rowsPainted && gutterDisplays.length === 1 && gutterDisplays[0] === "block",
+      `::before display: [${gutterDisplays.join(
+        ", ",
+      )}] - anything but "block" means the row has stopped being a flex container, and a width on an inline box is ignored`,
+    );
+
+    /* THE PRE-EXISTING MODE ROWS, WHICH THIS WORK CHANGED. Everything above
+       measures the scheme rows this feature added; the Light / Dark / Follow
+       Desktop rows predate it and their tick gutter was rebuilt underneath
+       them - from `margin-right: 6px` beside the checkmark and `20px` in place
+       of it, to the same fixed 12px box the scheme rows use.
+
+       Both halves are asserted because they fail under different accidents.
+       The first is the property the OLD margins were hand-tuned to approximate
+       and is what a reader sees within one group; the second is the property
+       the change was MADE for - one gutter for the whole submenu - and it is
+       satisfied by neither group on its own, so no per-group assertion can
+       reach it. A future edit retuning one group's gutter alone passes the
+       first and fails the second, which is exactly the regression the old
+       hand-tuned pair was one edit away from. */
+    const modeLefts = chrome.modeRows.map(
+      (r) => Math.round((r.labelLeft - r.rowLeft) * 100) / 100,
+    );
+    const modeSpread = modeLefts.length ? Math.max(...modeLefts) - Math.min(...modeLefts) : -1;
+    const modePainted =
+      chrome.modeRows.length > 0 && chrome.modeRows.every((r) => r.w > 0 && r.h > 0);
+    check(
+      "10j: every mode row's tick gutter ends at the same x, ticked or not",
+      chrome.modeRows.length === 3 &&
+        modePainted &&
+        chrome.modeRows.some((r) => r.active) &&
+        chrome.modeRows.some((r) => !r.active) &&
+        modeSpread >= 0 &&
+        modeSpread <= 1,
+      `mode insets ${chrome.modeRows
+        .map((r, i) => `${r.id}${r.active ? "*" : ""}=${modeLefts[i]}`)
+        .join(" ")} (spread ${modeSpread}, painted ${modePainted})`,
+    );
+    /* AND THE SAME CHANGE AS A RECORDED DECISION, which the assertion above is
+       not. That one says the rows are aligned TODAY; it is equally satisfied by
+       a menu that was always aligned, so it cannot show that a pre-existing
+       surface was deliberately changed. This one reads the ledger and asserts
+       both halves of the entry: the recorded `was` really is a misaligned set
+       (the premise the amendment was made on), and the live geometry really is
+       the aligned one (the amendment is applied). Emptying the ledger, or
+       restoring the old margins, each fail it on their own. */
+    const gutterAmendment = CHROME_AMENDMENTS.find((a) => a.id === "mode-row tick gutter");
+    /* THE PREMISE IS PINNED THREE WAYS, because "the recorded numbers are not
+       all equal" is not a premise - both review models observed that ANY
+       misaligned set satisfies it, so a `was` that had drifted to numbers
+       nobody ever measured would still read as sound. These tie the reading to
+       itself and to the sentence that explains it: the two unticked rows must
+       AGREE (they were one measurement taken twice, not two), the ticked row
+       must sit exactly the recorded delta to their left, and `why` must name
+       that same delta in px. Change any single number and at least one of the
+       three stops holding. */
+    const wasActive = gutterAmendment ? gutterAmendment.was.active : null;
+    const wasInactive = gutterAmendment ? gutterAmendment.was.inactive : [];
+    const inactiveAgrees = wasInactive.length === 2 && wasInactive[0] === wasInactive[1];
+    const wasDelta = inactiveAgrees && typeof wasActive === "number" ? wasInactive[0] - wasActive : -1;
+    const whyDelta = gutterAmendment ? Number((/(\d+)px/.exec(gutterAmendment.why) || [])[1]) : NaN;
+    check(
+      "10j: the mode-row gutter change is recorded as a decision, and its premise still reads as one",
+      CHROME_AMENDMENTS.length === 1 &&
+        inactiveAgrees &&
+        wasDelta > 0 &&
+        wasDelta === whyDelta &&
+        modePainted &&
+        chrome.modeRows.length === 3 &&
+        modeSpread >= 0 &&
+        modeSpread <= 1,
+      `ledger ${CHROME_AMENDMENTS.length} entry(ies); recorded was active=${wasActive} inactive=${wasInactive.join(
+        "+",
+      )} (delta ${wasDelta}, why says ${whyDelta}px) -> now ${modeLefts.join(
+        "/",
+      )} (spread ${modeSpread}); reason: ${gutterAmendment ? gutterAmendment.why : "NO LEDGER ENTRY"}`,
+    );
+    /* AND THE LABEL ITSELF, which the number above is not. A mode row's first
+       child is its icon, so the inset above is where the GUTTER ends; the two
+       coincide only while all three icons are the same width, and an icon
+       retune moves every mode label without moving that inset at all. This
+       reads the trailing text node on its own. */
+    const modeTextLefts = chrome.modeRows.map((r) =>
+      r.textLeft === null ? null : Math.round((r.textLeft - r.rowLeft) * 100) / 100,
+    );
+    const modeTextMeasured = modeTextLefts.every((v) => typeof v === "number");
+    const modeTextSpread = modeTextMeasured
+      ? Math.round((Math.max(...modeTextLefts) - Math.min(...modeTextLefts)) * 100) / 100
+      : -1;
+    check(
+      "10j: every mode row's text label starts at the same x, ticked or not",
+      chrome.modeRows.length === 3 &&
+        modePainted &&
+        modeTextMeasured &&
+        chrome.modeRows.every((r) => r.iconW > 0) &&
+        modeTextSpread >= 0 &&
+        modeTextSpread <= 1,
+      `mode text insets ${chrome.modeRows
+        .map((r, i) => `${r.id}${r.active ? "*" : ""}=${modeTextLefts[i]}`)
+        .join(" ")} (spread ${modeTextSpread}, icons ${chrome.modeRows
+        .map((r) => r.iconW)
+        .join("/")})`,
+    );
+    /* THE CONTROL THAT KEEPS THE PAIR HONEST. If the text range silently
+       collapsed onto the icon - a changed row structure, a lost text node, a
+       Range that failed to resolve - both numbers above would become the SAME
+       number and both assertions would still pass, one of them vacuously. The
+       label must measure strictly right of the gutter, by about an icon. */
+    const modeTextGaps = modeTextMeasured
+      ? chrome.modeRows.map((r, i) => Math.round((modeTextLefts[i] - modeLefts[i]) * 100) / 100)
+      : [];
+    check(
+      "10j: the mode row's text really is a different measurement from its gutter (control)",
+      modeTextMeasured &&
+        modeTextGaps.length === 3 &&
+        chrome.modeRows.every((r) => r.iconW > 0) &&
+        modeTextGaps.every((g, i) => g >= chrome.modeRows[i].iconW),
+      `text-minus-gutter ${modeTextGaps.join("/")} against icon widths ${chrome.modeRows
+        .map((r) => r.iconW)
+        .join("/")} - equal numbers here mean the text range collapsed onto the icon, and a zero icon width means nothing was painted to compare against`,
+    );
+    const gutterSpread =
+      modeLefts.length && labelLefts.length
+        ? Math.round(
+            (Math.max(...modeLefts, ...labelLefts) - Math.min(...modeLefts, ...labelLefts)) * 100,
+          ) / 100
+        : -1;
+    /* ONE GUTTER, TWO TEXT COLUMNS - and the second half of that sentence is
+       why this assertion is no longer named "so the submenu is a single
+       column". It is not one: the mode rows carry an icon the scheme rows do
+       not, so their text starts an icon-width further right. Measured, not
+       assumed - see the text assertion above. What the shared rule really buys
+       is a single TICK column, which is the thing a reader's eye follows down
+       the menu and the thing the old hand-tuned margins were one edit from
+       losing. */
+    check(
+      "10j: mode rows and scheme rows share ONE tick gutter",
+      modePainted && rowsPainted && gutterSpread >= 0 && gutterSpread <= 1,
+      `mode [${modeLefts.join(",")}] scheme [${labelLefts.join(",")}] (spread ${gutterSpread})`,
     );
 
     /* Both base rows are included deliberately: a base scheme applies by
@@ -4636,6 +8056,1257 @@ app.whenReady().then(async () => {
       }
       if (running !== 0) settleFailures.push(`10k resolver: ${running} still running`);
     }
+
+    // ─── 10m. CHROME FIDELITY AGAINST THE BASELINE COMMIT ───────────────────
+    /* THE HARD CONSTRAINT, FOR THE SURFACES THE GOLDEN NEVER REACHED. Both
+       models of a review round independently reported the same gap and it was
+       real: theme-golden.json's `surfaces` map holds exactly ten selectors,
+       all of them `body` or `#viewer`. Every chrome surface this work
+       TOKENISED - the header, the search panel and its buttons and counter,
+       the loading overlay, the welcome buttons and icons, the update banner,
+       the toggle track - had its literal replaced by a var() with nothing
+       comparing the result to what the app used to paint. A one-digit typo in
+       any of them ships silently under a requirement that says the two
+       defaults must look exactly as they did.
+
+       IT IS DERIVED, NOT LISTED, and that is the whole point. A hand-written
+       table of "chrome tokens to check" is a subject list chosen by the same
+       person who wrote the code, and this project has been bitten four times
+       by coverage narrower than the claim it is named for. Instead the
+       baseline stylesheets are read straight out of the pinned commit and
+       EVERY declaration in them is the subject. A new tokenised surface joins
+       this assertion by existing; nobody has to remember it.
+
+       THE COMPARISON IS DONE AFTER SUBSTITUTION, not token by token. Some
+       tokens hold only a fragment of the value they serve - the update
+       banner's glow is `rgba(var(--accent-mode-glow-rgb), 0.3)` inside a
+       box-shadow, and the tint is an alpha over a colour - so comparing token
+       values would need a per-token rule about what the token means. Resolving
+       the whole declaration and comparing the RESULT compares what is painted,
+       which is the thing the requirement is actually about. The var values are
+       read from the LIVE cascade in each frozen default, so a scheme leaking
+       into a default fails this too. */
+    const baselineCss = (f) =>
+      execSync(`git show ${BASELINE_COMMIT}:src/${f}`, {
+        cwd: path.join(__dirname, ".."),
+        maxBuffer: 1 << 28,
+      }).toString();
+    /* A tiny stylesheet reader, deliberately not a CSS parser: it tracks brace
+       depth, remembers the selector at each level and emits declarations. It
+       only has to read two files this project controls. */
+    const readDecls = (css) => {
+      const s = css.replace(/\/\*[\s\S]*?\*\//g, (m) => m.replace(/[^\n]/g, " "));
+      const out = [];
+      const stack = [];
+      let i = 0;
+      let start = 0;
+      const flush = (text) => {
+        const m = /^([-A-Za-z0-9]+)\s*:\s*([\s\S]+)$/.exec(text.trim());
+        if (!m) return;
+        out.push({
+          at: stack.filter((x) => x.startsWith("@")).join("|"),
+          sel: stack.filter((x) => !x.startsWith("@")).join(" >> "),
+          prop: m[1],
+          val: m[2].trim().replace(/\s+/g, " "),
+        });
+      };
+      while (i < s.length) {
+        const ch = s[i];
+        if (ch === "{") {
+          stack.push(s.slice(start, i).trim().replace(/\s+/g, " "));
+          i++;
+          start = i;
+          continue;
+        }
+        if (ch === "}") {
+          /* FLUSH BEFORE POPPING. CSS does not require a semicolon after a
+             block's LAST declaration, so discarding the pending text here
+             silently dropped one declaration per such block from a sweep whose
+             whole claim is that it re-resolves EVERY baseline declaration.
+             Nothing would have failed: the declaration simply leaves the
+             subject set, which is this project's most-repeated defect shape -
+             a subject list narrower than the claim made about it. */
+          flush(s.slice(start, i));
+          stack.pop();
+          i++;
+          start = i;
+          continue;
+        }
+        if (ch === ";") {
+          flush(s.slice(start, i));
+          i++;
+          start = i;
+          continue;
+        }
+        i++;
+      }
+      return out;
+    };
+    const CSS_FILES = ["styles.css", "custom-styles.css"];
+
+    /* A UNIT PIN FOR THE PARSER, BECAUSE THE PROPERTY IS CURRENTLY UNREACHABLE
+       IN THE REAL FILES AND THAT WAS MEASURED RATHER THAN ASSUMED. CSS does not
+       require a semicolon after a block's last declaration, and this parser used
+       to discard the pending text at `}` - silently dropping one declaration per
+       such block from a sweep whose entire claim is that it re-resolves EVERY
+       baseline declaration. Nothing would have failed; the declaration just
+       leaves the subject set.
+       Measured on both sides of the comparison: baseline styles.css 1569 /
+       custom-styles.css 188, current 1946 / 198, and the parse is IDENTICAL with
+       and without the flush - both trees are prettier-formatted, so every block
+       already terminates its last declaration. So the fix is inert today and the
+       end-to-end counts cannot pin it. The property is pinned here instead, at
+       the unit level, exactly as R202 and R372 were: an unreachable guard is
+       still a contract, and the first hand-edited rule that omits a trailing
+       semicolon makes it reachable with no warning. */
+    const UNTERMINATED = "body { color: #010203 }\n.x { background: #040506;\n  border-color: #070809 }\n";
+    const unitDecls = readDecls(UNTERMINATED);
+    const unitKeys = unitDecls.map((d) => `${d.sel}|${d.prop}|${d.val}`);
+    check(
+      "10m: the declaration parser reads a block's last declaration when it has no trailing semicolon",
+      unitKeys.length === 3 &&
+        unitKeys.includes("body|color|#010203") &&
+        unitKeys.includes(".x|background|#040506") &&
+        unitKeys.includes(".x|border-color|#070809"),
+      `parsed ${unitKeys.length}: ${JSON.stringify(unitKeys)}`,
+    );
+
+    const oldDecls = CSS_FILES.flatMap((f) => readDecls(baselineCss(f)).map((d) => ({ ...d, file: f })));
+    const newDecls = CSS_FILES.flatMap((f) =>
+      readDecls(fs.readFileSync(path.join(__dirname, "..", "src", f), "utf8")).map((d) => ({ ...d, file: f })),
+    );
+    const declKey = (d) => `${d.file}##${d.at}##${d.sel}##${d.prop}##${d.n}`;
+    /* THE OCCURRENCE INDEX IS LOAD-BEARING AND IT WAS ADDED AFTER A FALSE
+       POSITIVE, not before. Without it this comparison reported eight font
+       changes that never happened: an @font-face block has no selector, so all
+       five of them collapsed onto one key and each `src` was compared against
+       whichever block happened to be read last. Numbering repeated
+       (file, at-rule, selector, property) triples in document order pairs each
+       block with its own counterpart. This is the third time in this project
+       that an audit produced a confident wrong answer from a contaminated key -
+       and the second time in this section alone. */
+    const numberDecls = (list) => {
+      const seen = new Map();
+      for (const d of list) {
+        const k = `${d.file}##${d.at}##${d.sel}##${d.prop}`;
+        const n = seen.get(k) || 0;
+        d.n = n;
+        seen.set(k, n + 1);
+      }
+      return list;
+    };
+    numberDecls(oldDecls);
+    numberDecls(newDecls);
+    const newByKey = new Map(newDecls.map((d) => [declKey(d), d]));
+    // A dark override that gets tokenised loses its `body.dark-mode ` prefix -
+    // the value moves into the variable and the rule de-scopes to serve both
+    // modes. That is the only rewrite shape this change used, so it is the
+    // only one matched here; anything else lands in the unmatched ledger.
+    const newBySel = new Map(newDecls.map((d) => [`${d.sel}##${d.prop}`, d]));
+    const deScope = (sel) =>
+      sel
+        .split(", ")
+        .map((x) => x.replace(/^(body)?\.dark-mode\s+/, ""))
+        .filter((x, i, a) => a.indexOf(x) === i)
+        .join(", ");
+
+    // Live variable tables, one per frozen default, read from the cascade.
+    const varsFor = async (mode) => {
+      await applySettled(mode, null, `10m: read the ${mode} default's variables`);
+      return JSON.parse(
+        await exec(`(() => {
+          const cs = getComputedStyle(document.body);
+          const out = {};
+          for (const sheet of document.styleSheets) {
+            let rules; try { rules = sheet.cssRules; } catch (e) { continue; }
+            for (const r of rules || []) {
+              if (!r.style) continue;
+              for (const p of r.style) {
+                if (p.startsWith('--') && !(p in out)) out[p] = cs.getPropertyValue(p).trim();
+              }
+            }
+          }
+          return JSON.stringify(out);
+        })()`),
+      );
+    };
+    const liveVars = { light: await varsFor("light"), dark: await varsFor("dark") };
+
+    const subst = (val, mode, depth = 0) => {
+      if (depth > 10) return val;
+      return val.replace(
+        /var\(\s*(--[A-Za-z0-9-]+)\s*(?:,\s*([^()]*(?:\([^()]*\)[^()]*)*))?\)/g,
+        (m, name, fb) => {
+          const v = liveVars[mode][name];
+          if (v !== undefined && v !== "") return subst(v, mode, depth + 1);
+          return fb !== undefined ? subst(fb.trim(), mode, depth + 1) : `<<UNRESOLVED:${name}>>`;
+        },
+      );
+    };
+    // Chromium hands back rgb()/rgba() from the cascade while the baseline
+    // baked hex, and it drops a redundant alpha of 1. Comparing raw text would
+    // report every single tokenised declaration as drift.
+    const toRgb = (h) => {
+      const s = h.length === 4 ? h[1] + h[1] + h[2] + h[2] + h[3] + h[3] : h.slice(1);
+      return `rgb(${parseInt(s.slice(0, 2), 16)},${parseInt(s.slice(2, 4), 16)},${parseInt(s.slice(4, 6), 16)})`;
+    };
+    const normCss = (v) =>
+      v
+        .toLowerCase()
+        .replace(/#[0-9a-f]{6}\b|#[0-9a-f]{3}\b/g, toRgb)
+        .replace(/\s+/g, "")
+        .replace(/rgba?\(([^)]*)\)/g, (m, inner) => {
+          const p = inner.split(",").map((x) => x.trim());
+          if (p.length === 4 && (p[3] === "1" || p[3] === "1.0")) p.pop();
+          return `rgb(${p.join(",")})`;
+        });
+
+    const sameSelDrift = [];
+    const deScopedDrift = [];
+    const unmatched = [];
+    let sameSelSeen = 0;
+    let deScopedSeen = 0;
+    for (const o of oldDecls) {
+      if (o.prop.startsWith("--")) continue;
+      if (/\[data-theme/.test(o.sel)) continue;
+      if (/var\(/.test(o.val)) continue;
+      const mode = /\.dark-mode/.test(o.sel) ? "dark" : "light";
+      const survivor = newByKey.get(declKey(o));
+      if (survivor) {
+        sameSelSeen++;
+        const got = subst(survivor.val, mode);
+        if (normCss(got) !== normCss(o.val))
+          sameSelDrift.push(`{${o.sel}} ${o.prop}: was ${o.val}, now ${survivor.val} => ${got}`);
+        continue;
+      }
+      const moved = newBySel.get(`${deScope(o.sel)}##${o.prop}`);
+      if (moved && /var\(/.test(moved.val)) {
+        deScopedSeen++;
+        const got = subst(moved.val, mode);
+        if (normCss(got) !== normCss(o.val))
+          deScopedDrift.push(`{${o.sel}} ${o.prop}: was ${o.val}, now {${moved.sel}} ${moved.val} => ${got}`);
+        continue;
+      }
+      unmatched.push(`${o.file} {${o.sel}} ${o.prop}: ${o.val}`);
+    }
+    /* THE FLOOR IS THE MEASURED CORPUS, NOT A ROUND NUMBER. This shipped as
+       `>= 700` against a real 1455 - a guard that would stay green with 755
+       baseline declarations, more than half the corpus, silently no longer
+       being compared (a readDecls regression on a nesting shape, one sheet
+       failing to load, a selector-normalisation change) while still claiming
+       chrome fidelity. That is the same magic-floor disease as the `>= 30`
+       and `>= 200` retied to `>= 62`/`>= 632` below, and the `>= 4` against 9
+       that R340 exposed. Pinned just under the measurement so a deliberate
+       addition moves it, and the count is printed either way. */
+    const SAME_SEL_MIN = 1440; // measured: 1455
+    console.log(`      10m measured: ${sameSelSeen} same-selector, ${deScopedSeen} de-scoped`);
+    check(
+      "10m: every baseline declaration that kept its selector still paints the baseline value",
+      sameSelDrift.length === 0 && sameSelSeen >= SAME_SEL_MIN,
+      `${sameSelSeen} baseline declaration(s) re-resolved through the live cascade, ${sameSelDrift.length} drifted${
+        sameSelDrift.length ? ": " + sameSelDrift.join(" | ") : ""
+      }`,
+    );
+    check(
+      "10m: every dark override this work tokenised still paints the baseline value through its token",
+      deScopedDrift.length === 0 && deScopedSeen >= 20,
+      `${deScopedSeen} tokenised dark override(s) re-resolved, ${deScopedDrift.length} drifted${
+        deScopedDrift.length ? ": " + deScopedDrift.join(" | ") : ""
+      }`,
+    );
+    /* THE POSITIVE CONTROL, because the two assertions above are absence
+       checks over a DERIVED subject list and this project has been bitten four
+       times by an absence check that failed open. If the reader stopped
+       reading, or substitution stopped substituting, or normalisation started
+       calling everything equal, both would report a clean sweep over nothing.
+       This pushes a value that is known to be wrong through the identical
+       pipeline and requires it to be caught. */
+    const controlDecl = { sel: ".header", prop: "background", val: "var(--header-bg)" };
+    const controlGot = subst(controlDecl.val, "dark");
+    check(
+      "10m: the fidelity comparison can actually detect a changed value (positive control)",
+      normCss(controlGot) === normCss("#2d2d2d") && normCss(controlGot) !== normCss("#2d2d2e"),
+      `--header-bg resolves to ${controlGot} in the dark default; it must equal the baseline #2d2d2d and must NOT compare equal to a one-digit change`,
+    );
+    /* THE REMAINDER, CLASSIFIED BY REASON RATHER THAN COUNTED. A baseline
+       declaration that neither kept its selector nor de-scoped is not
+       necessarily a regression - most are the vendored dark Prism rules, whose
+       grouped selectors were replaced wholesale by the --tok-* system that the
+       golden's token tuples pin far more precisely than a selector match could.
+       What must not happen is a NEW surface quietly joining that remainder.
+       A bare total would let one removal cancel one addition, which is exactly
+       the substitution that caught out the README section list, so each removal
+       is bucketed by the reason it is excused and every bucket is pinned. An
+       unclassified remainder fails by name. */
+    const REMOVAL_REASONS = [
+      {
+        why: "vendored dark Prism rules, replaced by the --tok-* cells the golden pins directly",
+        match: (u) => /\.token\.|code\[class\*=language-\]/.test(u),
+        count: 10,
+      },
+      {
+        why: "dark welcome accents, tokenised onto --welcome-accent at a de-scoped selector",
+        match: (u) => /\.dark-mode \.welcome-/.test(u),
+        count: 3,
+      },
+      {
+        why: "the old ::before tick markup, replaced by the tick gutter this work added",
+        match: (u) => /\.custom-theme-option/.test(u),
+        count: 6,
+      },
+      {
+        why: "a border-color longhand replaced by a border shorthand holding a var()",
+        match: (u) => /\{body\.dark-mode \.search-btn\} border-color/.test(u),
+        count: 1,
+      },
+    ];
+    const unclassified = unmatched.filter((u) => !REMOVAL_REASONS.some((r) => r.match(u)));
+    const badBuckets = REMOVAL_REASONS.filter((r) => unmatched.filter(r.match).length !== r.count).map(
+      (r) => `${r.why}: ${unmatched.filter(r.match).length} (recorded ${r.count})`,
+    );
+    check(
+      "10m: every baseline declaration that no longer matches any rule is a recorded removal",
+      unclassified.length === 0 && badBuckets.length === 0,
+      `${unmatched.length} unmatched total; ${unclassified.length} unclassified${
+        unclassified.length ? ": " + unclassified.join(" | ") : ""
+      }${badBuckets.length ? "; bucket drift: " + badBuckets.join("; ") : ""}`,
+    );
+
+    /* ── 10o. THE MODE ROWS AND THE OS-FOLLOWING PATH ──────────────────────
+       BOTH REVIEWERS FOUND THIS HOLE INDEPENDENTLY, from opposite ends. The
+       whole of 10j drives `.custom-scheme-option` rows and nothing had ever
+       clicked a `.custom-theme-option` (mode) row, so applyTheme() through a
+       real click, the tick moving, and the dismissal after a mode pick were
+       unproven; and the `change` listener init() registers on the OS media
+       query had no coverage of any kind, so a reader on "Follow Desktop"
+       could stop following at sunset with every assertion green.
+
+       THE OS FLIP IS REAL, NOT STUBBED. window.matchMedia returns a fresh
+       MediaQueryList per call, so dispatching `change` on a new instance would
+       not reach the listener the product registered on ITS instance - the test
+       would pass against a copy of the mechanism rather than the mechanism.
+       Emulation.setEmulatedMedia flips prefers-color-scheme in the engine, so
+       the real listener fires for the real reason. That is also why this
+       section owns its own debugger attach/detach rather than borrowing
+       10i's: the two must not overlap. */
+    /* THE MODE ROWS, DRIVEN AS A READER DRIVES THEM. Nothing had ever clicked
+       a `.custom-theme-option`: all of 10j drives scheme rows, so applyTheme()
+       through a real click, the tick moving between the three rows, and the
+       "Follow Desktop" row - the only one whose mode is not a scheme mode and
+       the only one that reaches resolveMode()'s matchMedia branch from the
+       menu - were unproven end to end. applyTheme is deliberately NOT exported
+       on window.foliaThemes, so clicking is not merely the realistic path, it
+       is the only one.
+
+       THE SNAPSHOT IS TAKEN HERE, BEFORE THE FIRST CLICK, not further down
+       where the OS block needs it: the mode loop WRITES themeMode, so a
+       snapshot taken after it would restore the section's own "desktop"
+       rather than what this section inherited. */
+    const before = JSON.parse(
+      await exec(`(() => JSON.stringify({
+        themeMode: localStorage.getItem("themeMode"),
+        light: localStorage.getItem("themeLightScheme"),
+        dark: localStorage.getItem("themeDarkScheme"),
+      }))()`),
+    );
+    const modeRows = [];
+    for (const want of ["light", "dark", "desktop"]) {
+      /* THE FULL MENU PATH, exactly as 10j opens it for the scheme rows. A
+         bare mouseenter on #customThemeMenuItem is not enough: the submenu
+         panel only exists on screen once the hamburger and View menu above it
+         are open, so elementFromPoint finds nothing and the row is reported
+         unreachable - which is what a first attempt at this measured. */
+      const opened = JSON.parse(await exec(MENU_PATH_PROBE));
+      if (opened.missing.length || opened.unreachable.length) {
+        modeRows.push({
+          want,
+          found: false,
+          openBefore: false,
+          reachable: false,
+          why: `path: missing=[${opened.missing}] unreachable=[${opened.unreachable}]`,
+        });
+        continue;
+      }
+      const r = JSON.parse(
+        await exec(`(() => {
+          const item = document.getElementById('customThemeMenuItem');
+          const row = document.querySelector('.custom-theme-option[data-mode="${want}"]');
+          if (!row || !item) return JSON.stringify({ found: false });
+          /* THE PANEL MUST BE OPEN BEFORE THE CLICK, or the "dismisses the
+             menu" clause is an absence check over an already-empty set:
+             nothing between 10j's last row click and here re-opens the
+             submenu, so theme-open was false before the click as well as
+             after, and R400 - deleting closeMenu() from this very branch -
+             could not fail. Found by both reviewers independently. */
+          const openBefore = item.classList.contains('theme-open');
+          /* HIT-TESTED, NOT JUST CLICKED, for the same reason 10j hit-tests
+             its scheme rows: a bare .click() fires on a row that is covered,
+             clipped out of the panel or zero-sized, so "a reader can click
+             this" stays unproven. The MODE rows had never been hit-tested at
+             all. */
+          const b = row.getBoundingClientRect();
+          const hit = b.width < 1 || b.height < 1
+            ? null
+            : document.elementFromPoint(
+                Math.round(b.left + b.width / 2),
+                Math.round(b.top + b.height / 2),
+              );
+          const reachable = !!hit && (hit === row || row.contains(hit));
+          if (reachable) row.click();
+          return JSON.stringify({ found: true, openBefore, reachable });
+        })()`),
+      );
+      if (!r.found || !r.reachable) {
+        modeRows.push({ want, found: r.found, openBefore: r.openBefore, reachable: r.reachable });
+        continue;
+      }
+      await new Promise((res) => setTimeout(res, 120));
+      modeRows.push({
+        want,
+        found: true,
+        openBefore: r.openBefore,
+        reachable: r.reachable,
+        ...JSON.parse(
+          await exec(`(() => {
+            const ticked = [...document.querySelectorAll('.custom-theme-option')]
+              .filter((e) => e.classList.contains('active'))
+              .map((e) => e.dataset.mode);
+            return JSON.stringify({
+              stored: localStorage.getItem('themeMode'),
+              dark: document.body.classList.contains('dark-mode'),
+              attr: document.body.getAttribute('data-theme'),
+              ticked: ticked,
+              open: document.getElementById('customThemeMenuItem').classList.contains('theme-open'),
+            });
+          })()`),
+        ),
+      });
+    }
+    const modeMisses = modeRows
+      .filter(
+        (m) =>
+          !m.found ||
+          !m.openBefore ||
+          !m.reachable ||
+          m.stored !== m.want ||
+          m.ticked.join() !== m.want ||
+          m.open,
+      )
+      .map(
+        (m) =>
+          `${m.want}: found=${m.found} openBefore=${m.openBefore} reachable=${m.reachable} stored=${m.stored} ticked=[${(m.ticked || []).join(",")}] stillOpen=${m.open}`,
+      );
+    check(
+      "10o: clicking each mode row stores that mode, moves the tick to it alone, and dismisses the menu",
+      modeRows.length === 3 && modeMisses.length === 0,
+      `${modeMisses.join(" | ") || "no misses"} - exactly one row may carry the tick, and "desktop" is the row no other test reaches`,
+    );
+    const darkMisses = modeRows
+      .filter((m) => m.found && m.want !== "desktop" && m.dark !== (m.want === "dark"))
+      .map((m) => `${m.want} -> dark=${m.dark}`);
+    check(
+      "10o: a mode row click actually repaints the app, not just the preference",
+      darkMisses.length === 0 && modeRows.filter((m) => m.found).length === 3,
+      `${darkMisses.join(" | ") || "no misses"} - applyTheme() delegates the class to the original toggle, so a stored preference with an unchanged class is the failure this catches`,
+    );
+
+    const osProbe = { steps: [], error: null };
+    let osAttached = false;
+    try {
+      win.webContents.debugger.attach("1.3");
+      osAttached = true;
+      const emulate = (value) =>
+        win.webContents.debugger.sendCommand("Emulation.setEmulatedMedia", {
+          features: [{ name: "prefers-color-scheme", value }],
+        });
+      /* The snapshot this restores from is taken ABOVE, before the mode loop's
+         first click - taking it here would capture the "desktop" this section
+         itself stored and restore the wrong value. */
+      try {        /* THE BASELINE FLIP IS SETUP, NOT A MEASUREMENT. setEmulatedMedia only
+           fires `change` when the value actually CHANGES, so if this machine's
+           real preference already matches the first asserted value the
+           listener never runs and the reading is just leftover state - which
+           is exactly what the first draft of this section measured. Emulating
+           light here makes the first asserted flip a genuine transition on any
+           machine. */
+        await exec(`(() => {
+          localStorage.setItem("themeMode", "desktop");
+          localStorage.setItem("themeLightScheme", "clarity");
+          localStorage.setItem("themeDarkScheme", "abyss");
+          window.__foliaOsFlips = 0;
+          window.matchMedia("(prefers-color-scheme: dark)")
+            .addEventListener("change", () => { window.__foliaOsFlips++; });
+          return 1;
+        })()`);
+        await emulate("light");
+        await waitFor(
+          exec,
+          `!document.body.classList.contains("dark-mode")`,
+          "10o: the app to settle to the light baseline",
+        );
+        /* THE COUNTER IS ZEROED AFTER THE BASELINE FLIP, NOT BEFORE IT: the
+           baseline is setup, and whether it counts depends on what this
+           machine's real preference happens to be, which would make the pin
+           below machine-dependent. From here on every increment is one of the
+           three asserted flips. */
+        await exec(`(() => { window.__foliaOsFlips = 0; return 1; })()`);
+        for (const want of ["dark", "light", "dark"]) {
+          await emulate(want);
+          await waitFor(
+            exec,
+            `document.body.classList.contains("dark-mode") === ${JSON.stringify(want === "dark")}`,
+            `10o: the app to follow the OS to ${want}`,
+          );
+          osProbe.steps.push({
+            want,
+            ...JSON.parse(
+              await exec(`(() => JSON.stringify({
+                dark: document.body.classList.contains("dark-mode"),
+                attr: document.body.getAttribute("data-theme"),
+                stored: localStorage.getItem("themeMode"),
+              }))()`),
+            ),
+          });
+        }
+        osProbe.loopFlips = JSON.parse(
+          await exec(`(() => JSON.stringify(window.__foliaOsFlips))()`),
+        );
+        /* THE NEGATIVE HALF: a reader who has PINNED a mode must not be
+           dragged around by the OS. Without this the assertion above is
+           satisfied by a listener that re-applies unconditionally, which is a
+           different and worse bug than not listening at all. Pinned through
+           the row rather than a function call, for the same reason as above.
+
+           THE OS MUST BE PUT BACK TO LIGHT FIRST, and the omission was caught
+           by R401 coming back VACUOUS rather than by reading. The flip loop
+           above ends on "dark", so re-emulating dark here is a NO-OP -
+           setEmulatedMedia fires `change` only on an actual value change - and
+           the assertion was passing because the listener never ran at all,
+           not because the guard held. Second instance of this exact trap in
+           this one section. The counter is what stops it coming back a third
+           time: CDP emulation is an ENGINE-LEVEL media change, so the
+           listener installed before the loop above receives the same event
+           the product's own listener receives, and a zero count means the
+           flip never happened. It is reset rather than re-registered, because
+           registering a second listener on a second MediaQueryList would
+           double-count every flip. */
+        await emulate("light");
+        await waitFor(
+          exec,
+          `!document.body.classList.contains("dark-mode")`,
+          "10o: the app to settle to light before the mode is pinned",
+        );
+        await exec(`(() => {
+          window.__foliaOsFlips = 0;
+          document.querySelector('.custom-theme-option[data-mode="light"]').click();
+          return 1;
+        })()`);
+        /* LEFT AS A FIXED WAIT DELIBERATELY, unlike the four above. Those
+           follow an emulate() and wait on an ASYNCHRONOUS engine event, which
+           is a genuine bet on machine load. This one follows a row click whose
+           handler runs SYNCHRONOUSLY, so the exec() round trip that comes next
+           is already a task boundary and there is nothing to race. It is kept
+           rather than deleted because removing it is an unproven behaviour
+           change days from a release; it is annotated so it does not read as
+           an oversight the next time this file is swept for sleeps. */
+        await new Promise((r) => setTimeout(r, 120));
+        await emulate("dark");
+        /* THE NEGATIVE HALF HAS NO POSITIVE DOM SIGNAL TO WAIT ON - the whole
+           claim is that NOTHING moves - so waiting on the app would be waiting
+           for something that must never happen, i.e. a fixed sleep wearing a
+           predicate's clothes. The flip COUNTER is the honest structural
+           signal: it proves the engine really delivered the media change to a
+           listener registered exactly like the product's, which is the
+           precondition the assertion needs. A fixed sleep here was a bet on
+           machine load, and under full-chain load losing that bet would have
+           reported the guard as holding when the event had simply not arrived
+           yet - the same shape as the R401 no-op trap this section already
+           carries a counter for. */
+        await waitFor(
+          exec,
+          `window.__foliaOsFlips >= 1`,
+          "10o: the emulated OS flip to reach a media-query listener",
+        );
+        osProbe.pinned = JSON.parse(
+          await exec(`(() => JSON.stringify({
+            dark: document.body.classList.contains("dark-mode"),
+            attr: document.body.getAttribute("data-theme"),
+            stored: localStorage.getItem("themeMode"),
+            flips: window.__foliaOsFlips,
+          }))()`),
+        );
+
+        /* THE keepFollowing === TRUE BRANCH, which nothing reached. setScheme()
+           normally switches the app to the chosen scheme's MODE; the one
+           exception is a reader on Follow Desktop choosing a scheme whose mode
+           the OS is already resolving to, where the choice must be recorded
+           WITHOUT pinning the mode. Its own comment calls this out - "otherwise
+           choosing a dark scheme at night would silently pin the app to dark
+           for good" - and only the FALSE side was covered, with the true side
+           appearing solely as a counterfactual in that comment. Driven here
+           for real rather than against a stubbed matchMedia: Follow Desktop,
+           OS resolving dark, pick a DARK scheme. */
+        await exec(`(() => {
+          document.querySelector('.custom-theme-option[data-mode="desktop"]').click();
+          return 1;
+        })()`);
+        await new Promise((r) => setTimeout(r, 120));
+        await exec(`(() => {
+          document.querySelector('.custom-scheme-option[data-scheme="ember"]').click();
+          return 1;
+        })()`);
+        await new Promise((r) => setTimeout(r, 120));
+        osProbe.keepFollowing = JSON.parse(
+          await exec(`(() => JSON.stringify({
+            stored: localStorage.getItem("themeMode"),
+            attr: document.body.getAttribute("data-theme"),
+            dark: document.body.classList.contains("dark-mode"),
+            remembered: localStorage.getItem("themeDarkScheme"),
+          }))()`),
+        );
+      } finally {
+        await win.webContents.debugger.sendCommand("Emulation.setEmulatedMedia", {
+          features: [{ name: "prefers-color-scheme", value: "" }],
+        });
+        await exec(
+          `(() => {
+            const put = (k, v) => (v === null ? localStorage.removeItem(k) : localStorage.setItem(k, v));
+            put("themeMode", ${JSON.stringify(before.themeMode)});
+            put("themeLightScheme", ${JSON.stringify(before.light)});
+            put("themeDarkScheme", ${JSON.stringify(before.dark)});
+            return 1;
+          })()`,
+        );
+      }
+    } catch (e) {
+      osProbe.error = String((e && e.message) || e);
+    } finally {
+      if (osAttached) {
+        try { win.webContents.debugger.detach(); } catch (e) {}
+      }
+    }
+
+    const osMisses = osProbe.steps
+      .filter(
+        (s) =>
+          s.dark !== (s.want === "dark") ||
+          s.attr !== (s.want === "dark" ? "abyss" : "clarity") ||
+          s.stored !== "desktop",
+      )
+      .map((s) => `OS->${s.want} gave dark=${s.dark} data-theme=${s.attr} stored=${s.stored}`);
+    check(
+      "10o: on Follow Desktop, a real OS colour-scheme change re-themes the app and picks that mode's remembered scheme",
+      osProbe.steps.length === 3 && osMisses.length === 0 && !osProbe.error,
+      `${osProbe.steps.length}/3 flips; ${osMisses.join(" | ") || "no misses"}${osProbe.error ? ` [${osProbe.error}]` : ""} - the listener is registered on init()'s own MediaQueryList, so this drives prefers-color-scheme in the engine rather than dispatching a synthetic event at a fresh instance`,
+    );
+    check(
+      "10o: positive control: the OS really did flip three times, so the assertion above is not reading a constant",
+      osProbe.loopFlips === 3,
+      `the page's own matchMedia listener saw ${osProbe.loopFlips} change event(s), expected 3 - the previous form of this control compared the observed data-theme values to each other, which the assertion above ALREADY pins per want, so it could only fail when that assertion had failed too; this counts engine-level media changes instead, which is the thing that can silently not happen`,
+    );
+    check(
+      "10o: a pinned mode is NOT dragged around by the OS",
+      !!osProbe.pinned &&
+        osProbe.pinned.dark === false &&
+        osProbe.pinned.stored === "light" &&
+        osProbe.pinned.flips >= 1,
+      `after pinning light and flipping the OS to dark: ${JSON.stringify(osProbe.pinned)} - a listener that re-applies unconditionally would follow the OS here and is a worse bug than one that never fires; flips is the positive control, because setEmulatedMedia only raises a change event on a real value change and a no-op flip makes this assertion pass for the worst possible reason`,
+    );
+    check(
+      "10o: choosing a scheme whose mode the OS already resolves to records it WITHOUT pinning the mode",
+      !!osProbe.keepFollowing &&
+        osProbe.keepFollowing.stored === "desktop" &&
+        osProbe.keepFollowing.remembered === "ember" &&
+        osProbe.keepFollowing.attr === "ember" &&
+        osProbe.keepFollowing.dark === true,
+      `on Follow Desktop with the OS dark, clicking the ember (dark) row gave ${JSON.stringify(osProbe.keepFollowing)} - the choice must be remembered and painted while "desktop" survives, or picking a dark scheme at night silently pins the app to dark for good`,
+    );
+
+    // ─── 10n. THE TOGGLE SWITCH, THE ONE THEMED CONTROL WITH NO TEXT ────────
+    /* IT HAD NO ASSERTION AT ALL AND IT SHIPPED STOCK LIGHT BLUE UNDER EVERY
+       SCHEME. `.tools-toggle-item.active .tools-toggle-track` was a hardcoded
+       #4fc3f7 - a colour belonging to no palette in this product - so every
+       scheme painted the same sky blue against its own menu. No prior section
+       could see it: it carries no text, so the contrast sweeps score nothing
+       on it; it is not a hover or focus rule, so 10g never collects it; and it
+       is not an accent literal, so the stranded-accent sweep does not know the
+       value.
+
+       IT IS SCORED AGAINST WCAG 1.4.11 (3:1, non-text contrast), which is the
+       APPLICABLE standard - deliberately not 4.5:1 "to be safe", because a
+       bar the standard never set would reject a future scheme for no reason.
+       FOUR relations, and all four are needed: a track that disappears into
+       the menu cannot be found, a track that disappears into the menu's HOVER
+       fill cannot be found while the reader is pointing at it, a track that
+       disappears behind its own thumb cannot be read, and an ON track that
+       matches the OFF track carries no information at all, which is the
+       entire job of a switch.
+
+       THE UNIQUENESS CLAUSE HAS TWO HALVES AND ONLY THE FIRST WAS OBVIOUS.
+       Distinctness across the four schemes catches one scheme copying
+       ANOTHER's track. It does NOT catch the realistic accident - a scheme
+       that was never given a track at all and inherits the frozen default's
+       stock blue - because that value is distinct from all four. R389 came
+       back WRONG-GUARD on exactly that hole: it pointed abyss back at
+       #4fc3f7 and the set stayed size 4. Hence the explicit FROZEN_TOGGLE
+       comparison beside it. */
+    const TOGGLE_MIN = 3.0;
+    const FROZEN_TOGGLE = "rgb(79, 195, 247)";
+    const TOGGLE_STATES = [
+      ["light", null, "light default"],
+      ["dark", null, "dark default"],
+      ...SCHEME_STATES.map(([m, s]) => [m, s, s]),
+    ];
+    const toggleCells = [];
+    for (const [mode, scheme, name] of TOGGLE_STATES) {
+      await applySettled(mode, scheme, `10n: ${name}`);
+      toggleCells.push({
+        name,
+        frozen: !scheme,
+        ...JSON.parse(
+          await exec(`(() => {
+            /* MEASURE THE PAINTED CONTROL, NOT THE TOKEN. This block used to
+               read --toggle-on-bg off <body> and paint it onto a throwaway
+               div, which is the same disjunction 10l already corrected for
+               --code-selection-bg ("THE FILL IS READ FROM THE CASCADE, NOT
+               FROM THE VARIABLE"): a higher-specificity
+               body[data-theme=...] .tools-toggle-item.active .tools-toggle-track
+               override would leave this green while the switch painted
+               something else, and 10m would see no drift because the base rule
+               is untouched.
+
+               #fullscreenToggle is the subject on purpose - it is the ONLY
+               user-visible toggle switch left in the app. #darkModeToggle is
+               display:none'd by custom-theme.js (this feature replaced it) and
+               #showNotesToggle carries an inline display:none. The .active
+               class is forced rather than waited for: it is cosmetic here (it
+               does not enter fullscreen), and in a test window fullscreen is
+               off, so no toggle would otherwise be in the on state at all.
+
+               Nothing here falls back. A missing element reports null and the
+               assertions below fail loudly, rather than silently rescoring
+               against <body> and reporting the page as if it were the menu. */
+            const menu = document.getElementById('viewMenu');
+            const item = document.getElementById('fullscreenToggle');
+            const track = item && item.querySelector('.tools-toggle-track');
+            const thumb = item && item.querySelector('.tools-toggle-thumb');
+            const hadActive = item ? item.classList.contains('active') : false;
+            const read = (el) => (el ? getComputedStyle(el).backgroundColor : null);
+
+            let on = null, off = null;
+            /* THE CLASS FLIP AND THE READ ARE SYNCHRONOUS, AND .tools-toggle-
+               track CARRIES a 0.2s background transition. That pairing is the
+               shape that produced a fully-formed wrong measurement elsewhere in
+               this project: a colour read while a transition is running is the
+               PREVIOUS state's colour, and it is indistinguishable from a real
+               value. Here it is safe, but only for a reason that is nothing to
+               do with this code - the View submenu is display:none while shut,
+               so the track has no box and no transition can run on it, while
+               getComputedStyle still resolves its colours exactly as it does
+               for a painted element.
+               That is accidental safety, so it is MEASURED rather than relied
+               on: transitionsRunning is captured across both reads and pinned
+               by an assertion below. A future edit that opens the menu before
+               this section - which is exactly what 10o now does for the mode
+               rows - would otherwise silently turn these four ratios into
+               transients. */
+            const runningOn = () =>
+              (document.getAnimations ? document.getAnimations() : []).filter(
+                (a) =>
+                  a.effect &&
+                  a.effect.target === track &&
+                  a.constructor &&
+                  a.constructor.name === 'CSSTransition',
+              ).length;
+            let transitionsRunning = 0;
+            if (track) {
+              item.classList.add('active');
+              on = read(track);
+              transitionsRunning += runningOn();
+              item.classList.remove('active');
+              off = read(track);
+              transitionsRunning += runningOn();
+              if (hadActive) item.classList.add('active');
+            }
+            const thumbBg = thumb ? (item.classList.add('active'), read(thumb)) : null;
+            if (!hadActive && item) item.classList.remove('active');
+
+            /* The hover fill is sourced from the hover RULE rather than
+               assumed to be --bg-secondary, so retargeting that rule at a
+               different token is visible here. :hover cannot be forced, so the
+               rule's own declared value is resolved through a probe. */
+            let hoverDecl = null;
+            for (const sheet of document.styleSheets) {
+              let rules; try { rules = sheet.cssRules; } catch (e) { continue; }
+              for (const r of rules || []) {
+                if (r.selectorText && /\\.tools-menu-item:hover(?![\\w-])/.test(r.selectorText)) {
+                  const v = r.style.getPropertyValue('background') || r.style.getPropertyValue('background-color');
+                  if (v) hoverDecl = v.trim();
+                }
+              }
+            }
+            let hoverBg = null;
+            if (hoverDecl) {
+              const probe = document.createElement('div');
+              (menu || document.body).appendChild(probe);
+              probe.style.background = hoverDecl;
+              hoverBg = getComputedStyle(probe).backgroundColor;
+              probe.remove();
+            }
+            return JSON.stringify({
+              on, off, thumbBg,
+              transitionsRunning,
+              trackHasBox: track ? !!track.getClientRects().length : null,
+              menuBg: read(menu),
+              hoverBg, hoverDecl,
+              foundMenu: !!menu, foundTrack: !!track, foundThumb: !!thumb,
+            });
+          })()`),
+        ),
+      });
+    }
+    const toggleScore = (a, b) => {
+      const p = (c) => {
+        const m = /^rgba?\((\d+),\s*(\d+),\s*(\d+)/.exec(c);
+        return m ? { r: +m[1], g: +m[2], b: +m[3] } : null;
+      };
+      const L = (c) => {
+        const f = (v) => {
+          v /= 255;
+          return v <= 0.03928 ? v / 12.92 : Math.pow((v + 0.055) / 1.055, 2.4);
+        };
+        return 0.2126 * f(c.r) + 0.7152 * f(c.g) + 0.0722 * f(c.b);
+      };
+      const x = p(a);
+      const y = p(b);
+      if (!x || !y) return null;
+      const l1 = L(x);
+      const l2 = L(y);
+      return (Math.max(l1, l2) + 0.05) / (Math.min(l1, l2) + 0.05);
+    };
+    /* The thumb is MEASURED, not assumed white. Naming an assertion for the
+       thumb while hardcoding rgb(255,255,255) decouples it from
+       .tools-toggle-thumb's actual fill: retint or tokenise that rule and this
+       kept certifying a byte-exactness that was no longer true. */
+    for (const c of toggleCells) {
+      c.vsThumb = toggleScore(c.on, c.thumbBg);
+      c.vsMenu = toggleScore(c.on, c.menuBg);
+      c.vsHover = toggleScore(c.on, c.hoverBg);
+      c.vsOff = toggleScore(c.on, c.off);
+    }
+    const toggleResolved = toggleCells.filter(
+      (c) => c.foundMenu && c.foundTrack && c.foundThumb && c.hoverBg,
+    );
+    check(
+      "10n: no CSS transition was running on the toggle track while its colours were read",
+      toggleCells.length > 0 &&
+        toggleCells.every((c) => c.transitionsRunning === 0) &&
+        toggleCells.every((c) => c.trackHasBox === false),
+      toggleCells
+        .map(
+          (c) =>
+            `${c.name}: running=${c.transitionsRunning} hasBox=${c.trackHasBox}`,
+        )
+        .join("; "),
+    );
+    check(
+      "10n: every toggle surface resolved to a real element (the scores below are not measuring <body>)",
+      toggleResolved.length === toggleCells.length && toggleCells.length > 0,
+      `${toggleResolved.length}/${toggleCells.length} state(s) resolved #viewMenu + #fullscreenToggle's track and thumb + the .tools-menu-item:hover fill; unresolved: ${toggleCells
+        .filter((c) => !(c.foundMenu && c.foundTrack && c.foundThumb && c.hoverBg))
+        .map((c) => `${c.name}(menu=${c.foundMenu} track=${c.foundTrack} thumb=${c.foundThumb} hover=${c.hoverDecl})`)
+        .join(", ") || "none"}`,
+    );
+    const toggleNote = toggleCells
+      .map(
+        (c) =>
+          `${c.name} on=${c.on} thumb=${c.vsThumb == null ? "?" : c.vsThumb.toFixed(2)} menu=${
+            c.vsMenu == null ? "?" : c.vsMenu.toFixed(2)
+          } hover=${c.vsHover == null ? "?" : c.vsHover.toFixed(2)} off=${c.vsOff == null ? "?" : c.vsOff.toFixed(2)}`,
+      )
+      .join("; ");
+    console.log(`      10n measured: ${toggleNote}`);
+    check(
+      "10n: the toggle track is a themed colour in every state, not one hardcoded blue",
+      toggleCells.length === TOGGLE_STATES.length &&
+        new Set(toggleCells.filter((c) => !c.frozen).map((c) => c.on)).size ===
+          toggleCells.filter((c) => !c.frozen).length &&
+        toggleCells.filter((c) => !c.frozen).every((c) => c.on !== FROZEN_TOGGLE),
+      `${toggleCells.length} state(s) measured; scheme tracks: ${toggleCells
+        .filter((c) => !c.frozen)
+        .map((c) => `${c.name}=${c.on}`)
+        .join(", ")} - a repeat means one scheme is inheriting another palette's switch, and ${FROZEN_TOGGLE} means a scheme never left the frozen default's stock blue at all`,
+    );
+    check(
+      "10n: every scheme's toggle track meets WCAG 1.4.11 (3:1) against the thumb, the menu, the hover fill and the off state",
+      toggleCells
+        .filter((c) => !c.frozen)
+        .every(
+          (c) =>
+            c.vsThumb >= TOGGLE_MIN &&
+            c.vsMenu >= TOGGLE_MIN &&
+            c.vsHover >= TOGGLE_MIN &&
+            c.vsOff >= TOGGLE_MIN,
+        ),
+      `note: ${toggleNote}`,
+    );
+    /* THE LIGHT DEFAULT FAILS THREE OF THE FOUR RELATIONS AND IS PINNED, NOT
+       BARRED. Stock #4fc3f7 measures 2.00:1 against its own white thumb in
+       both modes, 1.84:1 against the LIGHT menu, and 1.30:1 against its own
+       OFF track - a switch that is nearly invisible against the surface it
+       sits on and barely distinguishable from its own off state.
+       Both defaults are preserved byte-exact because the requirement freezing
+       them outranks this bar.
+       Writing that as an excusal from the bar would pardon any future value
+       that also failed it, so the measured ratios are pinned instead: the
+       defaults may keep exactly the appearance they shipped with and nothing
+       else. A degradation fails; so does an improvement, which is correct -
+       under a byte-exactness requirement an unrequested improvement is a
+       regression.
+       ALL FOUR RELATIONS ARE PINNED, and vsOff was missing from this table
+       until a review round found it. Its absence was not cosmetic: the off
+       track is the one surface a scheme author is most likely to leave stock
+       while retinting the on state, so it is precisely the relation a
+       half-finished scheme drifts on. R405 is the proof. */
+    const FROZEN_TOGGLE_RATIOS = {
+      "light default": { vsThumb: 2.0, vsMenu: 1.84, vsHover: 2.0, vsOff: 1.3 },
+      "dark default": { vsThumb: 2.0, vsMenu: 8.69, vsHover: 7.75, vsOff: 5.18 },
+    };
+    const fmt = (v) => (v == null ? "?" : v.toFixed(2));
+    for (const c of toggleCells.filter((x) => x.frozen))
+      console.log(
+        `      10n frozen ${c.name}: on=${c.on} thumb=${fmt(c.vsThumb)} menu=${fmt(c.vsMenu)} hover=${fmt(c.vsHover)} off=${fmt(c.vsOff)}`,
+      );
+    const frozenDrift = toggleCells
+      .filter((c) => c.frozen)
+      .filter(
+        (c) =>
+          c.on !== FROZEN_TOGGLE ||
+          !["vsThumb", "vsMenu", "vsHover", "vsOff"].every(
+            (k) => c[k] != null && Math.abs(c[k] - FROZEN_TOGGLE_RATIOS[c.name][k]) <= 0.02,
+          ),
+      )
+      .map(
+        (c) =>
+          `${c.name}: ${c.on} thumb=${fmt(c.vsThumb)} menu=${fmt(c.vsMenu)} hover=${fmt(c.vsHover)} off=${fmt(c.vsOff)}`,
+      );
+    check(
+      "10n: the frozen defaults keep the exact switch appearance they shipped with, sub-bar ratios included",
+      toggleCells.filter((c) => c.frozen).length === 2 && frozenDrift.length === 0,
+      `${frozenDrift.length} drifted${frozenDrift.length ? ": " + frozenDrift.join(", ") : ""}; recorded ${JSON.stringify(
+        FROZEN_TOGGLE_RATIOS,
+      )} at ${FROZEN_TOGGLE} - the light default's 1.84 against its own menu is a real defect this work is not permitted to fix`,
+    );
+
+    /* ---------------------------------------------------------------- 10p
+       THE COPY BUTTON'S CONFIRMATION FILL - a themed ink painted onto a
+       surface no scheme could reach.
+
+       .code-copy-btn is fully tokenised (background var(--primary-color),
+       color var(--on-accent-fg)). Its .copied override - the ~2s "Copied!"
+       confirmation after a click - repainted ONLY the background, with a raw
+       #27ae60 (#2ecc71 on hover). So all six states went on supplying the INK
+       for a fill they had no way to influence, and the four white-ink states
+       landed at 2.87:1 resting and 2.10:1 on hover.
+
+       IT WAS PROVEN UNCOVERED BEFORE IT WAS FIXED, rather than assumed to be:
+       planting a 1.0:1 fill in ONE scheme - leaving the frozen defaults
+       untouched, so the fidelity sweeps could not mask the result - left the
+       suite green at 351/351. Each existing section misses it for its own
+       reason: 10d reads a RESTING document, where no .copied button exists;
+       10g collects the hover rule but excuses it (HOVER_EXCUSALS) for the
+       same reason; and the state sweep does scaffold one, but it compares
+       against the BASELINE, which a raw literal reproduces perfectly. A
+       surface can be covered three times over and still have no assertion
+       asking whether a scheme can reach it at all. */
+    const COPIED_PROBE = `(() => {
+      let host = document.getElementById("__copiedProbe");
+      if (!host) {
+        host = document.createElement("div");
+        host.id = "__copiedProbe";
+        host.className = "code-block-container";
+        host.innerHTML =
+          "<pre><code>x</code></pre>" +
+          "<button class='code-copy-btn copied'>Copied!</button>";
+        document.body.appendChild(host);
+      }
+      const btn = host.querySelector(".code-copy-btn.copied");
+      if (!btn) return JSON.stringify({ error: "no button" });
+      const rest = getComputedStyle(btn);
+      const out = {
+        restBg: rest.backgroundColor,
+        restFg: rest.color,
+        declaredBg: rest.getPropertyValue("--success-bg").trim(),
+        declaredHover: rest.getPropertyValue("--success-bg-hover").trim(),
+        declaredFg: rest.getPropertyValue("--on-success-fg").trim(),
+      };
+      /* THE HOVER FILL IS REPLAYED FROM THE RULE, NOT RE-READ OFF THE
+         VARIABLE. Re-reading --success-bg-hover would keep passing even if
+         the rule stopped consuming it, and the LINKAGE is the half that
+         actually breaks. The declaration block is sliced out of cssText
+         rather than iterated off rule.style because a SHORTHAND HOLDING
+         var() is a pending-substitution value: it enumerates as its
+         longhands and serialises every one of them as the EMPTY STRING, so
+         the obvious loop drops the fill silently. Recorded in 10g; it is the
+         same trap here.
+         NOTE FOR EDITORS: never a backtick inside this template literal. */
+      let decl = null;
+      for (const sheet of document.styleSheets) {
+        let rules = null;
+        try { rules = sheet.cssRules; } catch (e) { continue; }
+        for (const r of rules || []) {
+          if (r.selectorText === ".code-copy-btn.copied:hover") {
+            const t = r.cssText;
+            decl = t.slice(t.indexOf("{") + 1, t.lastIndexOf("}")).trim();
+          }
+        }
+      }
+      out.hoverDecl = decl;
+      /* THE TRANSITION MUST BE SUPPRESSED ON THE PROBE OR THE REPLAY READS
+         BACK THE RESTING COLOUR. .code-copy-btn carries "transition: all"
+         (a recorded, deliberately-unfixed pre-existing item), so a computed
+         read taken immediately after the assignment returns the PREVIOUS
+         state - which is exactly the mid-transition trap recorded against
+         10c/10d, and here it is indistinguishable from a hover rule that
+         does nothing. Suppressing it is a measurement device, not a change
+         to the claim: what is being asserted is the colour the rule arrives
+         at, not the path it takes. The flush between the two assignments is
+         load-bearing - without it the "transition: none" and the new fill
+         land in the same style update and the engine still animates. */
+      btn.style.cssText = "transition: none";
+      void btn.offsetWidth;
+      btn.style.cssText = (decl || "") + "; transition: none;";
+      const hov = getComputedStyle(btn);
+      out.hoverBg = hov.backgroundColor;
+      out.hoverFg = hov.color;
+      btn.style.cssText = "";
+      return JSON.stringify(out);
+    })()`;
+
+    const copiedRgb = (s) => {
+      const m = /^rgba?\((\d+),\s*(\d+),\s*(\d+)/.exec(String(s || ""));
+      return m ? [+m[1], +m[2], +m[3]] : null;
+    };
+    const copiedRatio = (a, b) => {
+      if (!a || !b) return null;
+      const ch = (v) => {
+        const x = v / 255;
+        return x <= 0.03928 ? x / 12.92 : Math.pow((x + 0.055) / 1.055, 2.4);
+      };
+      const lum = (c) => 0.2126 * ch(c[0]) + 0.7152 * ch(c[1]) + 0.0722 * ch(c[2]);
+      const l1 = lum(a);
+      const l2 = lum(b);
+      return (Math.max(l1, l2) + 0.05) / (Math.min(l1, l2) + 0.05);
+    };
+
+    const copied = {};
+    for (const [cMode, cScheme] of [["light", null], ["dark", null], ...SCHEME_STATES]) {
+      const cLabel = cScheme || `${cMode} default`;
+      await applySettled(cMode, cScheme, `10p ${cLabel}`);
+      copied[cLabel] = JSON.parse(await exec(COPIED_PROBE));
+    }
+    await exec(
+      `(() => { const h = document.getElementById("__copiedProbe"); if (h) h.remove(); return "1"; })()`,
+    );
+    const copiedStates = Object.keys(copied);
+    const copiedSchemes = SCHEME_STATES.map(([, s]) => s);
+
+    /* THE POSITIVE CONTROL IS MANDATORY: a dropped fill is indistinguishable
+       from a real failure, and it reads as the SAME colour the resting rule
+       paints - i.e. as a hover rule that does nothing. */
+    const copiedNoDecl = copiedStates.filter((s) => !copied[s].hoverDecl);
+    const copiedNoMove = copiedStates.filter((s) => copied[s].hoverBg === copied[s].restBg);
+    check(
+      "10p: the copy-confirmation hover rule was really replayed in every state (positive control)",
+      copiedStates.length === 6 && copiedNoDecl.length === 0 && copiedNoMove.length === 0,
+      `${copiedStates.length} state(s); no declaration: ${JSON.stringify(copiedNoDecl)}; fill did not move: ${JSON.stringify(
+        copiedNoMove,
+      )}; light default decl ${JSON.stringify(copied["light default"] && copied["light default"].hoverDecl)}`,
+    );
+
+    /* THE STRANDED-SURFACE GUARD. A scheme that declares the tokens but whose
+       rule stopped consuming them, or a scheme that simply never got them,
+       both land back on the frozen literals - which is the defect itself. */
+    const FROZEN_COPIED = {
+      rest: "rgb(39, 174, 96)",
+      hover: "rgb(46, 204, 113)",
+      ink: "rgb(255, 255, 255)",
+    };
+    const copiedUndeclared = copiedStates.filter(
+      (s) => !copied[s].declaredBg || !copied[s].declaredHover || !copied[s].declaredFg,
+    );
+    const copiedStranded = copiedSchemes.filter(
+      (s) => copied[s].restBg === FROZEN_COPIED.rest || copied[s].hoverBg === FROZEN_COPIED.hover,
+    );
+    check(
+      "10p: every scheme reaches the copy-confirmation fill instead of inheriting the frozen literal",
+      copiedUndeclared.length === 0 && copiedStranded.length === 0,
+      `undeclared: ${JSON.stringify(copiedUndeclared)}; stranded on ${FROZEN_COPIED.rest}/${
+        FROZEN_COPIED.hover
+      }: ${JSON.stringify(copiedStranded)}; fills ${JSON.stringify(
+        Object.fromEntries(copiedSchemes.map((s) => [s, `${copied[s].restBg} -> ${copied[s].hoverBg}`])),
+      )}`,
+    );
+
+    const COPIED_MIN = 4.5;
+    const copiedSubAa = [];
+    for (const s of copiedSchemes) {
+      const c = copied[s];
+      const rRest = copiedRatio(copiedRgb(c.restBg), copiedRgb(c.restFg));
+      const rHover = copiedRatio(copiedRgb(c.hoverBg), copiedRgb(c.hoverFg));
+      if (!(rRest >= COPIED_MIN)) copiedSubAa.push(`${s} resting ${rRest == null ? "?" : rRest.toFixed(2)}`);
+      if (!(rHover >= COPIED_MIN)) copiedSubAa.push(`${s} hover ${rHover == null ? "?" : rHover.toFixed(2)}`);
+    }
+    check(
+      "10p: every scheme's copy confirmation meets WCAG AA against its own ink, resting and on hover",
+      copiedSchemes.length === 4 && copiedSubAa.length === 0,
+      `${copiedSubAa.length} below ${COPIED_MIN}: ${JSON.stringify(copiedSubAa)}; measured ${JSON.stringify(
+        Object.fromEntries(
+          copiedSchemes.map((s) => [
+            s,
+            `${copiedRatio(copiedRgb(copied[s].restBg), copiedRgb(copied[s].restFg)).toFixed(2)}/${copiedRatio(
+              copiedRgb(copied[s].hoverBg),
+              copiedRgb(copied[s].hoverFg),
+            ).toFixed(2)}`,
+          ]),
+        ),
+      )}`,
+    );
+
+    /* THE FROZEN DEFAULTS KEEP THE EXACT APPEARANCE THEY SHIPPED WITH,
+       SUB-AA RATIOS INCLUDED. Tokenising a surface is the easiest possible
+       way to "improve" a default by accident, and the byte-exact constraint
+       forbids it - so the defect is RECORDED here rather than fixed. */
+    const FROZEN_COPIED_RATIOS = { rest: 2.87, hover: 2.1 };
+    const copiedFrozenDrift = ["light default", "dark default"].filter((s) => {
+      const c = copied[s];
+      const rRest = copiedRatio(copiedRgb(c.restBg), copiedRgb(c.restFg));
+      const rHover = copiedRatio(copiedRgb(c.hoverBg), copiedRgb(c.hoverFg));
+      return (
+        c.restBg !== FROZEN_COPIED.rest ||
+        c.hoverBg !== FROZEN_COPIED.hover ||
+        c.restFg !== FROZEN_COPIED.ink ||
+        c.hoverFg !== FROZEN_COPIED.ink ||
+        Math.abs(rRest - FROZEN_COPIED_RATIOS.rest) > 0.01 ||
+        Math.abs(rHover - FROZEN_COPIED_RATIOS.hover) > 0.01
+      );
+    });
+    check(
+      "10p: both frozen defaults keep the exact copy-confirmation appearance, sub-AA ratios included",
+      copiedFrozenDrift.length === 0,
+      `${copiedFrozenDrift.length} drifted${
+        copiedFrozenDrift.length ? ": " + JSON.stringify(copiedFrozenDrift.map((s) => copied[s])) : ""
+      }; recorded ${JSON.stringify(FROZEN_COPIED_RATIOS)} on ${FROZEN_COPIED.rest}/${FROZEN_COPIED.hover}`,
+    );
+
+    /* THE LEDGER - because .copied was found by SWEEPING for its shape, and a
+       sweep whose result is written into prose rots the moment someone adds a
+       rule. Every screen-scope declaration that paints a literal colour is
+       listed here with the reason it is allowed to. The defect shape is a
+       MIXED-AUTHORITY pair: a themed ink over a raw fill (or the reverse), so
+       no scheme owns both halves of the cell. Every entry below is instead a
+       SELF-CONSISTENT literal pair, an overlay whose backdrop it also paints,
+       or a mode-invariant decoration - measured, not assumed.
+
+       PRINT-ONLY declarations are deliberately out of scope: they are already
+       owned by 10k's print sweep and its excusals. The exclusion is on the
+       at-rule being EXACTLY "@media print", so a rule in a "screen, print"
+       group - which really does apply on screen - lands here as an
+       unrecorded entry and fails loudly rather than being waved through by a
+       substring match on the word print. */
+    const LITERAL_PAINT_LEDGER = {
+      "styles.css|.search-highlight|background-color": "self-consistent pair with its own #000 ink (14.97:1)",
+      "styles.css|.search-highlight|color": "self-consistent pair, see above",
+      "styles.css|.search-highlight.current|background-color":
+        "self-consistent pair with its own #fff ink - a real 2.33:1 cell, but mode-invariant and therefore part of the frozen defaults",
+      "styles.css|.search-highlight.current|color": "self-consistent pair, see above",
+      "styles.css|.notes-item.search-highlight|background": "translucent tint over a themed row, no ink of its own",
+      "styles.css|.note-dialog-overlay|background": "modal scrim, paints no ink",
+      "styles.css|.note-label|color": "ink over the note's own author-chosen colour, which no scheme owns",
+      "styles.css|.note-tooltip::-webkit-scrollbar-track|background": "translucent decoration on the tooltip's own dark surface",
+      "styles.css|.note-tooltip::-webkit-scrollbar-thumb|background": "translucent decoration, see above",
+      "styles.css|.note-tooltip::-webkit-scrollbar-thumb:hover|background": "translucent decoration, see above",
+      "styles.css|.note-tooltip-title|color": "self-consistent with the tooltip's own literal dark backdrop",
+      "styles.css|.note-tooltip-content|color": "self-consistent, see above",
+      "styles.css|.note-tooltip-close|background": "self-consistent pair with its own #fff ink",
+      "styles.css|.note-tooltip-close|color": "self-consistent pair, see above",
+      "styles.css|.note-tooltip-close:hover|background": "self-consistent pair, see above",
+      "styles.css|.tools-toggle-thumb|background": "un-themed switch knob, measured against every track by 10n",
+      "styles.css|.img-zoom-btn|background": "self-consistent pair with its own #fff ink, over an image",
+      "styles.css|.img-zoom-btn|color": "self-consistent pair, see above",
+      "custom-styles.css|::-webkit-scrollbar-thumb|background": "translucent decoration, per-mode pair",
+      "custom-styles.css|::-webkit-scrollbar-thumb:hover|background": "translucent decoration, see above",
+      "custom-styles.css|body.dark-mode ::-webkit-scrollbar-thumb|background": "translucent decoration, see above",
+      "custom-styles.css|body.dark-mode ::-webkit-scrollbar-thumb:hover|background": "translucent decoration, see above",
+      "custom-styles.css|.tab-close:hover|background": "translucent tint over the themed tab, paints no ink",
+      "custom-styles.css|body.dark-mode .tab-close:hover|background": "translucent tint, see above",
+    };
+    const PAINT_PROPS =
+      /^(color|background|background-color|border(-(top|right|bottom|left))?-color|fill|stroke|outline-color)$/;
+    const NAMED_COLOURS = [
+      "white", "black", "red", "green", "blue", "gold", "orange", "gray", "grey", "silver",
+      "yellow", "purple", "navy", "teal", "olive", "maroon", "lime", "aqua", "fuchsia",
+      "pink", "brown", "cyan", "magenta",
+    ];
+    /* A VARIABLE BLOCK IS WHERE A LITERAL IS SUPPOSED TO LIVE. The whole point
+       of the token layer is that every scheme spells its palette out as raw
+       values in exactly these blocks; sweeping them would report the design as
+       the defect. */
+    const isVarBlockSel = (sel) =>
+      /^(:root|body|html)$/.test(sel) || /^body\[data-theme=/.test(sel) || /^body\.dark-mode$/.test(sel);
+    /* A value whose only colour is rgba(var(--x), a) is TOKENISED, not
+       literal - strip that shape before looking for a literal. */
+    const hasLiteralColour = (v) => {
+      const s = v.replace(/rgba?\(\s*var\([^)]*\)[^)]*\)/g, "");
+      return (
+        /#[0-9a-fA-F]{3,8}\b/.test(s) ||
+        /\brgba?\(/.test(s) ||
+        new RegExp(`\\b(${NAMED_COLOURS.join("|")})\\b`, "i").test(s)
+      );
+    };
+    const literalPaint = newDecls.filter(
+      (d) =>
+        !d.prop.startsWith("--") &&
+        PAINT_PROPS.test(d.prop) &&
+        !isVarBlockSel(d.sel) &&
+        d.at !== "@media print" &&
+        hasLiteralColour(d.val),
+    );
+    const literalKeys = literalPaint.map((d) => `${d.file}|${d.sel}|${d.prop}`);
+    const ledgerKeys = Object.keys(LITERAL_PAINT_LEDGER);
+    const unrecordedLiterals = [...new Set(literalKeys.filter((k) => !LITERAL_PAINT_LEDGER[k]))];
+    const staleLedger = ledgerKeys.filter((k) => !literalKeys.includes(k));
+    check(
+      "10p: every screen-scope literal paint declaration is a recorded self-consistent cell, not a stranded fill",
+      literalKeys.length >= 24 && unrecordedLiterals.length === 0 && staleLedger.length === 0,
+      `${literalKeys.length} swept against ${ledgerKeys.length} recorded; unrecorded: ${JSON.stringify(
+        unrecordedLiterals,
+      )}; stale: ${JSON.stringify(staleLedger)}`,
+    );
+
+    /* THE LINKAGE, NAMING BOTH HALVES. A behavioural assertion cannot see the
+       ink token stop being consumed: every state's --on-success-fg is
+       currently the same colour as its --on-accent-fg, so deleting the
+       declaration changes no pixel today and would silently strand the token
+       as dead paint a future editor changes expecting an effect - the defect
+       10f2 states generally for literal var() fallbacks. It names the fill
+       AND the ink because a claim that names only one half leaves the other
+       free to break (recorded against the code ::selection belt, which named
+       only the background while the foreground was the half that broke). */
+    const COPIED_RULE_SHAPE = [
+      ".code-copy-btn.copied|background|var(--success-bg)",
+      ".code-copy-btn.copied|color|var(--on-success-fg)",
+      ".code-copy-btn.copied:hover|background|var(--success-bg-hover)",
+    ];
+    const copiedRuleDecls = newDecls
+      .filter((d) => d.file === "styles.css" && d.at === "" && /^\.code-copy-btn\.copied(:hover)?$/.test(d.sel))
+      .map((d) => `${d.sel}|${d.prop}|${d.val}`);
+    const copiedShapeMissing = COPIED_RULE_SHAPE.filter((k) => !copiedRuleDecls.includes(k));
+    check(
+      "10p: the copy-confirmation rules consume the success tokens for both their fill and their ink",
+      copiedShapeMissing.length === 0,
+      `missing: ${JSON.stringify(copiedShapeMissing)}; declared: ${JSON.stringify(copiedRuleDecls)}`,
+    );
 
     // Leave the page in the shipped default so nothing after this section - or
     // a screenshot taken from the same profile - inherits a scheme.

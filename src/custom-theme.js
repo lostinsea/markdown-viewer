@@ -50,13 +50,22 @@
      downgrade, or a scheme withdrawn), and the honest answer then is the
      default appearance rather than a half-applied one. The `s.mode === mode`
      term matters - it stops a dark id stored under the light key from being
-     applied over a light page. */
+     applied over a light page.
+
+     THE resolveMode() CALL IS NOT DEFENSIVE PADDING. This function is exported
+     on window.foliaThemes, and the value the app actually STORES for the mode
+     preference is "desktop" - so schemeFor(storedMode()), the most natural
+     composition of two exported functions, hit SCHEME_KEYS["desktop"] ===
+     undefined, read the literal localStorage key "undefined", matched no
+     scheme, and then returned undefined from baseSchemeFor because no scheme
+     carries mode "desktop". Every internal caller happens to resolve first, so
+     the product never reached it; applyScheme() would have thrown on
+     scheme.base inside a click handler, outside the one try that guards the
+     parse-time call. Resolving here makes the exported function total. */
   function schemeFor(mode) {
-    const stored = localStorage.getItem(SCHEME_KEYS[mode]);
-    return (
-      SCHEMES.find((s) => s.id === stored && s.mode === mode) ||
-      baseSchemeFor(mode)
-    );
+    const m = resolveMode(mode);
+    const stored = localStorage.getItem(SCHEME_KEYS[m]);
+    return SCHEMES.find((s) => s.id === stored && s.mode === m) || baseSchemeFor(m);
   }
 
   function resolveMode(mode) {
@@ -90,7 +99,14 @@
      oversight - and it is the seam that breaks first if mermaid is ever made
      scheme-aware. */
   function applyScheme(mode) {
-    const scheme = schemeFor(resolveMode(mode));
+    /* schemeFor() resolves the mode itself now that it is total (see its
+       comment above), so this no longer pre-resolves. The saving is NOT a
+       matchMedia call - resolveMode() short-circuits on "light"/"dark", so
+       schemeFor(resolveMode(mode)) reached matchMedia exactly once on the
+       "desktop" path, the same as now. The win is that schemeFor is no longer
+       PARTIAL: it used to return undefined for "desktop", which is the defect
+       its own comment describes. */
+    const scheme = schemeFor(mode);
     /* An export owns the document's appearance until it has finished
        rasterising. Mirrors the darkModeToggle handler in renderer.js: the
        PREFERENCE has already been written by the caller, so skipping the DOM
@@ -211,6 +227,20 @@
 
     const submenu = item.querySelector("#customThemeSubmenu");
 
+    /* BOTH ROW KINDS DISMISS THE MENU THE SAME WAY, and that is worth one
+       function rather than two copies. The pair is not obvious - drop the
+       `theme-open` class so the submenu does not linger, then simulate an
+       outside click on the next tick so the PARENT dropdown closes through
+       the product's own dismissal path - and two copies of a non-obvious pair
+       is exactly the shape that has silently diverged elsewhere in this file.
+       The deferral is load-bearing: clicking the body synchronously inside a
+       click handler that has already called stopPropagation would be handled
+       before the current event finishes unwinding. */
+    function closeMenu() {
+      item.classList.remove("theme-open");
+      setTimeout(() => document.body.click(), 10);
+    }
+
     /* Scheme rows are built as DOM nodes with textContent rather than appended
        as markup. The labels are static today, so this is not a sanitisation
        fix - it is the convention SEC-13/14 established for every menu surface,
@@ -234,8 +264,7 @@
         row.addEventListener("click", (e) => {
           e.stopPropagation();
           setScheme(s.id);
-          item.classList.remove("theme-open");
-          setTimeout(() => document.body.click(), 10);
+          closeMenu();
         });
         submenu.appendChild(row);
       });
@@ -266,9 +295,7 @@
       opt.addEventListener("click", (e) => {
         e.stopPropagation();
         applyTheme(opt.dataset.mode);
-        item.classList.remove("theme-open");
-        // Close the parent dropdown by simulating an outside click
-        setTimeout(() => document.body.click(), 10);
+        closeMenu();
       });
     });
 

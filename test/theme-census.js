@@ -168,20 +168,33 @@ const CENSUS_PROBE_SOURCE = `(() => {
     try { rules = sheet.cssRules; } catch (e) { continue; }
     for (const r of rules || []) {
       if (r.selectorText && /::(-moz-)?selection/.test(r.selectorText)) {
+        // The -moz- alternative can never match and is kept only so this
+        // instrument still reads the same against an ARCHIVED golden: measured
+        // in this Chromium, an unrecognised pseudo-element's whole rule is
+        // dropped at parse time, so a ::-moz-selection rule never enters the
+        // CSSOM in the first place.
         selection.push({ selector: r.selectorText, css: r.style.cssText });
       }
     }
   }
   selection.sort((a, b) => (a.selector < b.selector ? -1 : 1));
   // The end-to-end half: what a selection would ACTUALLY paint, per element.
+  // BOTH HALVES ARE RECORDED, AND THE FOREGROUND WAS THE MISSING ONE. This
+  // captured backgroundColor alone, so the frozen defaults' selection INK -
+  // the half the F1 defect was actually about - was byte-exact only by
+  // argument, never by measurement: --code-selection-fg could have been moved
+  // from #ffffff to #e8e8e8 without a single assertion noticing. Both
+  // reviewers reached that independently, which is the strongest signal this
+  // process produces.
   const selectionComputed = {};
   [['pre', '#viewer pre[class*=language-]'],
    ['preCode', '#viewer pre[class*=language-] code'],
    ['body', 'body']].forEach(([k, sel]) => {
     const el = document.querySelector(sel);
-    selectionComputed[k] = el
-      ? getComputedStyle(el, '::selection').backgroundColor
-      : null;
+    if (!el) { selectionComputed[k] = null; selectionComputed[k + 'Fg'] = null; return; }
+    const cs = getComputedStyle(el, '::selection');
+    selectionComputed[k] = cs.backgroundColor;
+    selectionComputed[k + 'Fg'] = cs.color;
   });
   return JSON.stringify({ tokens, box, surfaces, selection, selectionComputed });
 })()`;

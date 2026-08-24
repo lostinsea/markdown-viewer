@@ -438,6 +438,29 @@ body.dark-mode .tab-close:hover {
   display: block !important;
 }
 
+/* THE CHECKMARK GUTTER, AND WHY IT IS A FIXED-WIDTH BOX RATHER THAN A MARGIN.
+   These rows are .tools-submenu-item, which is `display: flex` with
+   `justify-content: space-between` (see the .tools-submenu-item rule in
+   styles.css - cited by selector, not by line, because a change that adds
+   rules above it silently invalidates a line range, which is exactly what
+   happened to this comment's first draft). Under that, the
+   pseudo and the label are two flex items pushed to OPPOSITE ENDS of the panel
+   and any margin between them is absorbed by the free space - so the previous
+   `margin-right: 6px` / `margin-right: 20px` pair, whose comment claimed to
+   "keep labels aligned when no checkmark", could not align anything.
+   MEASURED, before the fix: the six scheme labels started at insets of 34.66,
+   82.66, 66.66, 42.66, 98.66 and 98.66 px - a 64 px ragged right-aligned
+   column - and each tick sat about 140 px from the label it marks, at the far
+   left edge of the panel, so it was genuinely ambiguous which row was ticked.
+   Two changes fix it, and both are needed: pack the row from the start edge,
+   and give the gutter a WIDTH so the ticked and unticked states occupy the
+   same space. Pinned by 10j's label-inset assertion, which measures where the
+   text really begins with a Range rather than restating either number. */
+#customThemeMenuItem .custom-theme-option,
+#customThemeMenuItem .custom-scheme-option {
+  justify-content: flex-start;
+}
+
 /* Align SVG icons vertically with the text label */
 .custom-theme-option .theme-icon {
   flex-shrink: 0;
@@ -449,33 +472,52 @@ body.dark-mode .tab-close:hover {
   opacity: 1;
 }
 
-/* Active option checkmark */
-.custom-theme-option.active::before {
-  content: "✓";
-  margin-right: 6px;
-  color: var(--primary-color, #2d9cdb);
-  font-weight: 700;
-}
-.custom-theme-option:not(.active)::before {
-  content: "";
-  margin-right: 20px; /* keep labels aligned when no checkmark */
-  display: inline-block;
-}
+/* Active option checkmark.
+   The box is a fixed 12px column so that ticked and unticked rows put their
+   labels at the same x - that alignment is what 10j measures.
 
-/* Scheme rows share the mode rows' checkmark gutter so the whole submenu
-   reads as one column. Written as a separate selector list rather than by
-   widening the rules above, because the mode rows also carry an SVG icon and
-   the two must stay independently adjustable. */
-.custom-scheme-option.active::before {
-  content: "✓";
-  margin-right: 6px;
-  color: var(--primary-color, #2d9cdb);
-  font-weight: 700;
-}
-.custom-scheme-option:not(.active)::before {
+   MEASURED, so the set of declarations here is evidence rather than habit:
+   - `display: inline-block` WAS declared here and was DEAD. A generated box
+     that is a flex item is blockified, so it computed to `block` regardless
+     (probe: getComputedStyle(row, '::before').display === "block"). Deleted;
+     the computed value is now asserted, so if the row ever stops being a flex
+     container the alignment claim fails loudly instead of silently.
+   - `flex: 0 0 auto` is NOT dead, though it is inert in the shipped layout:
+     the submenu is shrink-to-fit, so a long label widens the panel (measured
+     1005px) rather than compressing anything. Bound the panel - an entirely
+     ordinary future edit - and the default `flex: 0 1 auto` squeezes this
+     column on the overflowing row alone, measured inset 32 -> 28 while its
+     siblings stay at 32. That is the exact misalignment the fixed width
+     exists to prevent, so the declaration is kept and asserted under a
+     deliberately bounded panel.
+   - `text-align: center` is load-bearing and PIXEL-verified, because no DOM
+     measurement can reach it: a pseudo-element has no client rect and its
+     text cannot be put in a Range. Captured off the real open menu at dpr
+     1.5, the tick's horizontal ink centroid inside this 12px box measures
+     9.83 centred against 6.83 left-aligned and 12.76 right-aligned. Kept as
+     a recorded coverage gap rather than asserted - see 10j - since a
+     capturePage assertion would make the suite depend on window foreground
+     state, and capturePage is known here to return stale frames. */
+/* SCOPED TO MATCH THE PACKING RULE ABOVE, and that symmetry is load-bearing
+   rather than tidiness. The 12px gutter and `justify-content: flex-start` only
+   produce an aligned column TOGETHER: the gutter reserves the space and the
+   packing decides which end it is reserved at. While the packing was
+   ID-scoped and the gutter was not, a row rendered outside
+   #customThemeMenuItem - or a rename of that id - would have kept the gutter
+   and lost the packing, silently recreating the "ticks ~140px from their
+   labels" defect documented above with no rule looking wrong on its own. */
+#customThemeMenuItem .custom-theme-option::before,
+#customThemeMenuItem .custom-scheme-option::before {
   content: "";
-  margin-right: 20px;
-  display: inline-block;
+  flex: 0 0 auto;
+  width: 12px;
+  text-align: center;
+}
+#customThemeMenuItem .custom-theme-option.active::before,
+#customThemeMenuItem .custom-scheme-option.active::before {
+  content: "✓";
+  color: var(--primary-color);
+  font-weight: 700;
 }
 
 /* Group captions. Not focusable, not clickable, and deliberately not a
@@ -486,13 +528,25 @@ body.dark-mode .tab-close:hover {
   font-weight: 700;
   letter-spacing: 0.06em;
   text-transform: uppercase;
-  color: var(--text-secondary, #777);
+  color: var(--text-secondary);
   cursor: default;
   user-select: none;
 }
 
+/* THE DIVIDER BETWEEN THE MODE ROWS AND THE SCHEME GROUPS, and the value is a
+   DELTA over the base separator rather than a repeat of it. This element is
+   .tools-menu-separator .theme-scheme-sep, and the base rule already supplies
+   `margin: 4px 8px`; an earlier draft of this rule set `margin-top: 4px`, which
+   computed to exactly what it would have been anyway. That is worse than
+   pointless - it made the assertion named for this gap satisfiable by the BASE
+   rule, so it reported a disjunction rather than the thing it was named for,
+   and the revert guarding it had to override the base rule to bite at all.
+   10px is a real, measurable increase, and it is warranted: this divider does
+   not separate two groups of the same kind of choice, it separates the MODE
+   choice from the SCHEME choice, which is the one place in the submenu the
+   reader is switching between two different questions. */
 .theme-scheme-sep {
-  margin-top: 4px;
+  margin-top: 10px;
 }
 
 /* ============================================
@@ -509,11 +563,17 @@ body.dark-mode .tab-close:hover {
 }
 
 /* ============================================
-   CUSTOM: Replace "transition: all" with targeted transitions
-   to reduce GPU Code Helper CPU usage.
-   "transition: all" forces the GPU to watch every CSS property
-   on an element continuously. Targeting only properties that
-   actually change eliminates that overhead.
+   CUSTOM: Replace "transition: all" with targeted transitions.
+   `transition: all` makes the style engine consider EVERY animatable
+   property of the element as a transition candidate whenever its computed
+   style changes, so an unrelated recalculation can start transitions on
+   properties nobody meant to animate. Naming the properties that actually
+   change keeps the transition set to the intended ones.
+   NOT MEASURED HERE: an earlier form of this comment claimed the GPU
+   "watches every CSS property continuously" and that this change reduces
+   GPU-process CPU. No benchmark in this repository establishes either, and
+   this file's rule is that an unmeasured causal claim does not get written
+   down as fact. The correctness argument above stands on its own.
    ============================================ */
 
 /* Buttons - change: background, color, border-color, transform */

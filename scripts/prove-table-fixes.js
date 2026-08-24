@@ -2773,8 +2773,18 @@ const REVERTS = [
     suite: "test:patch",
     what: "remove the checkmark that marks the selected Theme option, the indicator that survives in custom-styles.css now that the language menu's own .lang-check has gone",
     file: CUSTOM_CSS,
-    from: '.custom-theme-option.active::before {\n  content: "\u2713";',
-    to: '.custom-theme-option.active::before {\n  content: "";',
+    // REPOINTED when the theme submenu's checkmark gutter was rebuilt as a
+    // fixed-width box: the mode rows and the scheme rows now SHARE one rule, so
+    // the old two-line anchor (which quoted the mode-row rule and its own
+    // content declaration) no longer exists. Dropping the mode rows from the
+    // selector list is the same neutralisation, and it is deliberately the
+    // mirror of R340, which drops the scheme rows instead - each keeps the
+    // other half of the submenu ticked, so neither can pass by wrecking enough
+    // of the panel that some other assertion notices first.
+    from:
+      "#customThemeMenuItem .custom-theme-option.active::before,\n" +
+      "#customThemeMenuItem .custom-scheme-option.active::before {\n",
+    to: "#customThemeMenuItem .custom-scheme-option.active::before {\n",
     expect: [/the selected theme carries a checkmark the unselected ones do not/],
     // The submenu must still be built, populated and OPEN - otherwise "no
     // checkmark" would just mean "no options were found", and the icon-opacity
@@ -4090,7 +4100,20 @@ const REVERTS = [
     from: "  --code-selection-bg: rgba(61, 189, 198, 0.35);",
     to: "  --code-selection-bg: #073642;",
     suite: "test:theme",
-    expect: [/dark: ::selection paints what the golden recorded/],
+    // TWO ASSERTIONS FAIL, AND THE SET IS THE EVIDENCE. Restoring the navy does
+    // NOT hurt legibility - the ink is --code-selection-fg (white), and white on
+    // near-black navy is the most legible pairing in the product. That is
+    // precisely the fault: it scores perfectly on legibility by barely existing
+    // against the #2d2d2d code background it sits on, which is why 10l asserts
+    // both halves of the trade rather than only the one a reader complains
+    // about. The relative-to-default bars that this revert used to trip no
+    // longer exist: they were replaced by recorded absolute floors after a
+    // review pointed out that a bar measured against a moving reference cannot
+    // notice the reference moving.
+    expect: [
+      /dark: ::selection paints what the golden recorded/,
+      /dark default: the selection highlight is still visible against the code behind it/,
+    ],
   },
   {
     id: "R266",
@@ -4760,7 +4783,23 @@ const REVERTS = [
     from: "  --welcome-solid-bg: #0969da;",
     to: "  --welcome-solid-bg: #1F3244;",
     suite: "test:theme",
-    expect: [/clarity: no element still paints a DEFAULT accent colour/],
+    expect: [
+      /clarity: no element still paints a DEFAULT accent colour/,
+      /every hover rule that repaints a neutral element with a saturated fill sets its own ink/,
+      /neutral and saturated fills stay far enough apart for the classifier to tell them apart/,
+    ],
+    // THE SECOND AND THIRD ARE HONEST CONSEQUENCES, NOT NOISE, and they are
+    // named rather than narrowed away. #1F3244 is a DEFAULT palette colour -
+    // the light default's ink/panel/table-header - which is exactly what makes
+    // it a legitimate subject for 10c's stranded-accent sweep. But painting it
+    // onto the welcome dot and the Open button also changes what those two
+    // surfaces are to 10g: their RESTING fill becomes a dark neutral while the
+    // hover rule above them still paints the accent, so the saturation
+    // classifier legitimately reports both. Choosing a colour that trips only
+    // the named assertion would mean picking one that is simultaneously a
+    // default palette member and invisible to every other section - a search
+    // over colours rather than a proof, and the earlier #279EA7 shows how that
+    // ends (it tripped two 10d contrast bars instead).
     mustPass: [
       /clarity: overrides every literal its mode's base declares/,
       /light default: the accent literals 10c searches for are really painted/,
@@ -4864,7 +4903,16 @@ const REVERTS = [
     from: ".file-update-btn {\n  transition: background 0.2s ease !important;",
     to: ".file-update-btn {\n  transition: background 30s ease !important;",
     suite: "test:theme",
-    expect: [/every theme state settled its CSS transitions before it was measured/],
+    expect: [
+      /every theme state settled its CSS transitions before it was measured/,
+      // AN HONEST CONSEQUENCE, and the sharper of the two witnesses. A state
+      // measured mid-flight reports the colour the element was PASSING
+      // THROUGH, so the HEAD comparison sees ten hover/active cells drift on
+      // the very button this revert slows. That assertion did not exist when
+      // R300 was written; it now catches the symptom directly, while the
+      // settle assertion names the CAUSE. Both are wanted.
+      /neither frozen default has changed a single state colour since HEAD/,
+    ],
     // THE POSITIVE CONTROL MUST SURVIVE, and saying so is the point. This
     // revert makes a transition run LONGER, so the control - "the settle wait
     // actually observed running transitions" - is if anything more satisfied
@@ -5327,6 +5375,28 @@ const REVERTS = [
     // and it is deliberately INERT: nothing consumes the new binding, so no
     // other assertion in any suite can notice. That is the point - a boundary
     // assertion has to fail on the crossing itself, not on its consequences.
+    //
+    // BOTH main-side assertions are listed, and that is a measurement rather
+    // than a hedge: the file-wide sweep sees the new `data-theme` spelling, and
+    // so does the per-handler sweep, because the binding is introduced INSIDE
+    // the mermaid handler's own slice. An `expect` naming only the first would
+    // understate what the revert really does.
+    //
+    // mustPass USED TO NAME THE TWO RENDERER-SIDE PAYLOAD ASSERTIONS, AND
+    // THAT GUARD COULD NOT FAIL. The edit is confined to main.js; one of those
+    // assertions reads renderer.js source and the other drives a real click
+    // with ipcRenderer.send intercepted in the renderer, so main.js is never
+    // consulted by either. A collateral guard that is structurally incapable of
+    // firing is decorative - it reads as coverage and supplies none. The scope
+    // claim it was making is still true and is stated here in prose, where it
+    // costs nothing and pretends to nothing.
+    //
+    // What mustPass names instead are the two assertions in this section that
+    // main.js really can break: both run the export through the main process
+    // (printToPDF and the CDP media emulation behind it). They keep this a
+    // proof that the SWEEPS caught a scheme crossing the boundary, rather than
+    // a proof that a malformed edit broke the main process and took the
+    // section down with it.
     what: "forward the active scheme into the mermaid popup builder",
     file: MAIN,
     from: "  const { svgContent, isDarkMode } = data;\n",
@@ -5334,8 +5404,12 @@ const REVERTS = [
     suite: "test:theme",
     expect: [
       /10i: the main process, which owns every popup window, knows nothing about colour schemes/,
+      /10i: every popup handler paints literal colours chosen by isDarkMode and reads no token-layer variable/,
     ],
-    mustPass: [/10i: every popup surface exists and is themed by a boolean/],
+    mustPass: [
+      /10i: every theme state prints each measured surface exactly as the shipped light default does/,
+      /10i: the print stylesheet really was in effect for every printed measurement/,
+    ],
   },
   {
     id: "R321",
@@ -5414,17 +5488,18 @@ const REVERTS = [
   },
   {
     id: "R324",
-    // A MENU THAT WILL NOT GO AWAY. The mode rows and the scheme rows carry
-    // their own copies of the dismissal, so this anchors on the scheme row's
-    // pair specifically - the mode rows' copy stays, which is what keeps the
-    // failure narrow and is also why the two copies are worth pinning at all.
+    // A MENU THAT WILL NOT GO AWAY. Both row kinds now share one closeMenu(),
+    // so this anchors on the SCHEME row's CALL SITE - the mode rows keep
+    // theirs, which is what keeps the failure narrow. (Before the shared
+    // helper landed the two rows carried duplicate copies of the dismissal;
+    // the helper removed the drift hazard, not the need to pin each caller.)
     // The deferred document.body.click() still closes the hamburger and the
     // View flyout, so the panel left standing is the theme submenu alone: a
     // floating list with nothing behind it, and exactly the kind of half-state
     // a class-only test reports as success.
     what: "leave the theme submenu open after a scheme is chosen",
     file: THEME_JS,
-    from: '          setScheme(s.id);\n          item.classList.remove("theme-open");\n',
+    from: "          setScheme(s.id);\n          closeMenu();\n",
     to: "          setScheme(s.id);\n",
     suite: "test:theme",
     expect: [/10j: choosing a scheme dismisses the menu it was chosen from/],
@@ -5800,6 +5875,2487 @@ const REVERTS = [
       /10j: the ticks still describe the stored choice when the menu is reopened/,
     ],
   },
+  {
+    id: "R338",
+    // MAKING THE RE-THEME SITE SCHEME-AWARE, which is the exact drift the
+    // mermaid boundary exists to forbid and which nothing else in the suite
+    // can see. The two assertions above it call getMermaidConfig(true)/(false)
+    // directly with booleans the TEST supplies, so they measure a pure
+    // function and stay green while the product hands mermaid a palette
+    // chosen by data-theme.
+    // The substituted config is still a REAL one - the other mode's - so this
+    // is a plausible accident rather than a wrecking edit: a diagram still
+    // draws, it just draws in the wrong palette under two of the four schemes.
+    what: "let the mermaid re-theme site pick its palette from the active scheme rather than the mode",
+    file: RENDERER,
+    from: "  mermaid.initialize(getMermaidConfig(isDark));\n",
+    to:
+      "  mermaid.initialize(\n" +
+      "    getMermaidConfig(\n" +
+      '      ["abyss", "parchment"].includes(document.body.getAttribute("data-theme"))\n' +
+      "        ? !isDark\n" +
+      "        : isDark,\n" +
+      "    ),\n" +
+      "  );\n",
+    suite: "test:theme",
+    expect: [
+      /10i: the configuration the product really hands to mermaid\.initialize is chosen by the mode alone/,
+      // The source-shape assertion catches it too, and from the other side: the
+      // runtime capture sees a WRONG VALUE arriving at initialise, this sees the
+      // re-theme site spelling a scheme-derived expression where a plain mode
+      // flag belongs. Both are named because a future edit could satisfy one
+      // without the other.
+      /10i: both mermaid\.initialize sites pass a palette chosen by a plain mode flag, spelled that way in the source/,
+    ],
+  },
+  {
+    id: "R339",
+    // THE OTHER HALF OF THE SAME BOUNDARY, and it is invisible to the capture
+    // of initialise CALLS. renderer.js:102 runs once, inside ensureMermaid()'s
+    // onload, long before any state in this loop - so a wrong palette there
+    // produces no call to record and shows up only in what the next document
+    // renders with. That is why the assertion additionally evaluates the load
+    // site's own expression, getMermaidConfig(mermaidDesiredDark), after every
+    // state: it is the only observer of a site that has already run.
+    // The source-shape assertion added alongside it covers the ARGUMENT TEXT at
+    // that site, which this revert leaves untouched - so the two are genuinely
+    // complementary rather than one guarding the other, and only the runtime
+    // one fails here.
+    // Neutralising the RECORDING rather than the call, because the recording is
+    // the documented mechanism (renderer.js:1743-1746) by which a theme chosen
+    // before mermaid ever loaded is still honoured.
+    what: "stop applyMermaidTheme recording the chosen mode, so the lazy-load site initialises with a stale palette",
+    file: RENDERER,
+    from: "  mermaidDesiredDark = isDark;\n",
+    to: "",
+    suite: "test:theme",
+    expect: [
+      /10i: the configuration the product really hands to mermaid\.initialize is chosen by the mode alone/,
+    ],
+  },
+  {
+    id: "R340",
+    // THE EXACT EDIT THAT WAS MEASURED TO BE INVISIBLE. Before 10j grew a
+    // rendered-form probe, deleting the scheme rows' checkmark left the suite
+    // green at 242/242 - every row lost its tick, the submenu became
+    // unreadable, and not one assertion moved, because every other tick
+    // assertion in 10j reads the .active CLASS.
+    // Written as a dropped line from a SELECTOR LIST rather than as a deleted
+    // rule, so the mode rows (Light / Dark / Desktop) keep their ticks. That is
+    // both the likelier accident and what keeps this narrow: the 10h
+    // pseudo-element sweep counts own-ink cells across the whole document and
+    // would fire as collateral if both halves lost their glyph at once.
+    what: "drop the scheme rows from the checkmark rule, so an active scheme is marked by class only",
+    file: CUSTOM_CSS,
+    from:
+      "#customThemeMenuItem .custom-theme-option.active::before,\n" +
+      "#customThemeMenuItem .custom-scheme-option.active::before {\n",
+    to: "#customThemeMenuItem .custom-theme-option.active::before {\n",
+    suite: "test:theme",
+    expect: [
+      /10j: a ticked scheme row really paints a checkmark, not just an \.active class/,
+      // THE GLYPH-RULE FLOOR'S ONLY PROOF, and it belongs here rather than in a
+      // revert of its own because this is already the exact edit that removes a
+      // glyph rule PART. That floor read `>= 4` against a measured 9 - it even
+      // quoted "Measured: 4" while naming the six-part heading list and
+      // counting it as one - so it carried five parts of slack and would have
+      // passed with every tick and overlay rule gone. At `>= 9` this revert
+      // takes the count to 8 and the floor bites; at the old `>= 4` it did not,
+      // which is what makes this a proof about the floor's VALUE.
+      /the pseudo-element sweep found the product's glyph-painting rules/,
+    ],
+  },
+  {
+    id: "R341",
+    // HALF ONE OF THE ALIGNMENT FIX. Removing this override hands the rows back
+    // to .tools-submenu-item's `justify-content: space-between`, which pushes
+    // the ::before to the panel's left edge and the label to its right - the
+    // shipped defect this assertion found, where the labels were ragged over
+    // 64px and each tick sat ~140px from the row it marked.
+    // It fails ALONE even though the fixed-width gutter below survives, which
+    // is the point of splitting it from R342: neither half is sufficient.
+    // THE MODE ROWS FAIL TOO, and they are named rather than left to the
+    // unlisted-failure report because the rule this removes names
+    // .custom-theme-option as well: both groups lose their packing, so both
+    // columns go ragged and the shared-gutter claim goes with them.
+    what: "let the theme rows inherit space-between, pushing every tick away from its label",
+    file: CUSTOM_CSS,
+    from:
+      "#customThemeMenuItem .custom-theme-option,\n" +
+      "#customThemeMenuItem .custom-scheme-option {\n" +
+      "  justify-content: flex-start;\n" +
+      "}\n",
+    to: "",
+    suite: "test:theme",
+    expect: [
+      /10j: every scheme label starts at the same x, so the tick gutter is reserved on unticked rows too/,
+      /10j: every mode row's tick gutter ends at the same x, ticked or not/,
+      /10j: every mode row's text label starts at the same x, ticked or not/,
+      /10j: mode rows and scheme rows share ONE tick gutter/,
+    ],
+  },
+  {
+    id: "R342",
+    // HALF TWO, and it is the half that looks harmless. With the row packed
+    // from the start edge, an unsized ::before collapses to zero on an unticked
+    // row and to the glyph's own advance on a ticked one, so the column is
+    // still ragged - by the width of a checkmark rather than by 64px. This is
+    // exactly the mistake the ORIGINAL margin-based gutter made, restated: a
+    // gutter that only exists when there is something in it is not a gutter.
+    what: "drop the checkmark gutter's width, so an unticked row reserves no space for the tick",
+    file: CUSTOM_CSS,
+    from: "  flex: 0 0 auto;\n  width: 12px;\n  text-align: center;\n",
+    to: "  flex: 0 0 auto;\n  text-align: center;\n",
+    suite: "test:theme",
+    expect: [
+      /10j: every scheme label starts at the same x, so the tick gutter is reserved on unticked rows too/,
+      /10j: every mode row's tick gutter ends at the same x, ticked or not/,
+      /10j: every mode row's text label starts at the same x, ticked or not/,
+      /10j: mode rows and scheme rows share ONE tick gutter/,
+    ],
+  },
+  {
+    id: "R343",
+    // THE CAPTIONS' OWN COMMENT CLAIMS THEY READ AS CAPTIONS RATHER THAN AS
+    // ROWS. Dropping the one declaration that makes that visible - they are
+    // still uppercase, still tracked, still unclickable - leaves them at the
+    // rows' own size, so LIGHT SCHEMES scans as a menu item the reader can
+    // click. The assertion compares against the row's RESOLVED size rather than
+    // against 10px, so this bites without either number being restated.
+    what: "let the scheme group captions render at the menu rows' font size",
+    file: CUSTOM_CSS,
+    from: "  padding: 6px 12px 2px;\n  font-size: 10px;\n",
+    to: "  padding: 6px 12px 2px;\n",
+    suite: "test:theme",
+    expect: [
+      /10j: each scheme group carries a caption that renders, and reads as a caption rather than a row/,
+    ],
+  },
+  {
+    id: "R344",
+    // THE DIVIDER, DELETED - which is the realistic accident, and until this
+    // entry was rewritten it was also VACUOUS. The rule previously set
+    // `margin-top: 4px`, the exact value the base .tools-menu-separator already
+    // supplies, so removing it changed nothing and this revert had to set 0
+    // instead - overriding the BASE rule to force a failure. That proved the
+    // probe can see a zero, not that the rule under test is load-bearing.
+    // The rule now sets a real delta (10px) and the assertion compares against
+    // the base separator measured in the same probe, so DELETING the rule is
+    // enough: the element falls back to the base 4px and the comparison fails.
+    what: "delete the wider gap the scheme divider opens above the group captions",
+    file: CUSTOM_CSS,
+    from: ".theme-scheme-sep {\n  margin-top: 10px;\n}\n",
+    to: "",
+    suite: "test:theme",
+    expect: [
+      /10j: the divider above the scheme groups opens a WIDER gap than an ordinary menu separator/,
+    ],
+  },
+  {
+    id: "R345",
+    // THE LEAK THE MARKER SWEEP STRUCTURALLY CANNOT SEE. A scheme forwarded
+    // under a NEUTRAL key spells no scheme id and no `data-theme` in main.js,
+    // so the "the main process knows nothing about colour schemes" sweep -
+    // which matches literal strings in main.js text - stays green while the
+    // renderer hands the active scheme across the boundary on every popup.
+    // Chosen at the IMAGE site on purpose: the census fixture has no image, so
+    // this site is unreachable at runtime and only the parse can catch it.
+    // That is what separates this from R346.
+    what: "forward the active scheme to the image popup under a neutral key name",
+    file: RENDERER,
+    from: "        src: img.src,\n        alt: img.alt || '',\n",
+    to:
+      "        src: img.src,\n" +
+      "        alt: img.alt || '',\n" +
+      "        palette: document.body.getAttribute('data-theme') || '',\n",
+    suite: "test:theme",
+    expect: [
+      /10i: no popup-open payload carries anything but its content and the mode boolean/,
+    ],
+  },
+  {
+    id: "R346",
+    // THE MIRROR IMAGE, AND IT IS WHY THE RUNTIME HALF EXISTS. The payload's
+    // KEYS are untouched, so the parse in R345's assertion sees a clean
+    // {tableData, isDarkMode} and passes; what moved is the VALUE, which now
+    // depends on the scheme rather than on the mode. A parchment reader gets a
+    // popup built from the dark hex table.
+    // Written as a widened boolean rather than as a new key because that is the
+    // plausible accident - someone deciding a parchment page "reads as dark" -
+    // and because it keeps the two halves of the boundary independently pinned.
+    what: "let a scheme, not the mode, decide the boolean a popup is themed by",
+    file: RENDERER,
+    from:
+      "      const isDarkMode = document.body.classList.contains('dark-mode');\n" +
+      "      ipcRenderer.send('open-table-popup', { tableData, isDarkMode });\n",
+    to:
+      "      const isDarkMode =\n" +
+      "        document.body.classList.contains('dark-mode') ||\n" +
+      "        document.body.getAttribute('data-theme') === 'parchment';\n" +
+      "      ipcRenderer.send('open-table-popup', { tableData, isDarkMode });\n",
+    suite: "test:theme",
+    expect: [
+      /10i: the payload a popup really receives is the same in every scheme but for the mode boolean/,
+    ],
+  },
+  {
+    id: "R347",
+    // THE POSITIVE CONTROL, PROVEN THE ONLY WAY IT CAN BE. Both assertions
+    // above are absence claims over a set built by walking renderer.js text, so
+    // every one of them is satisfied for free by an EMPTY set - and this
+    // project's recurring disease is exactly that: an assertion of absence
+    // fails open. Renaming a channel at its send site is the realistic way the
+    // subject set silently shrinks, and it costs the parse one whole surface
+    // while leaving main.js still listening on the old name, so the marker
+    // sweep and the leak assertions all stay green.
+    what: "rename the image popup channel at its send site, so one surface leaves the parsed subject set",
+    file: RENDERER,
+    from: "      ipcRenderer.send('open-image-popup', {\n",
+    to: "      ipcRenderer.send('open-image-window', {\n",
+    suite: "test:theme",
+    expect: [
+      /10i: every popup-open payload in the renderer was really parsed \(positive control\)/,
+    ],
+  },
+  {
+    id: "R348",
+    // THE FLOOR THIS REPLACED WAS `rawDiffering.length >= 3` OF 5, and this is
+    // the edit that floor waved through. Scoping one scheme block to @media
+    // screen makes parchment resolve to the shipped light defaults on paper -
+    // exactly "the print CSS now neutralises a scheme on its own", the scenario
+    // the control's own comment names - while costing NOTHING visible on
+    // screen, so no colour, contrast or fidelity assertion moves. It takes the
+    // count from 5 to 4, which the old floor accepted and the relationship
+    // does not.
+    // Uses no colour values at all: the neutralisation is achieved by making
+    // the scheme inapplicable rather than by restating the default palette,
+    // which is what keeps it a one-idea revert.
+    what: "scope the parchment scheme to screen, so the print stylesheet neutralises it without the export park",
+    file: CSS,
+    from: 'body[data-theme="parchment"] {\n',
+    to: '@media screen {\nbody[data-theme="parchment"] {\n',
+    also: {
+      from:
+        "  --tok-function-name: var(--syn-function);\n}\n\n/* Abyss - a cool deep-blue dark scheme",
+      to:
+        "  --tok-function-name: var(--syn-function);\n}\n}\n\n/* Abyss - a cool deep-blue dark scheme",
+    },
+    suite: "test:theme",
+    // THREE assertions fail, and all three are honest consequences of the one
+    // idea rather than rot: 10a and 10b scan top-level rules, so a scheme
+    // scoped to screen genuinely has no unconditional block and genuinely
+    // cannot be shown to override its base on paper. Listed here so the record
+    // is complete - the harness only checks that `expect` MATCHES, so an
+    // unlisted failure would otherwise go unmentioned.
+    expect: [
+      /10i: the print stylesheet alone does not neutralise a scheme, so the export park is load-bearing \(control\)/,
+      /every registered non-base scheme has a body\[data-theme\] block in the stylesheet/,
+      /parchment: overrides every literal its mode's base declares/,
+    ],
+  },
+  {
+    id: "R349",
+    // THE OTHER FLOOR: `darkAware >= 20` against a real count of 56, so two of
+    // the three popup surfaces could have stopped being boolean-themed
+    // altogether and the control would still have passed with 36 to spare.
+    // This makes ONE handler read ONE token-layer variable - the smallest
+    // possible version of a popup joining the scheme layer, and one that spells
+    // no scheme id, so the marker sweep beside it stays green. The old floor
+    // could not express it; the per-handler relationship fails on it.
+    what: "let the table popup take one colour from the app's token layer instead of its own literal",
+    file: MAIN,
+    from: "ipcMain.on(\"open-table-popup\", (event, data) => {\n",
+    to:
+      "ipcMain.on(\"open-table-popup\", (event, data) => {\n" +
+      "  const popupAccent = \"var(--primary-color)\";\n" +
+      "  void popupAccent;\n",
+    suite: "test:theme",
+    expect: [
+      /10i: every popup handler paints literal colours chosen by isDarkMode and reads no token-layer variable/,
+    ],
+  },
+  {
+    id: "R350",
+    // THE REVERT IS INVISIBLE BY CONSTRUCTION, WHICH IS WHY IT NEEDS ITS OWN
+    // ASSERTION. --primary-color is declared on body in all six theme states,
+    // so this fallback can never paint: every colour, contrast, fidelity and
+    // stranded-accent assertion in the suite keeps passing, and a screenshot
+    // is byte-identical. Only a scan that reads the DECLARATION rather than
+    // the painted result can see it. #2d9cdb is the real pre-Folia accent this
+    // rule shipped with, so this is the exact line that was removed.
+    what: "restore the pre-Folia literal colour fallback on the theme-menu checkmark",
+    file: CUSTOM_CSS,
+    from: "  color: var(--primary-color);\n  font-weight: 700;\n",
+    to: "  color: var(--primary-color, #2d9cdb);\n  font-weight: 700;\n",
+    suite: "test:theme",
+    // BOTH 10f2 ASSERTIONS FIRE, AND THAT IS CORRECT RATHER THAN COLLATERAL.
+    // The first says the fallback is a LITERAL COLOUR, which is the defect;
+    // the second says the file's total var()-fallback INVENTORY is what was
+    // recorded, and adding a fallback of any kind moves that count by one. The
+    // inventory assertion is what stops a literal being smuggled in under a
+    // spelling the first one does not recognise, so a revert that adds one
+    // must trip it - naming only the first understated the revert, which the
+    // expect-completeness report caught.
+    expect: [
+      /10f2: no rule falls back to a literal colour when a token is missing/,
+      /10f2: the product's var\(\) fallback inventory is exactly what was recorded/,
+    ],
+  },
+  {
+    id: "R351",
+    // THE SHIPPED DEFECT, PER SCHEME. Before the foreground was named, the two
+    // code-selection rule groups overrode `background` only, so the app-wide
+    // `::selection { color: var(--on-accent-fg) }` won the ink for code as
+    // well. abyss's accent is LIGHT, so its --on-accent-fg is near-black
+    // #11151c, and selecting code repainted the entire syntax palette in it at
+    // 2.18:1 measured off the live cascade. This revert reproduces exactly that
+    // by pointing abyss's own foreground back at --on-accent-fg - and the
+    // harness confirms the number, printing 2.18 for all 55 cells.
+    //
+    // THE COMMENT USED TO SAY 1.48:1 AND THAT WAS STALE. It was measured while
+    // abyss's highlight was still at 16% alpha; the shipped 35% composites to
+    // rgb(60, 78, 113), against which #11151c is 2.18. A revert whose stated
+    // justification does not describe what the revert actually does is exactly
+    // the stale-measurement defect this project treats as real, so it is
+    // recorded here rather than quietly corrected.
+    //
+    // R354 removes the declaration outright, which is the same defect at the
+    // rule level; this one is the likelier accident - a scheme author reusing
+    // the variable that already means "ink on my accent", which is a
+    // perfectly reasonable thing to believe it means.
+    //
+    // NOTHING ELSE IN THE SUITE CAN SEE IT. No element carries the selection
+    // background, so 10d never samples it, 10g cannot replay a pseudo-element
+    // onto a real node, and the golden was captured with nothing selected.
+    what: "point abyss's selected-code ink back at --on-accent-fg, the pre-fix behaviour",
+    file: CSS,
+    from: "  --code-selection-fg: #d8dee9;",
+    to: "  --code-selection-fg: var(--on-accent-fg);",
+    suite: "test:theme",
+    expect: [/abyss: selected code at full opacity is legible against its own highlight/],
+    mustPass: [/abyss: the selection highlight is still visible against the code behind it/],
+  },
+  {
+    id: "R352",
+    // THE OPPOSITE FAILURE, AND THE REASON THE VISIBILITY FLOOR EXISTS.
+    // Legibility through the highlight is bought with alpha, so the cheapest
+    // way to satisfy every legibility assertion in 10l is to stop highlighting
+    // at all - and 2% passes all of them with room to spare while the reader
+    // can no longer tell what is selected. Only the floor notices.
+    what: "buy selection legibility by making the highlight almost invisible",
+    file: CSS,
+    from: "  --code-selection-bg: rgba(224, 164, 88, 0.32);",
+    to: "  --code-selection-bg: rgba(224, 164, 88, 0.02);",
+    suite: "test:theme",
+    expect: [/ember: the selection highlight is still visible against the code behind it/],
+    mustPass: [/ember: selected code at full opacity is legible against its own highlight/],
+  },
+  {
+    id: "R353",
+    // THE LIGHT DEFAULT'S FLOOR, WHICH WAS A NON-ASSERTION UNTIL IT WAS
+    // MEASURED. It stood at 1.0 - a value every conceivable colour clears -
+    // because the real number had never been printed: the assertion passed, so
+    // nothing ever forced it to say what it was passing at. Measured, the
+    // light default's selection is visible at 12.05:1 - Solarized Light's own
+    // #073642 is opaque navy over cream, overwhelmingly visible and bought at
+    // the cost of the ink it covers - so SELECTION_VISIBLE_FLOOR["light
+    // default"] is pinned at 12.0. The byte-exact constraint owns that value,
+    // so the floor records what it MEASURES rather than what it ought to be;
+    // what the floor defends is that nothing walks it down.
+    //
+    // (An earlier draft of this note quoted "2.42" here and 12.05 three lines
+    // later, for the same quantity, and named the map `DEFAULT_SELECTION_FLOOR`
+    // - an identifier that no longer exists. Both were corrected against the
+    // shipped code rather than reasoned about.)
+    //
+    // THAT MATTERS MORE THAN IT LOOKS, and the reason is NOT the one this note
+    // used to give. It claimed 10l's per-scheme bars are RELATIVE to their
+    // mode's default, so a degraded default would drag every scheme's bar down
+    // with it. That is simply false of the shipped section: the bars are the
+    // absolutes SELECTION_FLAT_MIN (4.5) and SELECTION_TOKEN_MIN (3.0) plus
+    // the per-state recorded numbers in SELECTION_VISIBLE_FLOOR, and no scheme
+    // is ever compared against its mode's default there. R265's own note says
+    // as much. The real hazard is quieter: every one of those floors is a
+    // RECORDED number, and a recorded number is only as good as the run that
+    // recorded it, so what needs guarding is a silent walk-down of the record
+    // itself - which is exactly what this revert performs.
+    //
+    // The revert repaints the frozen light default's selection in a warm cream
+    // barely distinguishable from the Solarized code background it sits on, and
+    // darkens the ink to match, so the highlight stays perfectly LEGIBLE (10.4:1)
+    // while becoming almost invisible (1.26:1). That isolates the floor: an
+    // edit that made the selection illegible would be caught by three other
+    // assertions, so it would prove nothing about this one.
+    //
+    // RE-DERIVED AFTER THE FOREGROUND FIX. An earlier form repainted the
+    // background alone in one of the light default's own token colours, on the
+    // reasoning that a token would then land at 1.0:1. That reasoning belonged
+    // to a regime the product does not have: selected code is repainted in ONE
+    // flat ink, so the tokens underneath are never seen and the failure landed
+    // on legibility rather than on the floor. Two edits are needed because the
+    // ink and the fill move together.
+    what: "make the frozen light default's code selection legible but nearly invisible",
+    file: CSS,
+    from: "  --code-selection-bg: #073642; /* base02 */",
+    to: "  --code-selection-bg: #e8dcc0; /* base02 */",
+    also: {
+      from: "     --on-accent-fg. */\n  --code-selection-fg: #ffffff;",
+      to: "     --on-accent-fg. */\n  --code-selection-fg: #2b2b2b;",
+    },
+    suite: "test:theme",
+    expect: [
+      /light default: the selection highlight is still visible against the code behind it/,
+      /light: ::selection paints what the golden recorded/,
+      // NAMED RATHER THAN LEFT UNDER `~`, which is this file's own rule and
+      // R353 was quietly breaking it. The `also` clause moves the light
+      // default's --code-selection-fg from #ffffff to #2b2b2b, and
+      // theme-census.js reads that value into selectionComputed.preFg and
+      // preCodeFg, both of which the golden pins at rgb(255,255,255). So the
+      // INK assertion CANNOT survive this revert - it was being reported as an
+      // anonymous consequence of a revert that is precisely about the ink.
+      // The inline visibility bar is the second: it postdates R353 and
+      // measures the same darkened fill from the other side.
+      /light: ::selection paints the golden's INK, not just its fill/,
+      /light default: the selection highlight is still visible against INLINE code's own background/,
+    ],
+    mustPass: [
+      /light default: selected code at full opacity is legible against its own highlight/,
+      /dark default: the selection highlight is still visible against the code behind it/,
+    ],
+  },
+  {
+    id: "R354",
+    // THE DEFECT ITSELF, AT THE RULE LEVEL, AND IT SHIPPED. The code-selection
+    // rule overrode `background` alone until a dual review found it; the
+    // app-wide `::selection { color: var(--on-accent-fg) }` therefore won the
+    // COLOUR for code too, repainting the whole syntax palette in the ink meant
+    // for a button label sitting on the accent. White in the two frozen
+    // defaults (harmless), near-black in abyss and ember whose accents are
+    // light. Measured rather than reasoned about: an unselected block paints
+    // 1264 distinct colours, a selected one 128, and the real contrasts were
+    // 1.36 (clarity), 1.55 (parchment), 2.18 (abyss), 2.15 (ember). Ten
+    // sections of assertions reported a clean sweep over it, because 10l's
+    // first version composited the tint and scored the TOKEN colours - which is
+    // what the stylesheet looks like it does.
+    //
+    // THE ABYSS AND EMBER NUMBERS WERE STALE FOR A WHILE (1.48 and 1.59),
+    // having been read at the 16%/18% alphas those two highlights carried
+    // before they were raised to the shipped 35%/32%. The light schemes'
+    // pastels are opaque, so 1.36 and 1.55 never moved - and that asymmetry is
+    // what exposed the staleness.
+    //
+    // A NOTE THAT USED TO SIT HERE said only the standard rule was reverted
+    // because a ::-moz-selection twin existed and was inert. That twin has
+    // since been DELETED from the stylesheet (see the comment on the rule, and
+    // R357), so there is now exactly one rule and no choice to explain.
+    what: "let the app-wide accent ink win the colour of selected code again",
+    file: CSS,
+    from: 'code[class*="language-"] ::selection {\n  background: var(--code-selection-bg);\n  color: var(--code-selection-fg);\n',
+    to: 'code[class*="language-"] ::selection {\n  background: var(--code-selection-bg);\n',
+    suite: "test:theme",
+    expect: [
+      /clarity: selected code at full opacity is legible against its own highlight/,
+      /parchment: selected code at full opacity is legible against its own highlight/,
+      /abyss: selected code at full opacity is legible against its own highlight/,
+      /ember: selected code at full opacity is legible against its own highlight/,
+      // The dimmed bucket fails alongside the undimmed one in the two LIGHT
+      // schemes only, because --tok-namespace-opacity is 0.7 in :root and 1 in
+      // body.dark-mode, so abyss and ember have no dimmed cell to fail.
+      /clarity: selected code that inherits dimming chose a colour that was legible before it/,
+      /parchment: selected code that inherits dimming chose a colour that was legible before it/,
+      // The belt, which had to be REWRITTEN before it could fail here. Its old
+      // form named only --code-selection-bg (this revert deletes the FOREGROUND)
+      // and was a `some()` across two vendor groups at once, so the inert
+      // ::-moz-selection group answered for the standard one. It reported
+      // WRONG-GUARD, which is exactly what that verdict is for.
+      /every code ::selection rule consumes both selection variables/,
+      // AND THE DIMMED-EFFECTIVE BAR, measured rather than predicted. With the
+      // ink lost to the accent, the dimmed cell in each LIGHT scheme fails on
+      // BOTH of its assertions - the colour it chose (1.36) and what that
+      // colour is worth after the 0.7 multiplier (1.24). Two claims, two
+      // failures; leaving the second unlisted made this record read as if the
+      // dimming bar were unaffected.
+      /clarity: selected code that inherits dimming is still readable after it \(3:1\)/,
+      /parchment: selected code that inherits dimming is still readable after it \(3:1\)/,
+      // The ink's painted-vs-declared pair, added after this revert run showed
+      // the fill had one and the ink did not.
+      /10l: the selection ink that paints is the one --code-selection-fg declares/,
+    ],
+    // The two frozen defaults must survive it: their --on-accent-fg is white,
+    // which is byte-identical to the --code-selection-fg they declare. That
+    // asymmetry is the whole reason the defect was invisible to a human
+    // checking the default themes.
+    mustPass: [
+      /light default: selected code at full opacity is legible against its own highlight/,
+      /dark default: selected code at full opacity is legible against its own highlight/,
+    ],
+  },
+  {
+    id: "R355",
+    // THE REGIME, WHICH IS A DECISION RATHER THAN A DETAIL. `color:
+    // currentColor` on a ::selection rule really does carry the syntax palette
+    // THROUGH the highlight in Chromium - measured, 1264 distinct colours
+    // selected against 128 for a flat repaint, while `revert`, `unset` and
+    // `revert-layer` all do nothing. It was rejected for the defaults because
+    // 4bbde83:styles.css:1085 proves a flat white ink is the frozen baseline,
+    // and the byte-exact constraint owns that. But it is a one-word edit that
+    // looks strictly more faithful to the syntax colours, so 10l asserts the
+    // regime instead of assuming it: flipping it changes which bar applies to
+    // every state at once, and someone has to say so out loud.
+    what: "let the syntax palette survive the selection highlight",
+    file: CSS,
+    from: 'code[class*="language-"] ::selection {\n  background: var(--code-selection-bg);\n  color: var(--code-selection-fg);\n',
+    to: 'code[class*="language-"] ::selection {\n  background: var(--code-selection-bg);\n  color: currentColor;\n',
+    suite: "test:theme",
+    // The REGIME assertion is the one this entry exists for. The rest are the
+    // honest consequences of the flip and are named so the record is complete:
+    // with the palette carried through, the two frozen defaults and the two
+    // dark schemes now have tokens scored against their own tint and several
+    // fall under the applicable bar - which is the substance of the argument
+    // for a flat repaint, not a side effect to be waved through. The belt fails
+    // too, because `currentColor` means --code-selection-fg is no longer
+    // consumed at all.
+    expect: [
+      /10l: selected code is repainted in one flat ink in every state, not left as the syntax palette/,
+      /every code ::selection rule consumes both selection variables/,
+      /light default: selected code at full opacity is legible against its own highlight/,
+      /light default: selected code that inherits dimming chose a colour that was legible before it/,
+      /dark default: selected code at full opacity is legible against its own highlight/,
+      /abyss: selected code at full opacity is legible against its own highlight/,
+      /ember: selected code at full opacity is legible against its own highlight/,
+      // THE GOLDEN'S INK, which is the half of the frozen-default guarantee
+      // this flip actually breaks: the fill still matches, the ink becomes each
+      // element's own foreground instead of the recorded white. Unlisted until
+      // it was measured, which made the record claim the defaults' recorded
+      // appearance survived the flip. It does not.
+      /light: ::selection paints the golden's INK, not just its fill/,
+      /dark: ::selection paints the golden's INK, not just its fill/,
+      // The dimmed-effective bar, same pairing as R354.
+      /light default: selected code that inherits dimming is still readable after it \(3:1\)/,
+      /parchment: selected code that inherits dimming is still readable after it \(3:1\)/,
+      // currentColor means the painted ink is each element's own foreground, so
+      // it stops agreeing with --code-selection-fg everywhere at once.
+      /10l: the selection ink that paints is the one --code-selection-fg declares/,
+    ],
+  },
+  {
+    id: "R356",
+    // THE ESCAPE THE OLD MATCHER CERTIFIED AS CORRECT. 10f2's first version
+    // found var() expressions with a regex, so `var(--a, var(--b, #fff))`
+    // handed it ` var(--b, #fff)` - which does not begin with a colour - and
+    // its lastIndex then skipped past the inner expression entirely. Worse, the
+    // negative control asserted that a var() CHAIN must not be caught, so the
+    // suite actively certified the escape. This revert removes the recursion
+    // from the paren-aware parser that replaced it.
+    //
+    // IT FAILS TWO ASSERTIONS FROM TWO DIRECTIONS, which is the layered
+    // coverage working: the positive control misses the planted nested hex,
+    // and the plant's fallback COUNT drops from 11 to 10 - that eleventh
+    // fallback exists only because the nested walk happens, so the number is
+    // itself a standing check on it.
+    what: "stop the literal-fallback scan recursing into nested var() fallbacks",
+    file: THEME_TEST,
+    from: "          if (fb) findVars(fb, out);",
+    to: "          if (false) findVars(fb, out);",
+    suite: "test:theme",
+    expect: [
+      /10f2: the literal-fallback scan catches every colour spelling and spares a legitimate one \(positive control\)/,
+      /10f2: the literal-fallback scan really traversed the product's stylesheets/,
+    ],
+    mustPass: [/10f2: no rule falls back to a literal colour when a token is missing/],
+  },
+  {
+    id: "R357",
+    // THE WELL-MEANING EDIT THAT SILENTLY DELETES CODE SELECTION.
+    // The product used to carry a `::-moz-selection` twin of this rule,
+    // inherited from the vendored PrismJS theme. It was removed because
+    // Chromium DROPS AN UNRECOGNISED PSEUDO-ELEMENT'S WHOLE RULE at parse time,
+    // so it never entered document.styleSheets and no assertion here could
+    // reach it. (An assertion written over the CSSOM to pin it failed on a
+    // clean tree while a revert against it looked PROVEN - a false proof, and
+    // the reason this entry exists in its present form rather than its first.)
+    //
+    // This revert is the obvious way someone re-adds Firefox support: fold the
+    // prefixed selectors into the existing list. It reads as strictly additive
+    // and is catastrophic. A comma-separated selector list is NOT forgiving
+    // outside :is() - ONE invalid selector invalidates the ENTIRE rule - so the
+    // whole group vanishes, code selection falls back to the app-wide accent,
+    // and the F1 defect R354 pins is reintroduced by an edit that appears to
+    // add nothing but breadth. Measured directly: planting
+    // `pre.pboth::-moz-selection, pre.pboth::selection { ... }` yields ZERO
+    // CSSOM rules, against 1 for the unprefixed rule alone.
+    //
+    // The correct way to support both is TWO SEPARATE RULES, which is what the
+    // product had. The failure is not "prefixes are bad", it is "prefixes must
+    // not share a selector list".
+    what: "fold ::-moz-selection back into the code selection selector list",
+    file: CSS,
+    from: 'pre[class*="language-"]::selection,\npre[class*="language-"] ::selection,',
+    to: 'pre[class*="language-"]::-moz-selection,\npre[class*="language-"]::selection,\npre[class*="language-"] ::selection,',
+    suite: "test:theme",
+    // WHAT ACTUALLY FAILS, MEASURED - and the first draft of this list got it
+    // wrong in a way worth recording. It named the four schemes' legibility
+    // assertions as "the user-visible damage", reasoning that the accent ink
+    // returns and clarity/parchment/abyss/ember drop to 1.36-2.18:1. They do,
+    // on screen. But those assertions score the DECLARED --code-selection-bg /
+    // --code-selection-fg pair, and deleting the RULE does not touch the
+    // variables - so every one of them passes while the schemes are visibly
+    // broken. The entry reported WRONG-GUARD on the first real run, six named
+    // assertions green.
+    //
+    // That is the whole argument for the painted-vs-declared assertion: for the
+    // four schemes it is the ONLY thing here that fails, because the golden
+    // covers the two frozen defaults alone. Note what that means for the
+    // record - a `--expects` pass proves the names exist, not that they fail.
+    expect: [
+      // The cause: no rule survived parsing at all.
+      /every code ::selection rule consumes both selection variables/,
+      // The consequence in the two frozen defaults, against the golden.
+      /light: ::selection paints what the golden recorded/,
+      /dark: ::selection paints what the golden recorded/,
+      // And the consequence in all six states at once - the accent paints where
+      // the variable says something else. The only assertion that catches this
+      // for the four schemes.
+      /10l: the selection fill that paints is the one --code-selection-bg declares/,
+      /10l: the selection ink that paints is the one --code-selection-fg declares/,
+      // THE TWO FROZEN DEFAULTS FAIL ON CONTRAST TOO, and only they do. Their
+      // recorded selection is a dark navy or a translucent teal; replacing it
+      // with the opaque accent moves the backdrop every cell is scored against,
+      // and the light default's visibility floor goes with it. The four schemes
+      // are NOT scored against the accent, which is the asymmetry that made the
+      // first draft of this list wrong in both directions.
+      /light default: selected code at full opacity is legible against its own highlight/,
+      /light default: selected code that inherits dimming chose a colour that was legible before it/,
+      /light default: selected code that inherits dimming is still readable after it/,
+      /light default: the selection highlight is still visible against the code behind it/,
+      /dark default: selected code at full opacity is legible against its own highlight/,
+    ],
+  },
+  {
+    id: "R358",
+    // THE MUTATION BOTH REVIEWERS SAID MOVED NOTHING, AND THEY WERE RIGHT.
+    // The census recorded ::selection's backgroundColor only, so the frozen
+    // defaults' selection INK was byte-exact by ARGUMENT (4bbde83's app-wide
+    // rule declared a literal `color: #ffffff` and --on-accent-fg did not yet
+    // exist) rather than by measurement. Both models reached that
+    // independently and it was the single finding they agreed on.
+    //
+    // A NEARLY-WHITE VALUE IS THE HONEST REVERT, not a wild one. #e8e8e8 is
+    // still perfectly legible - it clears every contrast bar in the suite with
+    // room to spare (the light default's selection measures 13.00:1 with white
+    // and ~11.6:1 with this) - so nothing scored on RATIOS can catch it. What
+    // it is not is byte-exact, and byte-exact is the user's stated constraint
+    // for the two defaults. So this revert bites exactly one assertion, and
+    // that assertion had to be added for it to bite at all.
+    //
+    // The dark default is deliberately NOT the subject: light and dark declare
+    // the same literal, and picking the one whose golden entry is reproduced
+    // without an amendment keeps the failure unambiguous.
+    what: "shift the light default's selection ink off the frozen white",
+    file: CSS,
+    from: "     dark default for why this is a variable rather than the app-wide\n     --on-accent-fg. */\n  --code-selection-fg: #ffffff;",
+    to: "     dark default for why this is a variable rather than the app-wide\n     --on-accent-fg. */\n  --code-selection-fg: #e8e8e8;",
+    suite: "test:theme",
+    expect: [/light: ::selection paints the golden's INK, not just its fill/],
+    // The fidelity of the FILL and every ratio-scored assertion must survive,
+    // or this would be proving "a wrong colour fails something" rather than
+    // "an off-by-a-shade ink is caught by the assertion written for it".
+    mustPass: [
+      /light: ::selection paints what the golden recorded/,
+      /dark: ::selection paints the golden's INK, not just its fill/,
+      /light default: selected code at full opacity is legible against its own highlight/,
+    ],
+  },
+  {
+    id: "R359",
+    // THE VACUOUS SAMENESS CLAIM. 10i asserts that the payload a popup really
+    // receives is identical in every theme state but for the mode boolean, and
+    // it computed that over `JSON.stringify(payload.tableData)`. That returns
+    // the VALUE undefined - not a string - when tableData is absent, so the
+    // outer stringify dropped the key entirely and all six states read back
+    // identically ABSENT. A set of one, from six payloads carrying no content.
+    // This revert empties the content at the source the probe actually drives
+    // (the render path's maximise button, renderer.js:4889) while leaving the
+    // payload's KEY SET untouched, so the structural and key assertions stay
+    // green and only the content floor bites.
+    what: "send a table popup with no table in it",
+    file: RENDERER,
+    from: "      const tableData = extractTableData(table);",
+    to: "      const tableData = undefined;",
+    suite: "test:theme",
+    expect: [
+      /10i: the payload a popup really receives is the same in every scheme but for the mode boolean/,
+    ],
+    mustPass: [
+      /10i: no popup-open payload carries anything but its content and the mode boolean/,
+      /10i: every popup-open payload in the renderer was really parsed \(positive control\)/,
+    ],
+  },
+  {
+    id: "R360",
+    // THE GUESSED FLOOR. `popupSites.length >= 5` stood as the parse control,
+    // and 5 was a number with nothing behind it - it happened to equal the real
+    // total, so it read like a measurement while being blind to a site
+    // APPEARING. A new send site is a payload literal nobody has reviewed,
+    // which is the exact thing the leak sweep beside it exists to review.
+    // The added site is inert (guarded on a global nothing sets), so it changes
+    // no behaviour and spells no scheme marker: only a count can see it.
+    what: "add an unreviewed sixth popup send site",
+    file: RENDERER,
+    from:
+      "      ipcRenderer.send('open-table-popup', { tableData, isDarkMode });\n" +
+      "    });",
+    to:
+      "      ipcRenderer.send('open-table-popup', { tableData, isDarkMode });\n" +
+      "      if (window.__foliaR360NeverTrue) {\n" +
+      "        ipcRenderer.send('open-table-popup', { tableData, isDarkMode });\n" +
+      "      }\n" +
+      "    });",
+    suite: "test:theme",
+    expect: [/10i: every popup-open payload in the renderer was really parsed \(positive control\)/],
+    mustPass: [
+      /10i: no popup-open payload carries anything but its content and the mode boolean/,
+      /10i: the payload a popup really receives is the same in every scheme but for the mode boolean/,
+    ],
+  },
+  {
+    id: "R361",
+    // THE BARE-SUBSTRING MATCHER - the matcher this sweep would have used
+    // before schemeMentions grew its word boundaries, NOT what ships today.
+    // The shipped per-handler sweep calls schemeMentions(), the same
+    // comment-stripped, \b-bounded matcher the file-wide sweep uses; this
+    // revert re-introduces the loose form so its cost stays measurable.
+    // `ember` sits inside `Remember` and `member`, so an honest handler could
+    // be failed by a word in its own prose - and a false alarm on a leak sweep
+    // is not harmless, because chasing one teaches the next reader to loosen
+    // the sweep.
+    //
+    // THE FALSE POSITIVE IS NOT HYPOTHETICAL AND THIS REVERT MEASURES IT.
+    // main.js:1232 reads "// ... unsaved edits. Remember the new" - a comment
+    // about the file watcher, twenty lines from the popup handlers. It never
+    // bit only because the FILE-WIDE sweep happened to use a quoted matcher
+    // while the per-handler one did not; unifying the two on the bare form
+    // fails the real file immediately. That second failure is listed here
+    // rather than left unnamed, because it is the evidence.
+    what: "match scheme ids as bare substrings, prose included",
+    file: THEME_TEST,
+    from:
+      "      for (const id of NON_BASE_IDS) {\n" +
+      '        if (new RegExp("\\\\b" + id + "\\\\b").test(code)) hits.push(id);\n' +
+      "      }",
+    to:
+      "      for (const id of NON_BASE_IDS) {\n" +
+      "        if (text.includes(id)) hits.push(id);\n" +
+      "      }",
+    suite: "test:theme",
+    expect: [
+      /10i: the scheme-leak sweep catches an unquoted id and ignores the same letters in prose \(control\)/,
+      /10i: the main process, which owns every popup window, knows nothing about colour schemes/,
+    ],
+  },
+  {
+    id: "R362",
+    // THE OPPOSITE MISTAKE, and the reason the fix is not simply "require
+    // quotes". A popup handler builds its CSS as a TEMPLATE LITERAL, so a
+    // leaked id - `body.theme-ember`, `.scheme-abyss` - carries no quotes
+    // around the id at all. A quoted-literal matcher is quiet on prose and
+    // quiet on the real defect too. Deliberately a separate entry from R361:
+    // the two failures name the two directions, and a future edit that fixes
+    // one by reintroducing the other cannot pass both.
+    what: "match scheme ids only as quoted string literals",
+    file: THEME_TEST,
+    from:
+      "      for (const id of NON_BASE_IDS) {\n" +
+      '        if (new RegExp("\\\\b" + id + "\\\\b").test(code)) hits.push(id);\n' +
+      "      }",
+    to:
+      "      for (const id of NON_BASE_IDS) {\n" +
+      "        if (code.includes('\"' + id + '\"') || code.includes(\"'\" + id + \"'\")) hits.push(id);\n" +
+      "      }",
+    suite: "test:theme",
+    expect: [
+      /10i: the scheme-leak sweep catches an unquoted id and ignores the same letters in prose \(control\)/,
+    ],
+  },
+  {
+    id: "R363",
+    // THE ACCIDENT THE CHROME PROBE'S SELF-GUARD EXISTS FOR, reproduced
+    // exactly. 10j's chrome assertions are the only ones in the section read
+    // off getBoundingClientRect, and the submenu is display:none while shut -
+    // so with the menu dismissed every rect collapses to zero, every label
+    // inset becomes 0, and the alignment spread reads a PERFECT 0. A vacuous
+    // pass and a flawless result are the same number.
+    //
+    // Deliberately a TEST-side revert (precedent: R361/R362), because the
+    // realistic accident is not a CSS regression - it is a future edit
+    // reordering this section so the chrome is measured after the menu has
+    // been dismissed. `document.body.click()` is the product's own dismissal
+    // path, the same one MENU_PATH_PROBE opens with, so nothing here strips a
+    // class by hand. It stays contained: MENU_CLICKS below reopens the menu
+    // through MENU_PATH_PROBE on every iteration.
+    //
+    // The ::before content assertions survive on purpose and are listed in
+    // mustPass: getComputedStyle reads a pseudo-element's `content` on a
+    // display:none subtree perfectly well, which is precisely why those two
+    // could not have caught this and why the geometric guard had to be added.
+    what: "measure the submenu chrome after the menu has been dismissed",
+    file: THEME_TEST,
+    from: "    const chrome = JSON.parse(await exec(CHROME_PROBE));",
+    to:
+      '    await exec("document.body.click()");\n' +
+      "    const chrome = JSON.parse(await exec(CHROME_PROBE));",
+    suite: "test:theme",
+    expect: [
+      /10j: the scheme submenu was open and painted when its chrome was measured \(probe self-guard\)/,
+      /10j: every scheme label starts at the same x/,
+      /10j: each scheme group carries a caption that renders/,
+      // The mode rows collapse to zero rects for exactly the same reason, and
+      // they are named rather than left unlisted: the self-guard above covers
+      // the SCHEME rows only, so without these three the record would suggest
+      // the mode-row geometry survives a dismissed menu. It does not - every
+      // inset reads 0 and every spread reads a flawless 0 with it.
+      /10j: every mode row's tick gutter ends at the same x, ticked or not/,
+      /10j: every mode row's text label starts at the same x, ticked or not/,
+      /10j: mode rows and scheme rows share ONE tick gutter/,
+      // The icon-width control goes with them: a dismissed menu paints no icon,
+      // so the number the text/gutter comparison is scaled against is zero.
+      /10j: the mode row's text really is a different measurement from its gutter \(control\)/,
+    ],
+    mustPass: [
+      /10j: a ticked scheme row really paints a checkmark/,
+      /10j: an unticked scheme row paints no checkmark \(control\)/,
+      /10j: every scheme row was reached and clicked as a mouse would reach it/,
+    ],
+  },
+  {
+    id: "R364",
+    // THE MODE ROWS' GUTTER AS IT WAS AT ca1ac9e - a pair of hand-tuned
+    // margins, 6px beside the checkmark and 20px in place of it, approximating
+    // an alignment that the shared 12px box now guarantees. This work rebuilt
+    // that gutter underneath three PRE-EXISTING rows (Light / Dark / Follow
+    // Desktop) and nothing measured the result, which is what this entry and
+    // the two assertions it names exist to fix.
+    //
+    // The scheme rows keep their box on purpose: the revert splits the shared
+    // rule rather than deleting it, so the failure is specifically "the two
+    // groups no longer share one gutter" and not "the gutter is gone". That is
+    // the realistic accident - retuning one group and not the other - and it
+    // is the one no per-group assertion can see.
+    //
+    // MEASURED, AND IT SETTLES WHETHER THE CHANGE WAS AN IMPROVEMENT: under
+    // this revert the mode-row gutter insets read [34, 40, 40] against the
+    // scheme rows' uniform [32 x 6]. So the old margins did not merely differ
+    // from the scheme rows - THEY DID NOT ALIGN THE MODE ROWS WITH EACH OTHER
+    // EITHER. The ticked row sat 6px left of the other two, a jitter that moved
+    // down the menu as the reader changed mode, and it had been shipping since
+    // long before this work. That is why these assertions fail here and all are
+    // named: the jitter is the pre-existing defect, and it was invisible until
+    // something measured it.
+    // THE TEXT ASSERTION IS LISTED SEPARATELY from the gutter one because they
+    // are genuinely two measurements - the gutter inset is read at the icon's
+    // edge and the label at its own text node - and this revert moves both.
+    what: "give the mode rows their own margin-based tick gutter again",
+    file: CUSTOM_CSS,
+    from: '#customThemeMenuItem .custom-theme-option::before,\n#customThemeMenuItem .custom-scheme-option::before {',
+    to:
+      '#customThemeMenuItem .custom-theme-option::before {\n' +
+      '  content: "";\n' +
+      "  display: inline-block;\n" +
+      "  margin-right: 20px;\n" +
+      "}\n" +
+      "#customThemeMenuItem .custom-theme-option.active::before {\n" +
+      "  margin-right: 6px;\n" +
+      "}\n" +
+      "#customThemeMenuItem .custom-scheme-option::before {",
+    suite: "test:theme",
+    expect: [
+      /10j: mode rows and scheme rows share ONE tick gutter/,
+      /10j: every mode row's tick gutter ends at the same x, ticked or not/,
+      /10j: every mode row's text label starts at the same x, ticked or not/,
+      // The ledger assertion asserts BOTH halves of the recorded decision, and
+      // this revert breaks the applied half: the live geometry goes back to the
+      // very [34, 40, 40] the entry records as `was`. Listed rather than left
+      // unlisted, because it is the same measurement from the register's side.
+      /10j: the mode-row gutter change is recorded as a decision/,
+    ],
+    mustPass: [
+      /10j: every scheme label starts at the same x/,
+      /10j: the scheme submenu was open and painted when its chrome was measured/,
+    ],
+  },
+  {
+    id: "R365",
+    // THE INSTRUMENT DEFECT THAT FABRICATED A FULLY-FORMED MEASUREMENT,
+    // reproduced exactly rather than approximated by deleting its guard.
+    //
+    // 10g replays each hover rule's declarations onto the real element. The
+    // obvious way to enumerate them is `for (i < rule.style.length)` - and a
+    // SHORTHAND HOLDING var() is a pending-substitution value, so the CSSOM
+    // enumerates it as its longhands and serialises every one as the EMPTY
+    // STRING. `background: var(--primary-color)`, which is how every accent
+    // fill in this product is written, is therefore SILENTLY DROPPED. The
+    // probe then measured each hover INK against the element's RESTING
+    // background and reported .btn:hover at 1.23:1 in every state - a
+    // confident, entirely fictitious ratio naming a real rule as broken.
+    //
+    // A dropped fill is indistinguishable from a real failure, which is why
+    // the declaredBg/landedBg/droppedBg control exists. This entry is what
+    // makes that control load-bearing: without it the reverted collector
+    // reports plausible numbers forever. Note the shape - the revert restores
+    // the DEFECT, so the assertion that must fail is the control, not a
+    // contrast bar.
+    what: "enumerate 10g declarations off rule.style again, dropping every var() shorthand",
+    file: THEME_TEST,
+    from:
+      "              const block = rule.cssText.slice(\n" +
+      "                rule.cssText.indexOf('{') + 1, rule.cssText.lastIndexOf('}'));",
+    to:
+      "              for (let di = 0; di < rule.style.length; di++) {\n" +
+      "                const p = rule.style[di];\n" +
+      "                decls.push([p, rule.style.getPropertyValue(p)]);\n" +
+      "              }\n" +
+      "              const block = '';",
+    suite: "test:theme",
+    // THE UNLISTED FAILURES ARE THE EVIDENCE, so they are named rather than
+    // left under the `~` marker. With the accent fills dropped, every scheme's
+    // hover ink is scored against the element's RESTING background, so seven
+    // contrast assertions fail naming real, correct rules as broken - which is
+    // precisely the fabricated-measurement disease. A record that listed only
+    // the control would understate what this revert demonstrates.
+    expect: [
+      /hover replay: every rule that declares a background really carried one into the measurement/,
+      /every hover cell it paints at full opacity meets its WCAG minimum/,
+      /no hover cell that was already below its minimum in the default is made worse/,
+      /every hover cell that met its minimum in the default still meets it/,
+    ],
+  },
+  {
+    id: "R366",
+    // THE CASCADE-POSITION DEFECT, and it is the one accident the comment in
+    // styles.css warns about but nothing measured.
+    //
+    // `.markdown-body code` and `code[class*="language-"]` are BOTH (0,1,1), so
+    // a Prism-highlighted <code class="language-x"> inside a <pre> matches both
+    // and the tie is broken by SOURCE ORDER alone. The inline-code colour pair
+    // therefore has to sit BEFORE the syntax block. Moving it after - which is
+    // what tidying the file, or appending "one more code rule" at the end,
+    // naturally does - silently repaints every highlighted block with the
+    // INLINE code background and foreground.
+    //
+    // This is a genuine MOVE, not a value change: the rule is neutralised where
+    // it stands and re-added verbatim after the syntax block. Cascade position
+    // was the dominant defect class when this block was first inlined (8 of the
+    // first run's 50 failures), and until now nothing pinned it.
+    what: "move the inline-code colour rule AFTER the syntax block, inverting the source-order tie",
+    file: CSS,
+    from:
+      ".markdown-body code {\n" +
+      "  background: var(--code-inline-bg);\n" +
+      "  color: var(--code-inline-fg);\n" +
+      "}",
+    to: "/* relocated by R366 */",
+    also: {
+      file: CSS,
+      from: "/* Inline code */\n:not(pre) > code[class*=\"language-\"] {",
+      to:
+        ".markdown-body code {\n" +
+        "  background: var(--code-inline-bg);\n" +
+        "  color: var(--code-inline-fg);\n" +
+        "}\n\n" +
+        "/* Inline code */\n:not(pre) > code[class*=\"language-\"] {",
+    },
+    suite: "test:theme",
+    // ONLY THE LIGHT LEG BITES, and that is a fact about the frozen defaults
+    // rather than a gap: dark's --code-inline-fg and --code-fg are the same
+    // colour, so inverting the tie there is invisible. Light's differ
+    // (--code-fg base00 rgb(101,123,131) vs --code-inline-fg rgb(31,50,68)),
+    // which is what makes the evidence name the defect outright.
+    //
+    // The three further failures are honest consequences of the same one edit:
+    // every token inherits the wrong foreground, and two light schemes then
+    // paint cells below AA that their default does not. Named rather than left
+    // under `~` so the record does not understate the blast radius.
+    expect: [
+      // WAS `/code box/`, WHICH DEFEATED THE HARNESS'S OWN GUARANTEE. Verdicts
+      // are decided by `re.test(name)` with no anchoring, so an unanchored
+      // `/code box/` matched EVERY `${mode}: code box "${part}" reproduces the
+      // golden exactly` in both modes - dozens of names. R366 would have
+      // reported PROVEN on any code-box failure anywhere, including one it had
+      // nothing to do with, which is exactly the WRONG-GUARD condition this
+      // harness exists to detect. Replaced with the three boxes the revert was
+      // MEASURED to break (light only - dark's --code-inline-fg and --code-fg
+      // are the same colour, so inverting the tie there is invisible).
+      /light: code box "preCode" reproduces the golden exactly/,
+      /light: code box "inlineLangCode" reproduces the golden exactly/,
+      /light: code box "preNoLangCode" reproduces the golden exactly/,
+      /light: token appearance reproduces the golden exactly/,
+      /every element that RENDERS below AA also renders below AA in its mode's default/,
+    ],
+  },
+  {
+    id: "R367",
+    // THE TICK GUTTER'S flex-shrink, which is inert in the shipped layout and
+    // is NOT dead - the distinction the whole assertion is built around.
+    //
+    // The submenu panel is shrink-to-fit, so an over-long scheme name widens
+    // the panel (measured 1005px) rather than compressing anything inside a
+    // row. That means this declaration cannot bite as the product stands, and
+    // a plain revert of it would come back VACUOUS - which is exactly the
+    // trap this project deletes entries for (R110b). It is not deleted here,
+    // because the suite bounds the panel deliberately and measures the real
+    // rule under the one condition the declaration exists for. Under that
+    // bound the default `flex: 0 1 auto` squeezes this fixed column on the
+    // OVERFLOWING ROW ALONE - inset 32 -> 28 while its siblings hold at 32 -
+    // which is per-row misalignment, invisible to every resting measurement in
+    // the section and to the reader until a scheme name grows.
+    //
+    // Deleting the declaration outright is the realistic accident: it reads as
+    // redundant beside `width: 12px`, and it is, right up until someone puts a
+    // max-width on a submenu panel.
+    what: "delete flex-shrink:0 from the scheme tick gutter, so a bounded panel can squeeze it",
+    file: CUSTOM_CSS,
+    from: '  content: "";\n  flex: 0 0 auto;\n  width: 12px;',
+    to: '  content: "";\n  width: 12px;',
+    suite: "test:theme",
+    // The counterfactual control keeps PASSING under this revert, and that is
+    // correct rather than a gap: it asserts that the default flex squeezes the
+    // gutter, which is precisely what the reverted stylesheet now does on its
+    // own. Only the claim about the SHIPPED rule can distinguish the two.
+    expect: [
+      /the tick gutter keeps its width when the panel is bounded and a label overflows/,
+    ],
+    mustPass: [
+      /the bounded-panel perturbation really does overflow the row it plants a label in/,
+      /the bounded-panel perturbation was undone before anything else was measured/,
+    ],
+  },
+  {
+    id: "R368",
+    // THE FLEX CONTEXT ITSELF, which is what made deleting the rule's dead
+    // `display: inline-block` safe.
+    //
+    // That declaration computed to `block` and bought nothing, because a
+    // generated box inside a flex container is BLOCKIFIED. It was measured and
+    // deleted - but the deletion is only sound while the row really is a flex
+    // container. Take the flex away and the gutter falls back to an inline
+    // box, a width on an inline box is ignored, the fixed column collapses,
+    // and every label slides left by a different amount depending on whether
+    // its row is ticked.
+    //
+    // So this pins the PREMISE rather than the deleted declaration. The
+    // collateral is wide and every bit of it is an honest consequence of one
+    // edit - the gutter stops existing, so alignment, the gutter's computed
+    // display and the bounded-panel measurements all go at once. Named in
+    // expect rather than left under `~` so the record does not understate it.
+    what: "stop the scheme menu row being a flex container, un-blockifying the tick gutter",
+    file: CUSTOM_CSS,
+    // Targeted at the theme rows rather than at the shared `.tools-submenu-item`
+    // rule that supplies the flex, so the revert isolates the premise being
+    // pinned instead of relaying out every submenu in the app.
+    from:
+      "#customThemeMenuItem .custom-scheme-option {\n" +
+      "  justify-content: flex-start;",
+    to:
+      "#customThemeMenuItem .custom-scheme-option {\n" +
+      "  display: block;\n" +
+      "  justify-content: flex-start;",
+    suite: "test:theme",
+    expect: [
+      /the tick gutter is a blockified flex item/,
+      /every scheme label starts at the same x/,
+      /the tick gutter keeps its width when the panel is bounded and a label overflows/,
+      /mode rows and scheme rows share ONE tick gutter/,
+      // The anchor sits on the second selector of a two-selector list, so the
+      // reverted declaration reaches the pre-existing MODE rows too. Their two
+      // gutter/label assertions are named rather than left under `~`.
+      /every mode row's tick gutter ends at the same x/,
+      /every mode row's text label starts at the same x/,
+    ],
+    // The restoration assertion MUST keep passing: it is now judged against the
+    // insets measured before the perturbation rather than against a uniform
+    // spread, so a revert that breaks the gutter rule can no longer masquerade
+    // as a stranded perturbation. This revert is the proof of that distinction.
+    mustPass: [
+      /the bounded-panel perturbation was undone before anything else was measured/,
+    ],
+  },
+  {
+    id: "R369",
+    // THE SCOPE OF THE CODE ::selection RULE, and the realistic accident is a
+    // TIDY-UP rather than a typo. `pre[class*="language-"] ::selection` already
+    // covers a <code> INSIDE a <pre>, so the two `code[...]` selectors look
+    // redundant to anyone reading the list - and deleting them changes nothing
+    // a code BLOCK does. What they actually carry is INLINE highlighted code,
+    // the one surface in the rule's scope that has no <pre> ancestor. Without
+    // them it falls back to the app-wide accent ::selection, which is opaque
+    // rather than a derived tint, so the surface silently leaves the theme's
+    // measured selection system entirely.
+    what: "drop inline highlighted code from the code ::selection rule as redundant",
+    file: CSS,
+    from:
+      'pre[class*="language-"] ::selection,\n' +
+      'code[class*="language-"]::selection,\n' +
+      'code[class*="language-"] ::selection {',
+    to: 'pre[class*="language-"] ::selection {',
+    suite: "test:theme",
+    expect: [
+      /inline highlighted code is painted by the same code ::selection rule as a block/,
+      // HONEST CONSEQUENCES of the same edit, named rather than left under `~`.
+      // The app-wide accent selection is OPAQUE, so it replaces the backdrop
+      // outright instead of tinting it: the light default's ink lands on the
+      // accent at a ratio the 4.5 bar rejects, and the highlight stops being a
+      // highlight of the code background at all. Only two states trip the
+      // legibility bar because the other four happen to pair an accent and an
+      // ink that still clear it - which is exactly why the SCOPE assertion
+      // above is the one this revert is named for: it fails in all six.
+      /light default: selected INLINE highlighted code is legible against its own highlight/,
+      /light default: the selection highlight is still visible against INLINE code's own background/,
+      /dark default: selected INLINE highlighted code is legible against its own highlight/,
+    ],
+  },
+  {
+    id: "R370",
+    // THE PREMISE THE SWEPT ALPHAS REST ON. theme-7-contrast derived every
+    // selection alpha against --code-bg, and that covers inline highlighted
+    // code ONLY because Prism's ported rule paints it on --code-bg too. This
+    // revert points it at --code-inline-bg instead - which reads like an
+    // obvious correction, since the variable is named for inline code and the
+    // rule's own section heading says "Inline code" - and it is precisely the
+    // edit that would invalidate the derivation while leaving both legibility
+    // bars passing on every scheme that ships today.
+    //
+    // It is a REAL appearance change on any scheme whose two variables differ.
+    // I ASSUMED THE DEFAULTS WOULD BE BLIND TO IT AND THE RUN SAID OTHERWISE:
+    // the golden's `inlineLangCode` box does pin the light default's resting
+    // background, so section 3 catches it there. The dark default declares the
+    // same value for both variables, so it is genuinely blind - and all four
+    // schemes are outside the golden entirely, since a golden can only cover
+    // the two frozen defaults. So the resting half is half-covered by accident
+    // and the SELECTION half was covered by nothing at all, which is what the
+    // backdrop assertion adds.
+    what: "paint inline highlighted code on --code-inline-bg instead of --code-bg",
+    file: CSS,
+    from:
+      ':not(pre) > code[class*="language-"],\n' +
+      'pre[class*="language-"] {\n' +
+      "  background-color: var(--code-bg);\n" +
+      "}",
+    to:
+      ':not(pre) > code[class*="language-"] {\n' +
+      "  background-color: var(--code-inline-bg);\n" +
+      "}\n" +
+      'pre[class*="language-"] {\n' +
+      "  background-color: var(--code-bg);\n" +
+      "}",
+    suite: "test:theme",
+    expect: [
+      /inline highlighted code sits on the same backdrop the selection alphas were derived against/,
+      // HONEST CONSEQUENCES, named rather than left under `~`. The golden hit
+      // is the resting background moving on the one default whose variables
+      // differ; the three visibility hits are the derived tint composited over
+      // a backdrop it was never swept against, which is the defect itself
+      // showing up from the other side.
+      /light: code box "inlineLangCode" reproduces the golden exactly/,
+      /light default: the selection highlight is still visible against INLINE code's own background/,
+      /clarity: the selection highlight is still visible against INLINE code's own background/,
+      /parchment: the selection highlight is still visible against INLINE code's own background/,
+    ],
+    // The BLOCK surface must be untouched: this revert splits one rule into two
+    // and only the inline half changes. If a block assertion moves, the split
+    // itself was wrong and the verdict would be measuring the wrong thing.
+    mustPass: [
+      /selected code at full opacity is legible against its own highlight/,
+      /the selection highlight is still visible against the code behind it/,
+    ],
+  },
+
+  {
+    id: "R371",
+    // THE FLOOR THAT COULD NOT FAIL. 10l's vacuity guard demanded only
+    // `cells.length >= 8` from a sweep whose real subject is 55 cells in every
+    // one of the six theme states - 47 cells of slack, i.e. a sweep could lose
+    // 85% of its coverage and still report the subject as pinned. That is the
+    // magic-number disease this project has already cured twice (the licence
+    // guard's `entries.length > 200` against a real 220, and the placeholder
+    // 1.0 that SELECTION_VISIBLE_FLOOR["light default"] used to carry), and it
+    // matters more here than it looks. Note the reason is NOT that
+    // 10l's bars are relative to their mode's default - they are not, they are
+    // the absolutes SELECTION_FLAT_MIN / SELECTION_TOKEN_MIN and the recorded
+    // per-state visibility floors. The hazard is that a thinned subject simply
+    // stops containing the cells that would have failed, so an absolute bar
+    // scores a smaller and smaller sample and keeps reporting success.
+    //
+    // THE REVERT IS THE REALISTIC ACCIDENT, not a synthetic one: sampling only
+    // the first block is the obvious way to make a six-state selection sweep
+    // faster, and it is exactly what the recorded first-block reasoning above
+    // the ink probe warns against. Under the OLD `>= 8` floor it passes - one
+    // JavaScript block alone clears eight cells comfortably - so this revert
+    // is a proof about the FLOOR's value, not about the guard's existence.
+    what: "sample only the first code block in 10l's selection sweep",
+    file: THEME_TEST,
+    from: "          for (const pre of pres) {",
+    to: "          for (const pre of pres.slice(0, 1)) {",
+    suite: "test:theme",
+    expect: [
+      /every theme state measured selected code across every rendered block/,
+      // AN HONEST CONSEQUENCE, and a useful one. The only dimmed token in the
+      // fixture (`namespace`, opacity 0.7) is not in the first block, so a
+      // first-block sample empties the dimmed bucket outright and amendment 2's
+      // reach assertion fails with it. That assertion turns out to be a second,
+      // independent witness to the same thinning - which is the layered
+      // coverage working, not a defect in either.
+      /exactly the light states carry a dimmed selected token/,
+    ],
+    // The bars themselves must keep passing: a thinned sample is still a
+    // legible one, which is the entire reason the floor has to do this work.
+    mustPass: [
+      /light default: selected code at full opacity is legible/,
+      /abyss: selected code at full opacity is legible/,
+    ],
+  },
+
+  {
+    id: "R372",
+    // THE FLIP THAT LANDED ON THE WRONG ELEMENT. The state-cascade sweep works
+    // by adding a sentinel class where a `:hover` / `:active` pseudo-class sat,
+    // so the rule really matches and the state is really painted. The original
+    // form stripped the pseudo-class from the WHOLE selector and added the
+    // sentinel back to whatever that whole selector matched. For a rule whose
+    // state sits on an ANCESTOR - and this product has seven, e.g.
+    // `.mermaid-container:hover .mermaid-maximize-btn` - that put the class on
+    // the DESCENDANT, so the rule never matched and the state was never
+    // exercised, while the aggregate counts happily went on rising.
+    //
+    // WHY THE PROOF IS A DEDICATED UNIT-LEVEL ASSERTION AND NOT THE CELL FLOOR.
+    // My first attempt at this revert expected the floor to catch it and came
+    // back VACUOUS, which is the most useful thing this entry produced. The
+    // broken flip yields an IDENTICAL result - measured, not reasoned: 62
+    // selectors, 231 light / 232 dark elements, 632 cells, zero drift, zero
+    // barren, suite green. Two reasons, both checked against the code:
+    //   * all seven ancestor-state rules declare only `opacity` or `display`,
+    //     never a colour, and `getComputedStyle` answers for a `display: none`
+    //     element exactly as it does for a painted one - so the submenu-reveal
+    //     theory I had recorded here was simply wrong;
+    //   * the sub-query is `querySelectorAll(meas).filter(s => s === host ||
+    //     host.contains(s))` and `meas` is untouched by the flip, so when
+    //     `flip === meas` each host is its own sub and the cell SET is the same.
+    // So the property had to be stated directly at the unit level: the rule
+    // must MATCH once its element is put into the state. That assertion is the
+    // only thing in the section that can see this defect.
+    //
+    // AN UNREACHABLE GUARD IS STILL A CONTRACT - the R202 precedent. Nothing
+    // measurable moves today because no ancestor-state rule declares a colour;
+    // the first one that does would be silently unexercised without the fix.
+    what: "flip the state class onto the whole selector instead of the compound that carries it",
+    file: THEME_TEST,
+    from: "                  const flip = (head + (m ? tail.slice(0, m.index) : tail)).trim();",
+    to: "                  const flip = (head + tail).trim();",
+    suite: "test:theme",
+    expect: [/every state rule really matched once its element was put into the state/],
+    // The section's value comparisons and coverage floors must keep passing:
+    // the defect is invisible to all of them, and that invisibility is the
+    // entire reason this assertion had to be written.
+    mustPass: [
+      /neither frozen default has changed a single state colour since HEAD/,
+      /every planned state selector reaches an element in at least one mode/,
+    ],
+  },
+
+  {
+    id: "R373",
+    // THE CAP THAT TRUNCATED 22 OF 30 MENU ITEMS. `hosts.slice(0, 8)` bounded
+    // how many matches of a selector were put into the state, with nothing
+    // recording that a ninth existed - so a regression on the ninth context
+    // menu item was invisible and no count ever said so.
+    //
+    // ITS RECORDED JUSTIFICATION WAS FALSE, and that was settled by reading the
+    // loop rather than by argument: the cap's comment claimed that flipping
+    // every match at once would repaint a picture the product never draws, but
+    // the loop flips ONE host, measures it, and removes the class again before
+    // touching the next. So it was a pure cost bound - and the cost was then
+    // MEASURED: uncapped, the sweep compares 602 cells against 376 and the
+    // suite does not get slower (30.3 s either way); with the R374 scaffold in
+    // place it reaches 632. The cap bought nothing and cost 40% of the
+    // coverage.
+    //
+    // Deliberately distinct from R372: that one breaks WHICH element is put
+    // into the state, this one breaks HOW MANY. R372 is invisible to the floor
+    // and needs its own unit assertion; this one the floor catches directly,
+    // which is what makes the floor worth having rather than a formality.
+    what: "reinstate the 8-match cap on the state-cascade sweep",
+    file: THEME_TEST,
+    from: "          for (const host of hosts) {",
+    to: "          for (const host of hosts.slice(0, 8)) {",
+    suite: "test:theme",
+    // NAMES THE COVERAGE CLAIM, NOT THE DRIFT ONE. Both used to be `&&`-ed
+    // into a single assertion called "neither frozen default has changed a
+    // single state colour since HEAD" - so this revert, which changes no
+    // colour whatsoever, failed under a name announcing a colour regression in
+    // the frozen defaults. A review round called that out against this
+    // project's own standard (see R366, rewritten for exactly this), and the
+    // assertion was split rather than the expect widened.
+    expect: [/the state-cascade sweep still covers as much as it was measured to cover/],
+    mustPass: [/neither frozen default has changed a single state colour since HEAD/],
+  },
+
+  {
+    id: "R374",
+    // THE SURFACES THE SUITE'S DOCUMENT NEVER BUILDS. Thirteen of the sixty-two
+    // planned state selectors matched nothing - no tab bar, no note, no mermaid
+    // diagram, no copied or disabled variant - so a hover-colour regression on
+    // any of them was invisible to the frozen-default sweep, and the sweep's
+    // own totals gave no hint of it. The scaffold attaches them; this proves
+    // the barren guard notices when it stops.
+    //
+    // NOTE WHAT THIS REVERT IS *NOT* ABLE TO SHOW, because it is the reason the
+    // barren check is read across BOTH modes rather than one: the flip target
+    // of `body.dark-mode .tab-close:hover` cannot match in light mode by
+    // construction, so a single-mode reading would have reported it barren for
+    // ever and been "fixed" with an excusal for a non-defect.
+    what: "remove the state-sweep scaffold",
+    file: THEME_TEST,
+    from: "      document.body.appendChild(d);",
+    to: "      if (false) document.body.appendChild(d);",
+    suite: "test:theme",
+    expect: [
+      /every planned state selector reaches an element in at least one mode/,
+      // HONEST CONSEQUENCES, both of them, and worth listing rather than
+      // narrowing the revert to dodge: the scaffold is what the attachment
+      // assertion counts, and its cells are inside the coverage floor.
+      /the state-sweep scaffold really attached the surfaces/,
+      /the state-cascade sweep still covers as much as it was measured to cover/,
+    ],
+    // A FOURTH FAILURE WAS PREDICTED HERE AND THE FIRST FULL RUN DISPROVED IT,
+    // exactly as the harness corrected R379's prediction a few records below.
+    // The claim was that "a surface that stops existing also stops matching its
+    // state rule". It does not: `unexercised` is scoped to MODES WHERE THE
+    // SELECTOR HAD HOSTS by deliberate design - see that assertion's own
+    // comment, which exists because intersecting it across both modes made it
+    // structurally blind to the `body.dark-mode ...:hover` family - so a
+    // scaffolded selector whose host is gone leaves the domain entirely and is
+    // reported BARREN instead. The two predicates do not share a domain, which
+    // is the very thing that comment is about. MEASURED on the full run: the
+    // three assertions above fail, this one passes.
+    //
+    // IT MOVES TO mustPass RATHER THAN BEING DELETED, because it is not
+    // incapable of firing and so is not decorative: R379 fails it by breaking
+    // ancestry while every host survives. As collateral it states something
+    // real - removing the scaffold must not stop a rule that still HAS a host
+    // from matching. If it ever fails here, this revert has stopped being
+    // about supplying surfaces and is breaking the flip itself.
+    //
+    // THE DRIFT CLAIM MUST SURVIVE IT TOO. Removing the scaffold removes cells;
+    // it does not repaint one. If that ever starts failing, the scaffold is
+    // changing colours rather than only supplying surfaces.
+    mustPass: [
+      /neither frozen default has changed a single state colour since HEAD/,
+      /every state rule really matched once its element was put into the state/,
+    ],
+  },
+
+  {
+    id: "R376",
+    // THE HALF OF THE NO-FALLBACK RULE THAT WAS MISSING. 10f2 forbids a var()
+    // from falling back to a literal colour, which is right - but on its own it
+    // is a TRADE, not a fix: it removes the safety net without asserting the
+    // net is unnecessary. `color: var(--tok-string)` with the token absent is
+    // invalid at computed-value time, so `color` INHERITS and the token silently
+    // takes its parent's ink. That is the same class as the R343 "reads as a
+    // row" defect, arriving by a path R343 cannot see, because R343 watches the
+    // rule and this failure is in the token.
+    //
+    // A CURATED SCHEME IS WHERE IT WOULD REALLY HAPPEN - the defaults are swept
+    // cell-by-cell against v0.2.0, a new scheme block is not - so the revert
+    // takes the token out of one, which is exactly the typo being guarded.
+    what: "let a scheme forget one of the tokens its rules consume",
+    file: CSS,
+    // The four-line --tok-* block is IDENTICAL in clarity and parchment, so the
+    // anchor carries clarity's own --syn-entity-bg (the only #ddf4ff in the
+    // file) to disambiguate. Without it the harness reports NOT UNIQUE.
+    from: "  --syn-entity-bg: #ddf4ff;\n\n  --tok-block-comment: var(--syn-comment);\n  --tok-operator: var(--syn-operator);",
+    to: "  --syn-entity-bg: #ddf4ff;\n\n  --tok-operator: var(--syn-operator);",
+    suite: "test:theme",
+    expect: [
+      /every token consumed without a fallback resolves, except exactly the cells recorded as deliberately inherited/,
+    ],
+  },
+
+  {
+    id: "R377",
+    // THE FAIL-OPEN THAT MADE THE WHOLE READY-MOMENT ASSERTION A NO-OP in the
+    // one regression it exists for. The reading used to be taken
+    // UNCONDITIONALLY after the timeout branch, so a handler that stopped
+    // emitting `pdf-export-ready` produced a probe fifteen seconds later
+    // against a fully settled page: zero diffs, six entries present, and an
+    // assertion named "the page is already settled the instant the export
+    // reports ready" PASSED for six states in which nothing had reported ready.
+    //
+    // TWO NAMES, AND THE SECOND IS THE POINT. `prepFailures` always caught the
+    // missing signal - but it is a different assertion about a different
+    // subject, and delegating to it is precisely how the timing claim was able
+    // to report success about a moment that never happened. Under the old code
+    // this revert failed ONE assertion; it now fails two, and the added one is
+    // the fix.
+    what: "stop the renderer telling main.js the page is ready to print",
+    file: RENDERER,
+    from: "ipcRenderer.send('pdf-export-ready')",
+    to: "void 0",
+    suite: "test:theme",
+    expect: [
+      /the page is already settled the instant the export reports ready/,
+      /10i: the export preparation completed through its own pdf-export-ready signal/,
+      // MEASURED, NOT PREDICTED: with no signal at all the probe runs at the
+      // 15s wait timeout, so the latency assertion reports 15017ms against its
+      // 400ms ceiling and fails too. That is an honest consequence of the same
+      // edit rather than a second defect - the reading is genuinely not taken
+      // near a signal, because there is no signal - so it is listed rather
+      // than left to appear as an unexplained extra failure.
+      /10i: the ready-moment reading is taken close enough to the signal/,
+    ],
+  },
+
+  {
+    id: "R378",
+    // THE OTHER DIRECTION, WHICH NOTHING WATCHED AT ALL. The wait used to be
+    // `ipcMain.once`, which resolves on the FIRST signal and then stops
+    // listening - so a handler that sent `pdf-export-ready` twice was entirely
+    // invisible here, while main.js, which calls printToPDF on every one of
+    // them, would have run the export twice and written the file twice.
+    // The listener now stays attached for the whole of the state's export
+    // cycle and the count travels with the reading, so a late duplicate is
+    // still charged to the state that produced it.
+    what: "send the print-ready signal twice",
+    file: RENDERER,
+    from: "ipcRenderer.send('pdf-export-ready')",
+    to: "(ipcRenderer.send('pdf-export-ready'), ipcRenderer.send('pdf-export-ready'))",
+    suite: "test:theme",
+    expect: [/the page is already settled the instant the export reports ready/],
+  },
+
+  {
+    id: "R379",
+    // A SCAFFOLD CAN KEEP ITS ELEMENT COUNT AND LOSE THE ANCESTRY, which is
+    // the failure both review rounds independently reached for: the state
+    // sweep would then be proving the scaffold's own markup rather than the
+    // product's. The check was `scaffolded >= 17` against a real 20 - a magic
+    // floor with three in slack in a section that removes floors for exactly
+    // that reason, and blind to structure either way.
+    //
+    // THIS REVERT MOVES A NODE WITHOUT DELETING IT, so the count is untouched
+    // at 20 and no aggregate total moves. `.mermaid-maximize-btn` is the
+    // right subject: its state rule puts the class on the CONTAINER, so
+    // un-nesting it is precisely the ancestry loss that would make the rule
+    // stop matching while every count stayed healthy.
+    what: "flatten one scaffolded node out of the ancestry its state rule needs",
+    file: THEME_TEST,
+    from: "'<div class=\"mermaid-container\"><button class=\"mermaid-maximize-btn\">M</button></div>' +",
+    to: "'<div class=\"mermaid-container\"></div><button class=\"mermaid-maximize-btn\">M</button>' +",
+    suite: "test:theme",
+    expect: [
+      /the state-sweep scaffold really attached the surfaces/,
+      // MY PREDICTION HERE WAS WRONG AND THE HARNESS CORRECTED IT. The comment
+      // below originally claimed the ancestor rule would still match because
+      // the button still exists. It does not: the sentinel selector is the
+      // state rule's OWN selector, `.mermaid-container.__st_hov
+      // .mermaid-maximize-btn`, so un-nesting the button makes it match
+      // nothing and the rule is never exercised. That is the CONSEQUENCE of
+      // the ancestry loss, where the manifest assertion above names the CAUSE;
+      // both are honest effects of one edit, so both are listed.
+      /every state rule really matched once its element was put into the state/,
+    ],
+    // STILL AN HONEST NON-CONSEQUENCE, and it is what keeps this revert narrow:
+    // the flattened button remains a host for its own bare-compound rules, so
+    // no planned selector goes barren. If this ever starts failing too, the
+    // revert has stopped being about ancestry and is deleting coverage.
+    mustPass: [/every planned state selector reaches an element in at least one mode/],
+  },
+
+  {
+    id: "R380",
+    // THE FILTER IS THE ASSERTION. The ready-moment check asks "is anything a
+    // reader would SEE still moving", and bare `checkVisibility()` answers a
+    // different question - it considers layout but NOT opacity. `.code-copy-btn`
+    // rests at opacity 0 and fades in on hover, so the bare call reports it
+    // visible and the assertion fired on five of six states the first time it
+    // was run. That was the instrument, not the product.
+    //
+    // MEASURED, NOT REASONED: with the options the diff went from 5 false
+    // positives to 0, and the surviving reading matches the throwaway probe
+    // that originally rejected the race (31 transitions running, none of them
+    // painted under print media).
+    what: "ask checkVisibility the layout question instead of the painting one",
+    file: THEME_TEST,
+    from: "          if (!t.checkVisibility({\n            opacityProperty: true,\n            visibilityProperty: true,\n            contentVisibilityAuto: true,\n          })) continue;",
+    to: "          if (!t.checkVisibility()) continue;",
+    suite: "test:theme",
+    expect: [/the page is already settled the instant the export reports ready/],
+  },
+
+  {
+    id: "R381",
+    // THE LATENCY IS WHAT MAKES THE COLOUR ARM MEAN ANYTHING. The reading is
+    // taken one IPC round trip after the ready signal, so if that trip ever
+    // grew past the length of a transition, the comparison would sample a
+    // settled page and report success for a page that had been in flight -
+    // vacuous, and indistinguishable from a real pass. A review round called
+    // this out as an unmeasured dependency hidden by R375's transition delay.
+    //
+    // THE REVERT MOVES THE CLOCK, NOT THE PROBE. Starting the stopwatch after
+    // the round trip instead of before it reports a latency of roughly zero
+    // while measuring exactly the same page - so it proves the number is
+    // anchored to the SIGNAL rather than being a self-satisfied reading of the
+    // probe's own duration. Measured on this machine: 63ms against a 400ms
+    // ceiling, and R375's 500ms delay sits above the ceiling by design so that
+    // revert stays valid for any latency this assertion permits.
+    what: "start the ready-moment stopwatch after the round trip instead of before it",
+    file: THEME_TEST,
+    from: "        const t0 = Date.now();\n        await exec(",
+    to: "        let t0 = 0;\n        await exec(",
+    suite: "test:theme",
+    expect: [
+      /the ready-moment reading is taken close enough to the signal to still be a reading of that moment/,
+    ],
+  },
+
+  {
+    id: "R382",
+    // THE INK HALF OF THE FROZEN DEFAULTS WAS BYTE-EXACT BY ARGUMENT ONLY, and
+    // a review round put the objection exactly: the golden's `*Fg` entries were
+    // captured AFTER the ink moved to --code-selection-fg, so they are a
+    // re-baseline and cannot by themselves prove the pre-change value. Every
+    // other amendment in the suite carries a `was`; this one cannot, because
+    // the value it would record is gone.
+    //
+    // IT DOES NOT NEED ONE. `bodyFg` is painted by the APP-WIDE ::selection
+    // rule, which this change never touched, and that rule is where code
+    // selection ink used to come from before --code-selection-fg existed. So
+    // "the code ink equals the app-wide ink" IS the byte-exactness claim,
+    // stated end to end and independent of when the golden was captured.
+    // This revert breaks the identity WITHOUT touching the code side, which is
+    // the only way to show the new assertion is doing work the golden
+    // comparison was not already doing.
+    what: "let the frozen default's code selection ink drift from the app-wide ink",
+    file: CSS,
+    // Both frozen defaults declare the same literal, so the anchor carries the
+    // tail of the LIGHT block's comment to disambiguate. The light leg alone is
+    // enough: the assertion is emitted per mode.
+    from: "     --on-accent-fg. */\n  --code-selection-fg: #ffffff;",
+    to: "     --on-accent-fg. */\n  --code-selection-fg: #f4f4f4;",
+    suite: "test:theme",
+    expect: [
+      /the frozen default's code selection ink is still the app-wide selection ink it used to inherit/,
+    ],
+  },
+
+  {
+    id: "R375",
+    // THE PROPERTY THIS PINS IS TIMING, NOT COLOUR, so the revert has to break
+    // timing and nothing else. main.js calls printToPDF the instant
+    // `pdf-export-ready` arrives; the renderer sends it after a double rAF
+    // (~18ms) while themed transitions run 0.2-0.3s. Every other 10i assertion
+    // measures the page AFTER this suite settles the transitions, so a printed
+    // surface that faded into place would be captured half-way by the product
+    // and reported perfect by the suite.
+    //
+    // MEASURED: it is not half-way today - 31 transitions running at the ready
+    // signal, ZERO of them on an element the print stylesheet paints, and zero
+    // colour diffs on any sampled surface. But that is an accident of the
+    // stylesheet (document content carries no colour transitions at all, and
+    // every running one targets a `@media print` hidden control), not a
+    // designed guarantee: there is no `transition: none` under print anywhere.
+    // So the realistic accident is a future edit giving a PRINTED surface a
+    // colour transition, which is exactly what this revert does.
+    //
+    // WHY A DELAY RATHER THAN A LONG DURATION. Both produce a mid-flight page
+    // at the ready signal, but a duration bets on WHERE the ~18ms sample lands
+    // on the easing curve - at 3% of a 0.6s ease that is under one rgb unit
+    // after rounding, i.e. a revert that bites or not depending on frame
+    // timing. A delay puts the sample deterministically at the PRE-park colour
+    // while the settled reading is the parked one, so the divergence is the
+    // full colour delta every run. A flaky revert is not a proof.
+    // The 0.8s total is well inside the settle loop's 3s budget, so only the
+    // ready-moment reading moves and the settled assertions stay honest -
+    // which is what makes the failure name TIMING rather than fidelity.
+    // WHICH PRINTED SURFACE, AND WHY IT IS THE TOKENS. The first two attempts
+    // were both wrong and both were caught by running rather than by reading.
+    // On the screen `#viewer` rule the transition is live during EVERY mode
+    // switch in the suite, so sections 1-9 measured the reading surfaces
+    // mid-fade and the GOLDEN comparison failed instead of the timing
+    // assertion (`#viewer.color: golden=rgb(31,50,68) now=rgb(199,202,205)` -
+    // a literal mid-transition grey). Moved into `@media print` it went
+    // VACUOUS, and that exposed a fact worth keeping: the print block pins
+    // `body` and `#viewer` to `white`/`#333` with `!important` in BOTH modes,
+    // so those two surfaces cannot move at export time at all and no
+    // transition on them can ever fire. The surfaces that DO move are the
+    // syntax tokens - print pins nothing about them, so the park swaps the
+    // whole `--tok-*` palette underneath them.
+    // Scoping to print also keeps the revert honest: it is inert for every
+    // section except 10i, the only one that emulates print media, so exactly
+    // one assertion moves and it is the one this revert is named for.
+    what: "give a printed surface a delayed colour transition",
+    file: CUSTOM_CSS,
+    from: "  #viewer {\n    display: block !important;",
+    to:
+      "  #viewer .token {\n    transition: color 0.3s linear 0.5s;\n  }\n\n" +
+      "  #viewer {\n    display: block !important;",
+    suite: "test:theme",
+    expect: [
+      /the page is already settled the instant the export reports ready/,
+    ],
+  },
+
+  {
+    id: "R383",
+    // THE REGISTER, NOT THE GEOMETRY. R364 restores the old margins and proves
+    // that the live menu really did change; this proves the other half - that
+    // the change is RECORDED as a decision rather than merely being true. The
+    // two fail under opposite accidents: R364 is someone undoing the change,
+    // this is someone tidying the ledger that explains it.
+    //
+    // IT IS THE SAME DISEASE THE COLOUR REGISTER WAS BUILT FOR. An "applied
+    // exactly the decided amendments" assertion compares [] against [] and is
+    // structurally unfailable for an empty table, so a ledger that quietly
+    // loses its only entry reads exactly like a ledger that never needed one.
+    // The revert drops the entry while leaving the object in the file, which
+    // is what a real edit would look like.
+    what: "drop the mode-row gutter entry from the chrome amendment ledger",
+    file: THEME_TEST,
+    from: "const CHROME_AMENDMENTS = [\n  {\n    id: \"mode-row tick gutter\",",
+    to: "const CHROME_AMENDMENTS = [];\nconst CHROME_AMENDMENTS_DROPPED = [\n  {\n    id: \"mode-row tick gutter\",",
+    suite: "test:theme",
+    expect: [/10j: the mode-row gutter change is recorded as a decision/],
+    // The geometry is untouched, so every measurement-side assertion about the
+    // same rows must survive. If they do not, this revert has broken the menu
+    // rather than the register and proves nothing about the ledger.
+    mustPass: [
+      /10j: every mode row's tick gutter ends at the same x, ticked or not/,
+      /10j: mode rows and scheme rows share ONE tick gutter/,
+    ],
+  },
+
+  {
+    id: "R384",
+    // THE REVIEW DISAGREEMENT, IMPLEMENTED. One model held that a scheme id
+    // inside a template interpolation is hidden from the leak sweep, and
+    // proposed re-entering code mode at `${`. The other traced the scanner and
+    // called the claim unfounded. Reading settles the first half - a backtick
+    // is a quote character and template content is emitted verbatim, so the id
+    // is visible either way - but reading does NOT settle whether the proposed
+    // remedy is safe. This revert applies it, so the answer is measured.
+    //
+    // IT DESYNCHRONISES ON A NESTED TEMPLATE, which is the one shape the
+    // remedy exists to handle. Entering code mode at `${` means the inner
+    // template's OPENING backtick is read as an opener and its CLOSING one as
+    // a closer, leaving the outer template's real terminator to open a fresh
+    // string. Everything after it - including real line comments - is scanned
+    // as string content, so a comment that should have been stripped survives
+    // and its prose is reported as a leak. That is the fail-OPEN direction the
+    // stripper's own regex-state comment already warns about, reached by an
+    // edit that reads like a strict improvement.
+    //
+    // It fails only the plant table, and that is the point: the plants are
+    // what turn an argument between two reviewers into a property the suite
+    // re-establishes on every run.
+    what: "re-enter code mode at ${ inside a template literal, as review proposed",
+    file: THEME_TEST,    from:
+      '          if (ch === "\\\\") out += src[++i] || "";\n' +
+      "          else if (ch === quote) quote = \"\";",
+    to:
+      '          if (ch === "\\\\") out += src[++i] || "";\n' +
+      '          else if (quote === "`" && ch === "$" && src[i + 1] === "{") {\n' +
+      '            out += src[++i];\n' +
+      '            quote = "";\n' +
+      "          } else if (ch === quote) quote = \"\";",
+    suite: "test:theme",
+    expect: [
+      /10i: the scheme-leak sweep catches an unquoted id and ignores the same letters in prose \(control\)/,
+      // THE SECOND FAILURE IS THE FINDING, and it is worth more than the plant.
+      // The plant is synthetic; this one is the desync damaging a sweep over
+      // the REAL product source. The mermaid.initialize assertion scans
+      // comment-stripped renderer.js precisely because a third "site" lives
+      // inside a comment at renderer.js:2358 - so a stripper that leaves a
+      // comment standing hands that assertion a phantom third site. It is an
+      // independent witness that the remedy fails open on shipped code rather
+      // than only on a fixture, which is exactly what the plant claims.
+      /10i: both mermaid\.initialize sites pass a palette chosen by a plain mode flag/,
+    ],
+  },
+
+  {
+    id: "R385",
+    // THE PREDICTED-VACUOUS EDIT, MADE REAL. A review round named three chrome
+    // tokens whose default values nothing asserted, and predicted that
+    // changing any of them would leave the suite green. This is the first of
+    // them: the panel shadow, one digit deeper. Before 10m existed it really
+    // was invisible - the golden's `surfaces` map holds ten selectors, all
+    // body or #viewer, and no chrome at all.
+    //
+    // IT IS THE LIGHT DECLARATION, AND THAT IS THE WHOLE POINT. This revert
+    // first pointed at the DARK --panel-shadow and came back WRONG-GUARD: the
+    // baseline declared that shadow on `body.dark-mode .search-panel` and the
+    // tokenised tree declares it on `.search-panel`, so it is a DE-SCOPED
+    // tokenisation and 10m catches it through the de-scoped path - which R386
+    // already proves. A light rule was never mode-scoped in the first place,
+    // so tokenising it cannot change its selector, and it is the only kind of
+    // token that exercises the SAME-SELECTOR half. That half is the larger
+    // claim by an order of magnitude (1455 declarations against 20), and it is
+    // precisely the case a token-by-token comparison would report as "the
+    // token changed" without knowing whether anything painted differently,
+    // which is why 10m compares the RESOLVED DECLARATION.
+    what: "deepen the light default's panel shadow by one digit",
+    file: CSS,
+    from: "  --panel-shadow: rgba(0, 0, 0, 0.2);",
+    to: "  --panel-shadow: rgba(0, 0, 0, 0.4);",
+    suite: "test:theme",
+    expect: [/10m: every baseline declaration that kept its selector still paints the baseline value/],
+  },
+
+  {
+    id: "R386",
+    // THE OTHER HALF OF 10m, AND THE HARDER ONE. --overlay-bg is a DE-SCOPED
+    // tokenisation: the baseline declared this colour on `body.dark-mode
+    // .loading-overlay`, and the tokenised tree declares it on
+    // `.loading-overlay` with the mode difference moved into the variable. So
+    // there is no rule at the baseline's selector to compare against at all,
+    // and a comparison keyed on the selector alone would drop the declaration
+    // silently - which is the shape of every coverage hole this file has found.
+    // 10m strips the mode prefix, finds the surviving rule, and resolves it in
+    // the mode the baseline rule applied to.
+    //
+    // THE CHANGE IS DELIBERATELY SMALL AND PLAUSIBLE. rgba(26,26,26,.95) to
+    // rgba(30,30,30,.95) is the kind of edit that arrives with "round the
+    // greys" and is invisible to the eye at 95% opacity over a dark page.
+    what: "nudge the dark default's loading-overlay grey",
+    file: CSS,
+    from: "  --overlay-bg: rgba(26, 26, 26, 0.95);",
+    to: "  --overlay-bg: rgba(30, 30, 30, 0.95);",
+    suite: "test:theme",
+    expect: [/10m: every dark override this work tokenised still paints the baseline value through its token/],
+  },
+
+  {
+    id: "R387",
+    // PROVING THE INSTRUMENT, NOT THE PRODUCT - and it is a test-side revert
+    // on purpose (precedent R361/R362/R363/R365). 10m's two fidelity
+    // assertions are ABSENCE checks over a subject list this file derives
+    // itself, and an absence check fails open: if the stylesheet reader
+    // stopped reading, or substitution stopped substituting, or normalisation
+    // started calling everything equal, both would report a flawless sweep
+    // over nothing at all. This project has been bitten by that four times.
+    //
+    // THIS BREAKS EXACTLY THE LAST OF THOSE THREE. Neutralising normCss makes
+    // every comparison trivially equal, so both fidelity assertions PASS - and
+    // only the positive control notices, which is precisely the job it was
+    // written for. A revert that made the fidelity assertions fail would prove
+    // nothing about the control.
+    what: "make the fidelity comparison call every value equal",
+    file: THEME_TEST,
+    from: "    const normCss = (v) =>",
+    to: "    let normCss = (v) =>",
+    also: {
+      from: "    const sameSelDrift = [];",
+      to: "    normCss = () => \"\";\n    const sameSelDrift = [];",
+    },
+    suite: "test:theme",
+    expect: [/10m: the fidelity comparison can actually detect a changed value \(positive control\)/],
+    // The two assertions the control exists to protect must stay GREEN. If
+    // they fail, this revert has broken the sweep rather than the comparison,
+    // and the control's independence is not what has been demonstrated.
+    mustPass: [
+      /10m: every baseline declaration that kept its selector still paints the baseline value/,
+      /10m: every dark override this work tokenised still paints the baseline value through its token/,
+    ],
+  },
+
+  {
+    id: "R388",
+    // A LATENT THROW REACHABLE ONLY THROUGH THE EXPORTED SURFACE. themeMode's
+    // value domain is light|dark|desktop - that is a load-bearing contract
+    // read by resolveDarkPreference() - but "desktop" is not a SCHEME mode.
+    // Passed through unresolved it indexes SCHEME_KEYS to undefined, reads the
+    // literal localStorage key "undefined", matches no scheme, and falls
+    // through to baseSchemeFor("desktop"), which returns undefined because no
+    // scheme carries that mode. applyScheme() then throws on scheme.base
+    // inside a click handler, outside the one try that guards the parse-time
+    // call.
+    //
+    // EVERY INTERNAL CALLER HAPPENS TO RESOLVE FIRST, which is exactly why no
+    // behavioural assertion could reach it: the product never takes this path.
+    // The 10e probe calls the exported function directly, which is the only
+    // way to measure a contract the product does not currently exercise. Same
+    // precedent as R202 - an unreachable guard is still a contract.
+    what: "stop schemeFor resolving its mode argument",
+    file: THEME_JS,
+    from: "    const m = resolveMode(mode);\n    const stored = localStorage.getItem(SCHEME_KEYS[m]);",
+    to: "    const m = mode;\n    const stored = localStorage.getItem(SCHEME_KEYS[m]);",
+    suite: "test:theme",
+    expect: [/schemeFor is total over the themeMode value domain, including 'desktop'/],
+  },
+
+  {
+    id: "R389",
+    // THE CONTROL THAT SHIPPED IN A COLOUR BELONGING TO NO PALETTE. The
+    // toggle track was a hardcoded #4fc3f7 - stock light blue - so every
+    // scheme painted the same switch against its own menu. Nothing could see
+    // it: the track carries no text, so every contrast sweep scores nothing on
+    // it; it is not a hover or focus rule, so the state sweep never collects
+    // it; and it is not in the accent family, so the stranded-accent sweep
+    // does not know the value to look for.
+    //
+    // THE REVERT IS THE ORIGINAL DEFECT, ONE SCHEME AT A TIME. Pointing abyss
+    // back at the stock blue is what "this one looks fine, leave it" produces.
+    // It fails on TWO independent axes, which is the layered coverage working:
+    // the uniqueness control notices a scheme still wearing the frozen
+    // default's switch, and the contrast bar notices 2.00:1 against the white
+    // thumb.
+    //
+    // IT CAME BACK WRONG-GUARD FIRST TIME AND THE HOLE WAS REAL. The
+    // uniqueness control originally compared the four scheme tracks against
+    // EACH OTHER only, and the stock blue is distinct from all four - so the
+    // set stayed size 4 and only the contrast bar bit. The realistic accident
+    // is a scheme that was never given a track, not one that copied a
+    // neighbour, so the assertion now names FROZEN_TOGGLE explicitly.
+    what: "give abyss back the stock light-blue toggle track",
+    file: CSS,
+    from: "  --toggle-on-bg: #4d7fe0;",
+    to: "  --toggle-on-bg: #4fc3f7;",
+    suite: "test:theme",
+    expect: [
+      /10n: the toggle track is a themed colour in every state, not one hardcoded blue/,
+      /10n: every scheme's toggle track meets WCAG 1\.4\.11 \(3:1\) against the thumb, the menu, the hover fill and the off state/,
+    ],
+  },
+
+  {
+    id: "R390",
+    // THE EQUALITY THAT STOPPED MEANING WHAT IT SAID. Section 5's ::selection
+    // check rests on preFg === bodyFg === preCodeFg. That was byte-exactness
+    // while the rule baked `color: #ffffff`; today both halves read
+    // var(--on-accent-fg), so they move TOGETHER and the equality survives any
+    // value at all. Fidelity survives only because --on-accent-fg is #ffffff
+    // at :root with no body.dark-mode redeclaration - a fact about the cascade
+    // that the equality does not state and cannot check.
+    //
+    // #fefefe IS THE POINT. It is one step off white, invisible on screen, and
+    // it keeps all three readings equal - so it passes the equality and fails
+    // only the assertion written to pin the value the baseline actually baked.
+    what: "shift the on-accent ink one step off the white the baseline baked",
+    file: CSS,
+    from: "     editor theme with a light accent does. */\n  --on-accent-fg: #ffffff;",
+    to: "     editor theme with a light accent does. */\n  --on-accent-fg: #fefefe;",
+    suite: "test:theme",
+    // --on-accent-fg is the ink of the app-wide ::selection rule and of the
+    // code selection rule that now consumes it, so shifting it off white
+    // moves six further assertions. Every one is an HONEST CONSEQUENCE of the
+    // single edit rather than collateral damage, and listing them is what
+    // keeps the record from understating the revert's reach. The 10m
+    // same-selector failure is the most useful of them: it is independent
+    // confirmation that the larger half of the chrome-fidelity guard bites,
+    // measured on a real product token rather than on a planted control.
+    expect: [
+      /the frozen default still resolves --on-accent-fg to the white the baseline baked/,
+      /::selection paints the golden's INK, not just its fill/,
+      /the frozen default's code selection ink is still the app-wide selection ink it used to inherit/,
+      /neither frozen default has changed a single state colour since HEAD/,
+      /10m: every baseline declaration that kept its selector still paints the baseline value/,
+    ],
+  },
+
+  {
+    id: "R391",
+    // SOURCE ORDER IS THE ONLY THING THAT LETS A SCHEME WIN. body.dark-mode
+    // and body[data-theme="..."] are both (0,1,1), so the tie is broken by
+    // position alone - and a scheme block placed above the dark default is
+    // silently overridden in dark mode with nothing to indicate it.
+    //
+    // IT ADDS A BLOCK RATHER THAN MOVING ONE, which is both the realistic
+    // accident (a new scheme pasted in at the top of the theme section) and
+    // what keeps the proof clean: the stub declares a variable the real abyss
+    // block declares too, so the later block still wins and the APPEARANCE
+    // does not move. Nothing but an assertion that reads rule POSITIONS can
+    // see it, which is exactly the claim being proven. Same additive shape as
+    // R296.
+    what: "paste a scheme block in above the dark default",
+    file: CSS,
+    from: "/* Dark mode variables */\nbody.dark-mode {",
+    to: 'body[data-theme="abyss"] {\n  --syn-keyword: #bb9af7;\n}\n\n/* Dark mode variables */\nbody.dark-mode {',
+    suite: "test:theme",
+    expect: [/10b: every scheme block is declared AFTER the dark default/],
+  },
+
+  {
+    id: "R392",
+    // THE SENSITIVITY CONTROL FOR A PINNED COUNT. requiredSize was `>= 50`
+    // against a measured 58 - eight variables of slack, i.e. a scheme could
+    // stop requiring seven cells and the guard would still report itself
+    // satisfied. That is the same magic-number disease as the licence guard's
+    // `> 200` against a real 220 and the placeholder 1.0 selection floor, and
+    // the fix was to pin the measured value and PRINT it.
+    //
+    // A PIN IS ONLY WORTH ANYTHING IF IT IS READ. This moves the recorded
+    // number by one, which a floor could never notice and an exact comparison
+    // must. It is deliberately the same shape as R260, the golden's own
+    // sensitivity control: prove the expectation is consulted, or the
+    // comparison beside it is decorative.
+    what: "move the pinned required-variable count by one",
+    file: THEME_TEST,
+    from: "const REQUIRED_COUNTS = { light: 61, dark: 61 };",
+    to: "const REQUIRED_COUNTS = { light: 61, dark: 60 };",
+    suite: "test:theme",
+    expect: [/the derived required-variable list is the pinned measured size/],
+  },
+
+  {
+    id: "R393",
+    // THE LEDGER TIGHTENING, PROVEN BY MUTATING ITS PREMISE. The chrome
+    // amendment was first recorded as a spread - "the insets were not all the
+    // same" - which is satisfied by almost any three numbers and says nothing
+    // about WHICH row was out of line. Re-keyed by tick state it makes three
+    // checkable claims: the two unticked rows agreed, the ticked row sat
+    // exactly `delta` to their left, and the recorded reason names that same
+    // delta in px.
+    //
+    // 35 BREAKS ONLY THE SECOND. It leaves the pair intact and keeps the
+    // premise looking entirely reasonable - which is the point, because under
+    // the old spread form it would have passed. This proves the tightening
+    // rather than the ledger's existence; R383 already proves the ledger can
+    // fail by being emptied.
+    what: "move the recorded ticked-row inset off the measurement",
+    file: THEME_TEST,
+    from: "    was: { active: 34, inactive: [40, 40] },",
+    to: "    was: { active: 35, inactive: [40, 40] },",
+    suite: "test:theme",
+    expect: [/10j: the mode-row gutter change is recorded as a decision/],
+    // The live geometry is untouched, so every measurement-side assertion must
+    // survive. If they do not, this has broken the menu rather than the
+    // premise and proves nothing about the ledger's arithmetic.
+    mustPass: [
+      /10j: every mode row's tick gutter ends at the same x, ticked or not/,
+      /10j: mode rows and scheme rows share ONE tick gutter/,
+    ],
+  },
+
+  {
+    id: "R394",
+    // THE HOLE THE FIRST FORM OF 10b COULD NOT SEE, and it is a live one
+    // rather than a hypothetical. styles.css declares TWO top-level
+    // `body.dark-mode` rules - the chrome variables near the top, and the
+    // entire Tomorrow Night syntax palette three hundred lines later. The
+    // original assertion took `findIndex`, i.e. the FIRST of them, so a scheme
+    // block pasted between the two satisfies "after the dark default" while
+    // losing every --syn-*/--tok-* it declares to the block that follows it.
+    // In dark mode only, with nothing failing.
+    //
+    // IT IS ADDITIVE AND APPEARANCE-NEUTRAL ON PURPOSE, exactly as R391 and
+    // R296 are: the stub declares a variable the REAL abyss block declares
+    // too, and the real block is later still, so it wins and nothing on
+    // screen moves. Only an assertion that reads rule POSITIONS - and reads
+    // the LAST dark block rather than the first - can see it. Under the old
+    // form this revert passes, which is what makes it a proof of the
+    // tightening rather than of the assertion's existence.
+    what: "paste a scheme block between the two dark-default blocks",
+    file: CSS,
+    from: "body.dark-mode {\n  /* Tomorrow Night, as ported into Folia.",
+    to: 'body[data-theme="abyss"] {\n  --syn-keyword: #bb9af7;\n}\n\nbody.dark-mode {\n  /* Tomorrow Night, as ported into Folia.',
+    suite: "test:theme",
+    expect: [/10b: every scheme block is declared AFTER the dark default/],
+  },
+  {
+    id: "R395",
+    // THE STRONGEST GUARD IN THE SUITE HAD THE NARROWEST SUBJECT LIST. The
+    // :root-substitution check - the footgun BOTH reviewers independently
+    // named as their top finding when this work was designed - filtered on
+    // `prop.indexOf('--tok-') !== 0`, so it covered 54 of the 59 var()-valued
+    // declarations in the document and was blind to --code-inline-bg,
+    // --code-inline-fg, --drop-overlay-fg and --welcome-readme-ink-hover. A
+    // family invented later would have been outside it on the day it was
+    // added. The replacement asks only the question Chromium's rule cares
+    // about - does the value contain var(), and can <body> reach the element
+    // that declares it - so it is family-agnostic by construction.
+    //
+    // THE REVERT IS A MOVE, NOT AN ADDITION, and that is what makes it a
+    // proof of the SCOPE half rather than of the count. Adding a declaration
+    // would trip the pinned total as well and the verdict would not say which
+    // half bit. Moving one keeps the total at 59 and leaves exactly one
+    // declaration at :root. Appearance barely moves - :root is an ancestor of
+    // <body>, so inline code keeps a background either way; what is lost is
+    // the ability of a body[data-theme] scheme to re-point --bg-tertiary
+    // underneath it, which is precisely the silent half-applied-scheme
+    // failure this assertion exists to prevent.
+    what: "declare a var()-valued custom property on :root instead of body",
+    file: CSS,
+    from: "  --code-inline-bg: var(--bg-tertiary);\n",
+    to: "",
+    also: {
+      from: ":root {\n",
+      to: ":root {\n  --code-inline-bg: var(--bg-tertiary);\n",
+    },
+    suite: "test:theme",
+    expect: [
+      /every custom property whose value contains var\(\) is declared where <body> can reach it/,
+    ],
+  },
+  {
+    id: "R396",
+    // THE PRODUCT DEFECT THIS PINS WAS REAL AND SHIPPED. Three in-content
+    // overlay buttons - copy-code, maximise-diagram, maximise-table - are all
+    // position:absolute + opacity:0, sitting over content that prints, and
+    // NONE of them was hidden by @media print. So exporting a PDF while the
+    // pointer rests on a code block, a table or a diagram prints the button
+    // over the content. It was found by an intermittent 10i failure that had
+    // been dismissed as a flake: the assertion is named for a PRINTED surface
+    // but filters on checkVisibility({opacityProperty:true}), which answers
+    // about the SCREEN, so mid-fade the button reports visible. The suite's
+    // own comment claimed the print stylesheet hid it; it did not.
+    //
+    // Only `.code-copy-btn` still carries `transition: all` - the other two
+    // are narrowed with !important in custom-styles.css - which is why it,
+    // and not its siblings, is what 10i caught animating. See below.
+    //
+    // ONE SELECTOR IS DROPPED FROM THE LIST RATHER THAN THE WHOLE RULE, so
+    // the derived print-hidden COUNT is untouched and only the assertion that
+    // names the three buttons can see it - i.e. this proves the overlay check
+    // rather than the count pin beside it.
+    //
+    // THE SCREEN-SIDE HALF IS DELIBERATELY NOT FIXED, and the reason is
+    // measured rather than assumed. `.code-copy-btn` still carries
+    // `transition: all 0.2s ease` (styles.css) while its two siblings are
+    // narrowed in custom-styles.css - a genuine inconsistency, and review
+    // called for adding it to that sweep. Doing so was tried and MOVED A
+    // FROZEN DEFAULT: the state-cascade sweep reported 54 cells of
+    // `button.code-copy-btn > svg` changing their hover fill from #1f8089
+    // (--accent-hover) to #279EA7 (--primary-color) in the light default.
+    // The settled colour cannot actually differ - the hover declaration is
+    // untouched by a transition-property change - so the sweep is reading a
+    // non-settled value for this element in one half of the swap. Either way
+    // the byte-exactness requirement outranks the tidy-up: an appearance the
+    // guard reports as moved is not shipped in this release.
+    what: "drop the copy button from the print hide rule",
+    file: CSS,
+    from: "  .code-copy-btn,\n  .mermaid-maximize-btn,",
+    to: "  .mermaid-maximize-btn,",
+    suite: "test:theme",
+    expect: [/10i: the in-content overlay buttons are hidden in print/],
+  },
+  {
+    id: "R397",
+    // THE COUNT PIN BESIDE R396, AND IT BITES FROM THE OPPOSITE DIRECTION.
+    // The print-hidden list is what 10i's settle probe is ALLOWED TO IGNORE,
+    // so the failure mode that matters is it silently GROWING: every selector
+    // added to it is a surface that stops being watched. Additive and
+    // appearance-neutral on purpose (the selector matches nothing in the
+    // product), so no contrast, fidelity or settle assertion can see it and
+    // only the pinned size does.
+    what: "add a sixth display:none rule under @media print",
+    file: CSS,
+    from: "  .code-copy-btn,\n  .mermaid-maximize-btn,",
+    to: "  .folia-revert-r397-probe {\n    display: none;\n  }\n\n  .code-copy-btn,\n  .mermaid-maximize-btn,",
+    suite: "test:theme",
+    expect: [
+      /10i: the print-hidden exclusion is derived from the print stylesheet and is the pinned measured size/,
+    ],
+  },
+  {
+    id: "R398",
+    // A TEST-SIDE REVERT, same precedent as R361/R362/R363. 10n's probe used
+    // `querySelector('.tools-menu')` with an unguarded `|| document.body`
+    // fallback, which resolved #mainMenu - the wrong panel - and would have
+    // scored the toggle against <body> had the menu markup ever moved. The
+    // fallback is gone and the panel is resolved by id, but "the probe found
+    // the real menu" is an absence check over a derived subject list, and
+    // this project has been bitten five times by one of those failing open.
+    // Pointing the lookup at an id that does not exist is exactly the
+    // accident a markup rename produces.
+    what: "resolve 10n's menu panel by a non-existent id",
+    file: THEME_TEST,
+    from: "const menu = document.getElementById('viewMenu');",
+    to: "const menu = document.getElementById('viewMenuRenamed');",
+    suite: "test:theme",
+    expect: [
+      /10n: every toggle surface resolved to a real element/,
+      // ONE HONEST CONSEQUENCE, listed rather than hunted down. With no menu
+      // panel there is no menu fill, so the WCAG comparison has one of its
+      // four surfaces missing and scores null - the same defect seen from the
+      // assertion that CONSUMES the probe rather than a second one. It is
+      // listed and not dodged because the resolution control is asserted
+      // FIRST and separately, so the verdict names the cause, not the
+      // wreckage.
+      //
+      // A THIRD FAILURE USED TO BE LISTED HERE and it was a mistake: the
+      // frozen-ratio map called .toFixed() on those nulls and threw, so the
+      // suite's catch path reported "harness ran without throwing" - a string
+      // that names no catalogued assertion, which turned the --expects audit
+      // RED. That was a defect in the instrument, not a consequence worth
+      // recording, and the map is null-guarded now.
+      /10n: every scheme's toggle track meets WCAG 1\.4\.11 \(3:1\)/,
+    ],
+  },
+  {
+    id: "R399",
+    // THE MAGIC-FLOOR DISEASE, FIFTH INSTANCE. 10m's same-selector floor
+    // shipped as `>= 700` against a measured 1455, i.e. it would stay green
+    // with 755 baseline declarations - more than half the corpus - silently
+    // no longer being compared while the assertion went on claiming chrome
+    // fidelity. The realistic accident is not a hand-edited constant, it is
+    // the sweep quietly measuring less: a readDecls regression on a nesting
+    // shape, a sheet failing to load, or a deliberate "make this faster"
+    // narrowing. R371 is the same shape one section down.
+    //
+    // A NARROWING IS USED RATHER THAN A LOOSENED CONSTANT because loosening
+    // the constant cannot FAIL anything - it only makes the guard weaker, so
+    // the suite stays green and the revert proves nothing.
+    what: "narrow 10m's baseline sweep to the first 800 declarations",
+    file: THEME_TEST,
+    from: "    for (const o of oldDecls) {\n      if (o.prop.startsWith(\"--\")) continue;",
+    to: "    for (const o of oldDecls.slice(0, 800)) {\n      if (o.prop.startsWith(\"--\")) continue;",
+    suite: "test:theme",
+    expect: [
+      /10m: every baseline declaration that kept its selector still paints the baseline value/,
+      // AN INDEPENDENT SECOND WITNESS TO THE SAME THINNING, and worth listing
+      // rather than narrowing the revert to dodge it: the removals ledger is
+      // derived from the SAME sweep, so truncating the corpus also truncates
+      // the set of recorded removals it reconciles against. Two assertions
+      // built on one subject list failing together is the layered coverage
+      // working, not collateral.
+      /10m: every baseline declaration that no longer matches any rule is a recorded removal/,
+    ],
+  },
+  {
+    id: "R400",
+    // THE MODE ROWS HAD NO BEHAVIOURAL COVERAGE AT ALL until 10o. Every prior
+    // section drives `.custom-scheme-option`; nothing had ever clicked a
+    // `.custom-theme-option`, so applyTheme() through a real click, the tick
+    // moving between mode rows, and the menu dismissing were all unproven.
+    // closeMenu() was extracted precisely because its two callers repeat a
+    // non-obvious pair - remove the class AND defer a body click, the
+    // deferral being load-bearing because a synchronous body click inside a
+    // handler that has called stopPropagation is handled before the event
+    // unwinds - and a non-obvious pair with two copies is the shape that
+    // silently diverges. Dropping the call from the mode-row branch is what
+    // that divergence looks like: scheme rows still dismiss, mode rows leave
+    // the submenu hanging open over the document.
+    what: "stop dismissing the menu after a mode-row click",
+    file: THEME_JS,
+    from: "        applyTheme(opt.dataset.mode);\n        closeMenu();",
+    to: "        applyTheme(opt.dataset.mode);",
+    suite: "test:theme",
+    expect: [
+      /10o: clicking each mode row stores that mode, moves the tick to it alone, and dismisses the menu/,
+    ],
+  },
+  {
+    id: "R401",
+    // THE OS LISTENER'S GUARD, WHICH NOTHING REACHED. A listener that
+    // re-applies UNCONDITIONALLY satisfies "the app follows the OS" perfectly
+    // and is a worse bug than one that never fires: a reader who deliberately
+    // pinned Light gets dragged into dark at sunset, on a preference they
+    // explicitly set. Only the negative half of 10o can see it, which is why
+    // that half exists beside the positive one.
+    //
+    // The revert is driven through CDP Emulation.setEmulatedMedia rather than
+    // a synthetic event: window.matchMedia returns a FRESH MediaQueryList per
+    // call, so dispatching `change` at a new instance never reaches the
+    // listener the product registered on ITS instance - the test would pass
+    // against a copy of the mechanism.
+    what: "let the OS listener re-theme a pinned mode",
+    file: THEME_JS,
+    from: '        if (storedMode() === "desktop") {',
+    to: "        if (true) {",
+    suite: "test:theme",
+    expect: [/10o: a pinned mode is NOT dragged around by the OS/],
+  },
+  {
+    id: "R402",
+    // THE keepFollowing BRANCH, WHICH EXISTED ONLY AS A COUNTERFACTUAL IN ITS
+    // OWN COMMENT. Picking a scheme normally switches the app to that
+    // scheme's mode, because that is what clicking it means. The exception is
+    // a reader on Follow Desktop picking a scheme whose mode the OS is
+    // already resolving to: the choice must be recorded WITHOUT pinning, or
+    // choosing a dark scheme at night silently pins the app to dark for good
+    // and the reader's window stays dark the next morning with no obvious
+    // cause. Deleting the ternary is exactly the "simplify this" edit that
+    // reads as tidy-up and is a one-way door for the reader.
+    what: "make picking a scheme always pin its mode",
+    file: THEME_JS,
+    from: '    applyTheme(keepFollowing ? "desktop" : scheme.mode);',
+    to: "    applyTheme(scheme.mode);",
+    suite: "test:theme",
+    expect: [
+      /10o: choosing a scheme whose mode the OS already resolves to records it WITHOUT pinning the mode/,
+    ],
+  },
+  {
+    id: "R403",
+    // A LIGHT-ONLY DRIFT IN --on-accent-fg, WHICH THE SECTION-5 READ COULD NOT
+    // SEE. Section 5's `for (const mode of ["light","dark"])` loop reads the
+    // CAPTURED census for everything except one live read, and
+    // captureBothModes() runs light-then-dark, so it leaves the page in DARK.
+    // Both iterations therefore measured dark and the `light:` assertion was a
+    // verbatim duplicate of the `dark:` one - it established nothing about
+    // light at all. This revert is the mode-scoped redeclaration that assertion
+    // exists to catch, and it is deliberately LIGHT-ONLY: a change to the dark
+    // value fails both halves and so cannot distinguish the two.
+    //
+    // THREE ASSERTIONS ARE LISTED AND THAT IS THE DISCRIMINATOR, not padding.
+    // Two of them (the census-side ink comparisons) fail either way, because
+    // the census captures light with the drifted value regardless of where the
+    // page is left. Only the third can fail once the mode is really applied. So
+    // with the fix in place this reports PROVEN, and with the fix removed it
+    // reports WRONG-GUARD on exactly the assertion the fix is for, rather than
+    // quietly passing on the collateral.
+    what: "drift --on-accent-fg in light mode only",
+    file: CSS,
+    from: "/* Dark mode variables */\nbody.dark-mode {",
+    to: "body:not(.dark-mode) {\n  --on-accent-fg: #fefefe;\n}\n\n/* Dark mode variables */\nbody.dark-mode {",
+    suite: "test:theme",
+    // TWO FURTHER FAILURES ARE LISTED BECAUSE THEY ARE HONEST CONSEQUENCES,
+    // not noise to be tuned away. --on-accent-fg paints button labels across
+    // the chrome, so drifting it in light really does move painted state
+    // colours (the frozen-default state sweep) and really does make a baseline
+    // declaration re-resolve to a new value (10m). Both are the guards doing
+    // their job on a real appearance change; narrowing this record by hunting
+    // for a value that dodges them would be a search over colours rather than
+    // a proof.
+    expect: [
+      /^light: the frozen default still resolves --on-accent-fg to the white the baseline baked$/,
+      /^light: ::selection paints the golden's INK, not just its fill$/,
+      /^light: the frozen default's code selection ink is still the app-wide selection ink it used to inherit$/,
+      /^neither frozen default has changed a single state colour since HEAD$/,
+      /^10m: every baseline declaration that kept its selector still paints the baseline value$/,
+    ],
+  },
+  {
+    id: "R404",
+    // THE @media BLIND SPOT IN THE SUBSTITUTION-SCOPE SWEEP. The census used
+    // to iterate top-level cssRules only, so a var()-valued custom property
+    // declared at :root INSIDE an @media or @supports group was neither
+    // reported as misplaced nor counted in the pinned total - it was invisible
+    // on both axes at once, which is why the count pin could not catch it
+    // either. Both reviewers found this independently.
+    //
+    // THE PLANT IS DELIBERATELY CONSUMED BY NOTHING, so it changes no
+    // appearance anywhere and cannot fail a fidelity, contrast or chrome
+    // assertion as collateral. That isolation is the point: the only thing
+    // that can notice this rule is a sweep that actually descends into
+    // grouping rules, so the verdict names the recursion rather than a
+    // repaint.
+    what: "declare a var()-valued custom property at :root inside @media",
+    file: CSS,
+    from: "  --toggle-on-bg: #4fc3f7;\n}",
+    to: "  --toggle-on-bg: #4fc3f7;\n}\n\n@media screen {\n  :root {\n    --folia-revert-r404-probe: var(--primary-color);\n  }\n}",
+    suite: "test:theme",
+    expect: [
+      /^every custom property whose value contains var\(\) is declared where <body> can reach it, never on :root$/,
+    ],
+  },
+  {
+    id: "R405",
+    // THE OFF-STATE TRACK, WHICH WAS MEASURED AND THEN THROWN AWAY. 10n
+    // computes four relations for every toggle - on-vs-thumb, on-vs-menu,
+    // on-vs-hover and on-vs-off - but FROZEN_TOGGLE_RATIOS pinned only the
+    // first three, so the frozen defaults' off-state relation was computed on
+    // every run and compared against nothing. A review round found it.
+    //
+    // The off track is `background: var(--border-color)` on
+    // .tools-toggle-track, so this repaints it and leaves the on state, the
+    // thumb, the menu and the hover fill exactly where they were: of the four
+    // relations only vsOff can move. Without the vsOff entry the frozen-drift
+    // assertion therefore sees nothing at all.
+    what: "repaint the toggle's off-state track",
+    file: CSS,
+    from:
+      ".tools-toggle-track {\n  width: 36px;\n  height: 20px;\n  border-radius: 10px;\n  background: var(--border-color);",
+    to: ".tools-toggle-track {\n  width: 36px;\n  height: 20px;\n  border-radius: 10px;\n  background: #7a7a7a;",
+    suite: "test:theme",
+    // THE SECOND FAILURE IS THE SAME EDIT SEEN FROM THE SCHEMES' SIDE, and it
+    // is listed rather than dodged. .tools-toggle-track is ONE rule shared by
+    // every theme, so repainting it moves the off-state relation for the four
+    // schemes as well as for the two frozen defaults. The frozen assertion is
+    // what this revert is for - it is the half that did not exist before vsOff
+    // was pinned - and the scheme bar failing alongside it is the bar working.
+    // Notably the state sweep does NOT fire here: the toggle is menu chrome
+    // that only paints while the submenu is open, which is precisely why a
+    // relation pin is needed and a resting-surface sweep is not enough.
+    expect: [
+      /^10n: the frozen defaults keep the exact switch appearance they shipped with, sub-bar ratios included$/,
+      /^10n: every scheme's toggle track meets WCAG 1\.4\.11 \(3:1\) against the thumb, the menu, the hover fill and the off state$/,
+    ],
+  },
+  {
+    id: "R406",
+    // A COLOUR READ WHILE A TRANSITION IS RUNNING IS THE PREVIOUS STATE'S
+    // COLOUR, and it is indistinguishable from a real measurement. 10n flips
+    // .active on and off and reads the track SYNCHRONOUSLY across each flip,
+    // and .tools-toggle-track carries a 0.2s background transition - the exact
+    // pairing that produced five convincing false failures when 10c/10d were
+    // written, and the reason settleTransitions() exists at all.
+    //
+    // The four frozen ratios are nevertheless correct today, and the reason is
+    // nothing to do with 10n's code: the View submenu is display:none while
+    // shut, so the track has NO BOX and no transition can run on it, while
+    // getComputedStyle still resolves its colours exactly as it does for a
+    // painted element. That is accidental safety, and 10o now opens the menu
+    // for the mode rows a few hundred lines earlier - so the accident is one
+    // reordering away from silently turning all four ratios into transients.
+    //
+    // THIS IS A TEST-SIDE REVERT (precedent R361/R362/R363): the realistic
+    // accident is not a product edit but a future section leaving the menu
+    // open, so the revert reproduces that rather than breaking a rule. It uses
+    // the PRODUCT'S OWN open path - hamburger, then View - because a first
+    // attempt that merely added 'visible' to #viewMenu came back VACUOUS: the
+    // parent #mainMenu was still shut, so the panel stayed unpainted and the
+    // track still had no box. Same finding 10j records for the submenu.
+    what: "leave the View menu open before the 10n toggle probe reads it",
+    file: THEME_TEST,
+    from:
+      "            const menu = document.getElementById('viewMenu');\n            const item = document.getElementById('fullscreenToggle');",
+    to:
+      "            const menu = document.getElementById('viewMenu');\n            const rMb = document.getElementById('menuBtn'); if (rMb) rMb.click();\n            const rVb = document.getElementById('viewBtn'); if (rVb) rVb.click();\n            const item = document.getElementById('fullscreenToggle');",
+    suite: "test:theme",
+    // THE PREDICTION THIS COMMENT ORIGINALLY CARRIED WAS FALSIFIED, and the
+    // measurement is recorded instead. It said the four ratios might not move,
+    // because whether Chromium has started the transition by the time the
+    // forced recalc answers looked like a timing question. It is not: with the
+    // menu open the probe reports running=1 hasBox=true and BOTH ratio
+    // assertions fail. So the transients are not a theoretical hazard - the
+    // measurement really does go wrong the moment the track has a box, which
+    // is why the guard bites on the CAUSE and is worth having.
+    //
+    // Three of the six states report hasBox=false: the suite reapplies a theme
+    // between states and the menu is dismissed on the way, so only alternate
+    // iterations are still open. That is enough to fail, and it is left as it
+    // falls rather than forced - the guard's claim is "no transition ran",
+    // not "the menu was open every time".
+    expect: [
+      /^10n: no CSS transition was running on the toggle track while its colours were read$/,
+      /^10n: every scheme's toggle track meets WCAG 1\.4\.11 \(3:1\) against the thumb, the menu, the hover fill and the off state$/,
+      /^10n: the frozen defaults keep the exact switch appearance they shipped with, sub-bar ratios included$/,
+    ],
+  },
+  {
+    id: "R407",
+    // A SHIPPED CLAIM THAT NAMES THINGS BY LABEL GOES STALE SILENTLY. README.md
+    // is not repository prose here - extraResources puts it inside the
+    // installer and the in-app welcome button opens it - so the Themes bullet
+    // is a claim the PRODUCT makes about itself, and this release IS the themes
+    // feature. Renaming a scheme in the registry while the sentence stands
+    // still is the likeliest way for it to become false, and it is exactly the
+    // shape that put four non-existent keyboard shortcuts in this same file.
+    //
+    // The rename is one character so nothing else can plausibly be blamed for
+    // the failure, and it is made in the REGISTRY rather than in the README:
+    // an oracle that reads the prose and compares it against a second copy of
+    // the list would pass this, which is the whole reason the registry is the
+    // source of truth.
+    what: "rename a scheme in the registry without updating the README",
+    file: THEME_JS,
+    from: '{ id: "ember", label: "Ember", mode: "dark" }',
+    to: '{ id: "ember", label: "Emberr", mode: "dark" }',
+    suite: "test:packaging",
+    expect: [
+      /^the README names every colour scheme the theme menu actually offers$/,
+    ],
+  },
+  {
+    id: "R408",
+    // THE PARSER USED TO DISCARD A BLOCK'S LAST DECLARATION WHEN IT CARRIED NO
+    // TRAILING SEMICOLON, which CSS does not require. 10m's claim is that every
+    // baseline declaration is re-resolved and still paints its baseline value;
+    // a dropped declaration does not fail that claim, it silently leaves the
+    // set the claim is made about - this project's most-repeated defect shape.
+    //
+    // MEASURED, AND THE FIX IS INERT TODAY: both trees are prettier-formatted,
+    // so the parse is byte-identical with and without the flush (baseline
+    // 1569/188, current 1946/198). The end-to-end counts therefore CANNOT pin
+    // it, which is why the property is pinned by a unit case instead and why
+    // this revert targets that case. Same precedent as R202 and R372 - an
+    // unreachable guard is still a contract, and the first hand-edited rule
+    // that omits a trailing semicolon makes it reachable with no warning.
+    what: "drop a block's last declaration when it has no trailing semicolon",
+    file: THEME_TEST,
+    from: "          flush(s.slice(start, i));\n          stack.pop();",
+    to: "          stack.pop();",
+    suite: "test:theme",
+    expect: [
+      /^10m: the declaration parser reads a block's last declaration when it has no trailing semicolon$/,
+    ],
+  },
+  {
+    id: "R409",
+    // THE DEFECT ITSELF, RESTING HALF. .code-copy-btn is fully tokenised, but
+    // its .copied confirmation used to override ONLY the background, with a
+    // raw literal - so every scheme went on supplying the INK for a fill it
+    // could not reach, and the four white-ink states measured 2.87:1.
+    //
+    // IT WAS PROVEN UNCOVERED BEFORE IT WAS FIXED: a 1.0:1 fill planted in one
+    // scheme left the whole suite green at 351/351. The frozen defaults are
+    // BYTE-EXACT either way, which is precisely why no fidelity sweep could
+    // see it - the literal reproduces the baseline perfectly.
+    what: "re-inline the raw #27ae60 confirmation fill, stranding every scheme",
+    file: CSS,
+    from: ".code-copy-btn.copied {\n  background: var(--success-bg);",
+    to: ".code-copy-btn.copied {\n  background: #27ae60;",
+    suite: "test:theme",
+    expect: [
+      /^10p: every scheme reaches the copy-confirmation fill instead of inheriting the frozen literal$/,
+      /^10p: every scheme's copy confirmation meets WCAG AA against its own ink, resting and on hover$/,
+      // HONEST CONSEQUENCES, recorded rather than narrowed away: the literal
+      // ledger sweep is what FOUND this shape, so re-creating it must show up
+      // there as an unrecorded entry; and the rule-shape assertion names the
+      // fill as well as the ink, so de-tokenising the fill trips it too.
+      /^10p: every screen-scope literal paint declaration is a recorded self-consistent cell, not a stranded fill$/,
+      /^10p: the copy-confirmation rules consume the success tokens for both their fill and their ink$/,
+    ],
+    mustPass: [
+      /^10p: both frozen defaults keep the exact copy-confirmation appearance, sub-AA ratios included$/,
+      /^10p: the copy-confirmation hover rule was really replayed in every state \(positive control\)$/,
+    ],
+  },
+  {
+    id: "R410",
+    // THE HOVER HALF, SEPARATELY. The two fills are independent declarations
+    // and a hand edit reaches one at a time; the hover cell is also the worse
+    // of the two (2.10:1 against 2.87:1) because #2ecc71 is lighter still.
+    what: "re-inline the raw #2ecc71 confirmation hover fill",
+    file: CSS,
+    from: ".code-copy-btn.copied:hover {\n  background: var(--success-bg-hover);",
+    to: ".code-copy-btn.copied:hover {\n  background: #2ecc71;",
+    suite: "test:theme",
+    expect: [
+      /^10p: every scheme reaches the copy-confirmation fill instead of inheriting the frozen literal$/,
+      /^10p: every scheme's copy confirmation meets WCAG AA against its own ink, resting and on hover$/,
+      /^10p: every screen-scope literal paint declaration is a recorded self-consistent cell, not a stranded fill$/,
+      /^10p: the copy-confirmation rules consume the success tokens for both their fill and their ink$/,
+    ],
+    mustPass: [
+      /^10p: both frozen defaults keep the exact copy-confirmation appearance, sub-AA ratios included$/,
+      /^10p: the copy-confirmation hover rule was really replayed in every state \(positive control\)$/,
+    ],
+  },
+  {
+    id: "R411",
+    // THE INK TOKEN, WHICH NO BEHAVIOURAL ASSERTION CAN REACH. Every state's
+    // --on-success-fg is currently the same colour as its --on-accent-fg, so
+    // deleting this declaration moves NO pixel in any of the six states - the
+    // ink simply falls back to the base rule and resolves identically. What it
+    // costs is control: the token becomes dead paint, and the first scheme
+    // that wants a different ink on its confirmation surface finds the rule
+    // ignoring it. Same precedent as R202 and R408 - an unreachable guard is
+    // still a contract - which is why the property is pinned structurally and
+    // this revert is narrow by construction.
+    what: "stop the confirmation rule consuming its own ink token",
+    file: CSS,
+    from: "  background: var(--success-bg);\n  color: var(--on-success-fg);",
+    to: "  background: var(--success-bg);",
+    suite: "test:theme",
+    expect: [
+      /^10p: the copy-confirmation rules consume the success tokens for both their fill and their ink$/,
+    ],
+    mustPass: [
+      /^10p: every scheme's copy confirmation meets WCAG AA against its own ink, resting and on hover$/,
+      /^10p: both frozen defaults keep the exact copy-confirmation appearance, sub-AA ratios included$/,
+    ],
+  },
 ];
 
 const argv = process.argv.slice(2);
@@ -5861,6 +8417,22 @@ function runSuite(suite) {
   }
 }
 
+// THE MATCHING SUBJECT IS THE ASSERTION NAME, NOT THE WHOLE FAIL LINE, and both
+// review models raised this independently as the harness's own weakest link.
+// A suite prints `FAIL  <name>  -> <evidence>`, and the evidence quotes real
+// selectors, properties and colour values. Matching an `expect` regex against
+// that whole string means a record can be satisfied by text the SUITE chose to
+// print about a DIFFERENT assertion's subject - so a revert could report PROVEN
+// while the assertion it names never failed. Names are extracted once, here, and
+// every verdict decision below tests against the name alone. The full line is
+// still what gets PRINTED, because the evidence is the diagnosis.
+function assertionNameOf(line) {
+  return line
+    .replace(/^(PASS|FAIL)\s+/, "")
+    .split("  ->")[0]
+    .trim();
+}
+
 function failedNames(out) {
   return out
     .split(/\r?\n/)
@@ -5868,16 +8440,126 @@ function failedNames(out) {
     .map((l) => l.trim());
 }
 
-// Every assertion the suite emitted, rendered in the SAME shape failedNames()
-// produces, so the audit tests each regex against exactly the string the real
-// matching would see rather than against a hand-normalised approximation.
+// Every assertion the suite emitted, reduced to the same NAME the verdict logic
+// matches against, so the audit tests each regex against exactly the string the
+// real matching would see rather than against a hand-normalised approximation.
 function assertionNames(out) {
   return out
     .split(/\r?\n/)
     .map((l) => l.trim())
     .filter((l) => /^(PASS|FAIL)\s/.test(l))
-    .map((l) => "FAIL  " + l.replace(/^(PASS|FAIL)\s+/, ""));
+    .map(assertionNameOf);
 }
+
+// A POSITIVE CONTROL FOR THE ANCHORING ITSELF. An absence check fails open: if
+// assertionNameOf ever stopped stripping the evidence, every regex would match
+// MORE and the audit below would report a clean sweep - the exact false-clean
+// this project has recorded three times. So synthetic lines in the real
+// `FAIL  <name>  -> <evidence>` shape are put through the same reduction and the
+// evidence half must be unreachable while the name half stays reachable.
+//
+// THE SECOND HALF IS THE ONE THAT WAS MISSING, AND IT IS WHY THIS HOLE STAYED
+// OPEN. The reduction is only as good as the suites' agreement on the
+// separator, and TWO of the eleven formatted their own FAIL lines differently
+// (`test-packaging.js` used " - ", `test-userdata-migration.js` a bare "  "),
+// so for those suites the reduction was a NO-OP and every `expect` regex went
+// on matching evidence. A control over synthetic lines alone cannot see that -
+// it never reads a suite. So the suites' own formatters are checked here too.
+// The suite list is DERIVED FROM DISK rather than hand-maintained: a literal
+// list is precisely the thing that goes stale, and a stale list would omit the
+// next suite silently - reopening this hole in the one place nobody looks.
+// Every `test/test-*.js` that CONSTRUCTS a FAIL line is in scope. Matching on
+// `console.log` alone is not enough and that was measured, not assumed: four
+// suites (theme, startup-perf, visual-utils-selfcheck and the packaging
+// summary) build the line into a variable or an array and print it later, so a
+// console.log-shaped detector reported a clean sweep while never reading the
+// largest suite in the project.
+function failFormatterLines() {
+  const out = [];
+  const dir = path.join(ROOT, "test");
+  for (const f of fs.readdirSync(dir).filter((n) => /^test-.*\.js$/.test(n))) {
+    const src = fs.readFileSync(path.join(dir, f), "utf8");
+    for (const l of src.split(/\r?\n/)) {
+      const t = l.trim();
+      if (t.startsWith("//") || t.startsWith("*")) continue;
+      if (/(["'`])[^"'`]*\bFAIL\b/.test(t)) out.push([f, t]);
+    }
+  }
+  return out;
+}
+
+function proveNameAnchoring() {
+  const cases = [
+    // The shape nine suites emit.
+    ["FAIL  10i: the export preparation completed  -> abyss: box-shadow rgb(39, 158, 167)",
+     /the export preparation completed/, /box-shadow|rgb\(39/],
+    // The shape test-packaging.js emits (its names legitimately contain " - ",
+    // so the separator has to be the same two-space arrow as everywhere else
+    // rather than something this function special-cases).
+    ["  FAIL  the README names every colour scheme the theme menu actually offers  -> undocumented: [\"Emberr\"]",
+     /the README names every colour scheme the theme menu actually offers/, /undocumented|Emberr/],
+    // The shape test-userdata-migration.js emits.
+    ["FAIL  the shared helper is required at module scope  -> indented at line 41",
+     /the shared helper is required at module scope/, /indented at line/],
+  ];
+  for (const [line, nameRe, evidenceRe] of cases) {
+    const name = assertionNameOf(line);
+    if (!nameRe.test(name) || evidenceRe.test(name)) {
+      console.error(
+        `SELF-CHECK FAILED: expect/mustPass matching is not anchored to the assertion name ` +
+          `(name reachable=${nameRe.test(name)}, evidence reachable=${evidenceRe.test(name)}, ` +
+          `reduced=${JSON.stringify(name)}).`,
+      );
+      process.exit(2);
+    }
+  }
+
+  // Every suite must separate its evidence with the arrow the reduction splits
+  // on. A suite that does not is not loudly broken - it silently stops being
+  // name-anchored, which is the failure this whole mechanism exists to remove.
+  // Only formatters that ATTACH EVIDENCE are in scope. Several suites print a
+  // bare fatal line ("FAIL  no BrowserWindow was created") with no detail at
+  // all; there the name IS the whole line and there is nothing to separate.
+  // What matters is a formatter that appends a dynamic value - an interpolation,
+  // a concatenation or a second console.log argument - since that is the text
+  // an `expect` regex could otherwise be satisfied by.
+  const formatters = failFormatterLines().filter(([, l]) =>
+    /\$\{|\s\+\s|",\s*\S|',\s*\S/.test(l),
+  );
+  // THE FLOOR IS THE MEASURED COUNT, NOT A ROUND NUMBER WITH HEADROOM. This
+  // project has three recorded cases of a vacuity floor sitting so far below
+  // the real population that the sweep could lose most of its coverage and
+  // still report itself pinned. The count is also PRINTED, so it can never
+  // again pass at a number nobody has read.
+  const FAIL_FORMATTER_COUNT = 18;
+  if (formatters.length < FAIL_FORMATTER_COUNT) {
+    console.error(
+      `SELF-CHECK FAILED: found ${formatters.length} evidence-attaching suite FAIL formatter(s), ` +
+        `expected at least ${FAIL_FORMATTER_COUNT}; the format check is not reading the suites ` +
+        `it claims to vouch for.`,
+    );
+    process.exit(2);
+  }
+  const offenders = formatters
+    .filter(([, l]) => !l.includes("  -> "))
+    .map(([f, l]) => `${f}: ${l}`);
+  if (offenders.length) {
+    console.error(
+      `SELF-CHECK FAILED: ${offenders.length} suite FAIL formatter(s) do not use the "  -> " ` +
+        `evidence separator, so expect/mustPass would match their evidence text:\n  ` +
+        offenders.join("\n  "),
+    );
+    process.exit(2);
+  }
+  console.log(
+    `name-anchoring self-check OK: ${formatters.length} evidence-attaching FAIL formatter(s), ` +
+      `all using the "  -> " separator`,
+  );
+}
+
+// Runs on EVERY invocation - audit, anchors and full run alike - because the
+// verdict logic below depends on it just as much as the audit does.
+proveNameAnchoring();
 
 if (expectsOnly) {
   const suites = [...new Set(chosen.map((r) => r.suite || "test:tables"))].sort();
@@ -6017,13 +8699,14 @@ for (const r of chosen) {
     for (const [file, text] of originals) fs.writeFileSync(file, text);
   }
   const fails = failedNames(out);
-  const missing = r.expect.filter((re) => !fails.some((f) => re.test(f)));
+  const failNames = fails.map(assertionNameOf);
+  const missing = r.expect.filter((re) => !failNames.some((f) => re.test(f)));
   // A revert can "prove" itself by coincidence: if the setup assertion that
   // makes the real assertion meaningful ALSO fails, the expected name still
   // appears in the failure list while nothing has actually been demonstrated.
   // mustPass names the assertions that have to survive the revert for its
   // proof to mean what it claims.
-  const collateral = (r.mustPass || []).filter((re) => fails.some((f) => re.test(f)));
+  const collateral = (r.mustPass || []).filter((re) => failNames.some((f) => re.test(f)));
   if (fails.length === 0) {
     console.log(`${r.id}  VACUOUS       suite stayed green with the fix removed  (${r.what})`);
     bad += 1;
@@ -6039,7 +8722,27 @@ for (const r of chosen) {
     bad += 1;
   } else {
     console.log(`${r.id}  PROVEN        ${fails.length} assertion(s) failed  <- ${r.what}`);
-    for (const f of fails.slice(0, 4)) console.log(`        ${f}`);
+    // THE `expect` LIST IS THE RECORD OF WHAT THIS REVERT CLAIMS TO BREAK, and
+    // until now nothing checked it for COMPLETENESS. `collateral` is computed
+    // from `mustPass` only, so a failure outside both lists was invisible - it
+    // had to be spotted by reading the output, which cost three separate
+    // diagnoses in this project. Worse, the printed set was capped at four, so
+    // the unlisted ones were often not even on screen to be read.
+    //
+    // Verdicts are DELIBERATELY UNCHANGED: an unlisted failure is frequently an
+    // honest consequence of the revert (R348 breaks three assertions for one
+    // edit) rather than a defect, so turning it into a failure would punish
+    // accuracy. It is surfaced instead, so the author decides whether to widen
+    // `expect` or leave it - but can no longer do so by not noticing.
+    const expected = fails.filter((f) => (r.expect || []).some((re) => re.test(assertionNameOf(f))));
+    const unlisted = fails.filter((f) => !(r.expect || []).some((re) => re.test(assertionNameOf(f))));
+    for (const f of expected.slice(0, 4)) console.log(`        ${f}`);
+    if (unlisted.length) {
+      console.log(
+        `        ~ ${unlisted.length} further failure(s) not named in expect:`,
+      );
+      for (const f of unlisted) console.log(`        ~ ${f.split("  ->")[0]}`);
+    }
   }
 }
 

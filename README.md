@@ -215,7 +215,7 @@ The menu adapts to the mode you are in.
 - **Drag and drop** - drop a markdown file onto the window to open it
 - **Table of contents** - hierarchical, H1-H6, one click to jump, current section highlighted
 - **Search** with live highlighting, match counter and keyboard navigation (Ctrl+F)
-- **Theme** - Light, Dark, or follow the desktop's appearance in real time
+- **Themes** - Light, Dark, or follow the desktop's appearance in real time, each with a choice of colour scheme under **View > Themes**: Default Light, Clarity and Parchment for light; Default Dark, Abyss and Ember for dark. Folia remembers a scheme per mode, so following the desktop switches between your chosen light and dark schemes rather than a fixed pair.
 - **Zoom** - 50% to 400%
 - **Collapsible headings** - fold and unfold sections, individually or all at once
 - **Recent files** - the last 100

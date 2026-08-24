@@ -58,7 +58,16 @@ function check(name, ok, detail) {
     console.log(`  PASS  ${name}`);
   } else {
     fail++;
-    console.log(`  FAIL  ${name}${detail ? " - " + detail : ""}`);
+    // THE SEPARATOR IS `  -> `, MATCHING EVERY OTHER SUITE, AND THAT IS
+    // LOAD-BEARING RATHER THAN COSMETIC. The revert harness anchors `expect`
+    // and `mustPass` to the assertion NAME, which it recovers by splitting a
+    // FAIL line on "  ->". This suite used to separate its evidence with " - ",
+    // so the name it recovered still carried the evidence - and a revert's
+    // regex could be satisfied by a selector, a filename or a colour the suite
+    // happened to print about a DIFFERENT assertion. That is exactly the hole
+    // assertionNameOf() was introduced to close, left open in the two suites
+    // that formatted their own output differently.
+    console.log(`  FAIL  ${name}${detail ? "  -> " + detail : ""}`);
   }
 }
 
@@ -824,6 +833,33 @@ function main() {
       claimedExts.length === winAssoc.length
         && claimedExts.every((e, i) => e === winAssoc[i]),
       JSON.stringify({ readme: claimedExts, build: winAssoc }),
+    );
+
+    // THE THEMES BULLET NAMES SIX SCHEMES BY LABEL, and a label is exactly the
+    // kind of claim that goes stale silently: adding a seventh scheme, renaming
+    // one, or dropping one all leave the sentence reading perfectly while
+    // describing a product that no longer exists. This is the same disease the
+    // shortcut table had - a reader tests it in seconds and it is wrong.
+    // The oracle is the REGISTRY in src/custom-theme.js, never a second copy of
+    // the list maintained beside the assertion.
+    const themeSrc = read("src/custom-theme.js");
+    const schemeLabels = [...themeSrc.matchAll(/\blabel:\s*"([^"]+)",\s*mode:\s*"(?:light|dark)"/g)]
+      .map((m) => m[1]);
+    check(
+      "the theme registry declares the schemes the README's claim is checked against",
+      schemeLabels.length >= 6,
+      JSON.stringify(schemeLabels),
+    );
+    const themesBullet = (readme.match(/^- \*\*Themes\*\*[^\n]+$/m) || [])[0] || "";
+    const undocumented = schemeLabels.filter(
+      (l) => !new RegExp(`\\b${l.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}\\b`).test(themesBullet),
+    );
+    check(
+      "the README names every colour scheme the theme menu actually offers",
+      themesBullet !== "" && undocumented.length === 0,
+      themesBullet === ""
+        ? "the Themes bullet was reworded or removed, so nothing is being checked"
+        : `undocumented: ${JSON.stringify(undocumented)}`,
     );
 
     // Every artefact the release workflow publishes has to appear in the

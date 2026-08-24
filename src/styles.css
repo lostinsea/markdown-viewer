@@ -119,6 +119,20 @@
   --danger-bg: #e74c3c;
   --danger-bg-hover: #c0392b;
   --on-danger-fg: #ffffff;
+  /* The SUCCESS surface and its ink - the code-copy button's ~2s "Copied"
+     state. Exactly the --danger-bg shape and tokenised for exactly the same
+     reason: the button's resting fill and ink are already themed
+     (--primary-color / --on-accent-fg), but the .copied override repainted
+     ONLY the fill, with a raw literal. So every scheme kept painting its own
+     ink onto a green it could not reach - the four states whose ink is white
+     landed at 2.87:1 resting and 2.10:1 on hover, on a surface each scheme
+     believes it controls. The default pair stays BYTE-EXACT (those two
+     sub-AA figures are the frozen defaults' and cannot be shed); the schemes
+     are under no such constraint and every one of them now clears 4.5:1.
+     Measured per state in test/test-theme.js section 10p. */
+  --success-bg: #27ae60;
+  --success-bg-hover: #2ecc71;
+  --on-success-fg: #ffffff;
   /* The accent GLOW - the alpha-tinted halo painted behind accent buttons and
      focus rings. Carried as an rgb TRIPLE rather than as finished colours
      because the twelve glow rules use six different alphas (.08 .15 .2 .3
@@ -149,6 +163,24 @@
      cells already under AA being pushed further under, which is the one thing
      a scheme has no headroom to trade. The default value is the frozen 0.5. */
   --submenu-arrow-opacity: 0.5;
+  /* THE TOGGLE TRACK'S ON STATE, which shipped as a bare #4fc3f7 - a light
+     blue belonging to no palette in the app, not even the default accent
+     (#279EA7). It sits on #fullscreenToggle in the View menu, which is
+     visible, so every scheme painted its own menu and then drew this one
+     control in stock blue. Tokenising it here keeps BOTH frozen defaults
+     byte-exact - there is no body.dark-mode override to preserve, measured -
+     while letting a scheme reach it.
+     MEASURED, and it is why the scheme values are not simply --accent-main:
+     the thumb is white, so the track has to clear 3:1 against WHITE as well as
+     against the menu behind it, the HOVER fill that replaces the menu the
+     moment the reader points at the row, and the off-state track. The hover
+     fill is a separate surface and neither it nor the menu dominates - abyss
+     and ember score lower against hover, clarity and parchment lower against
+     the menu - so all four relations are scored. Abyss's and ember's accents
+     are light (2.52 and 2.18 against white) and would have made the thumb
+     vanish; the chosen values clear all four. The default's own 2.00 is below
+     that floor and is preserved anyway - it is frozen. */
+  --toggle-on-bg: #4fc3f7;
 }
 
 /* Dark mode variables */
@@ -315,7 +347,7 @@ body {
   --tok-entity-bg: var(--syn-entity-bg);
   --tok-namespace-opacity: 0.7;
 
-  /* The code box COLOURS. These are per-mode - all five are re-declared in the
+  /* The code box COLOURS. These are per-mode - all seven are re-declared in the
      body.dark-mode block below. It is the box GEOMETRY (padding, margin,
      radius, tab-size, white-space, hyphens) that was measured identical in both
      modes; it lived in the vendored light stylesheet, so dark mode depended on
@@ -336,6 +368,12 @@ body {
      and this is the only panel the reader gets. See .markdown-body pre code. */
   --code-pre-code-bg: none;
   --code-selection-bg: #073642; /* base02 */
+  /* Byte-exact with the pre-theme baseline's literal `color: #ffffff`
+     (styles.css:1085 at 4bbde83). White on the composited navy measures
+     13.00:1 - the most legible selection in the product. See the note on the
+     dark default for why this is a variable rather than the app-wide
+     --on-accent-fg. */
+  --code-selection-fg: #ffffff;
 }
 
 body.dark-mode {
@@ -410,18 +448,49 @@ body.dark-mode {
   --code-inline-bg: #2d2d2d;
   --code-inline-fg: #ccc;
   --code-pre-code-bg: #2d2d2d;
+  /* AMENDMENT 3. Solarized navy #073642 is nearly invisible on #2d2d2d, so the
+     dark code highlight is the accent at 35%.
+     THE ALPHA IS A VISIBILITY DECISION AND NOTHING ELSE, and saying so cost
+     one wrong round trip. It was briefly re-derived down to 18% to protect the
+     legibility of the tokens underneath - reasoning that was void, because the
+     tokens underneath are not what the reader sees. The app-wide rule at the
+     bottom of this file paints selected text in a FLAT colour, so selecting
+     code replaces the whole syntax palette with one ink; measured off the
+     captured pixels, an unselected code block shows 1264 distinct colours and
+     a selected one shows 128. Legibility is therefore owned entirely by
+     --code-selection-fg below, and the alpha is free to be what it always was:
+     the value that makes the highlight easy to SEE. Restored, and measured at
+     35%: composite rgb(51,95,99), 1.95:1 against the code background (up from
+     1.39 at 18%), with the white ink on it at 7.07:1.
+     THAT 7.07 IS THE PLAIN-BACKDROP FIGURE AND IT IS NOT THE BINDING ONE. One
+     token - .token.entity.named-entity - carries a background of its OWN, so
+     the tint composites over that instead and the same white ink measures
+     6.23:1 there. The earlier probe that produced 7.07 rendered a simpler
+     sample containing no entity token, which is the recorded fingerprint of a
+     fixture too narrow for its claim; the suite renders the full census
+     fixture and reports the worst cell BY NAME on every run.
+     Asserted by test-theme.js section 10l. */
   --code-selection-bg: rgba(61, 189, 198, 0.35);
+  /* Byte-exact with the pre-theme baseline, which painted selected text with a
+     literal `color: #ffffff` (styles.css:1085 at 4bbde83). This is NOT an
+     amendment - it is the frozen value, named so that a scheme can override it
+     without touching --on-accent-fg, which also paints button labels. */
+  --code-selection-fg: #ffffff;
 }
 
 /* ───────────────────────────────────────────────────────────────────────────
    COLOUR SCHEMES
    ───────────────────────────────────────────────────────────────────────────
    A scheme is selected with VIEW -> Theme and applied as `data-theme` on
-   <body>. It re-themes the WHOLE application, not only the code box - the
-   eleven chrome variables at the top of this file are consumed ~230 times by
-   the document AND by the tab bar, menus, dialogs and search panel alike, so
-   there is no separation to respect and a scheme that moved only the syntax
-   colours would leave a Solarized document sitting in unrelated chrome.
+   <body>. It re-themes the WHOLE application, not only the code box - the 38
+   chrome variables at the top of this file are consumed 293 times across this
+   sheet and custom-styles.css, by the document AND by the tab bar, menus,
+   dialogs and search panel alike, so there is no separation to respect and a
+   scheme that moved only the syntax colours would leave a Solarized document
+   sitting in unrelated chrome. (This read "the eleven chrome variables ... ~230
+   times" until it was re-measured: 233 is the consumption of the ELEVEN
+   originally-identified names, not of the chrome set, and eleven contradicted
+   the 38 counted in the contract table below.)
 
    POSITION IS LOAD-BEARING. `body[data-theme="x"]` and `body.dark-mode` are
    both specificity (0,1,1) and both declare on the same element, so SOURCE
@@ -435,18 +504,32 @@ body.dark-mode {
    second copy of the appearance the golden baseline pins, free to drift from
    it silently.
 
-   THE CONTRACT, enforced by test:theme rather than by convention. Every scheme
-   block must declare, explicitly:
-     - all 11 chrome variables (:root / body.dark-mode above),
-     - all 6 --code-* variables,
-     - all 10 --syn-* roles,
-     - plus the cells its MODE leaves un-roled, which differ per mode:
-         light: --tok-block-comment, --tok-operator, --tok-namespace,
-                --tok-function-name  (Solarized Light declares no rule for any
-                of them, so the base value is `inherit`);
-         dark:  --tok-inserted, --tok-function-name  (two Tomorrow Night
-                colours that sit outside its nine-role palette and are
-                therefore literals, not role references).
+   THE CONTRACT, enforced by test:theme rather than by convention. What a
+   scheme must declare is the LITERAL-valued subset of its base - a cell whose
+   base value contains var() resolves through a coarse role the scheme already
+   overrides, so it retints on its own and is exempt BY CONSTRUCTION. That
+   comes to 58 variables per mode, pinned in REQUIRED_COUNTS and re-derived on
+   every run rather than trusted. MEASURED breakdown, and note it is NOT the
+   same on both sides:
+                            light   dark
+       chrome variables       38     38
+       --code-*                5      7   (light's --code-inline-bg/-fg are
+                                           var()-derived, so exempt there)
+       --syn-* roles          10     10
+       --tok-* cells           5      3
+                            -----  -----
+                               58     58
+   The --tok-* cells are the ones the MODE leaves un-roled:
+       light: --tok-block-comment, --tok-operator, --tok-namespace,
+              --tok-namespace-opacity, --tok-function-name  (Solarized Light
+              declares no rule for any of them, so the base value is `inherit`);
+       dark:  --tok-inserted, --tok-function-name, --tok-namespace-opacity
+              (Tomorrow Night colours sitting outside its nine-role palette,
+              and therefore literals rather than role references).
+   Every numeral above is measured, not asserted here - this block shipped
+   claiming "11 chrome variables" against a real 38 and a single --code-*
+   count against two different ones, which is precisely why the suite pins the
+   count and prints it rather than relying on prose.
    Anything omitted does not fall back to something neutral - it falls back to
    the DEFAULT SCHEME's value, so an omission ships as a Solarized or Tomorrow
    Night colour embedded in someone else's palette. That is why the assertion
@@ -511,6 +594,14 @@ body[data-theme="clarity"] {
   --danger-bg: #cf222e;
   --danger-bg-hover: #a40e19;
   --on-danger-fg: #ffffff;
+  /* GitHub's own success green, which is what this scheme's palette is drawn
+     from. White ink, matching --on-accent-fg: 5.08:1 resting, 6.89:1 on
+     hover. The hover fill DARKENS, following this scheme's accent, whose
+     hover (#0550ae) is darker than its rest (#0969da) - the frozen default
+     lightens instead, and copying that here would fight the palette. */
+  --success-bg: #1a7f37;
+  --success-bg-hover: #14682c;
+  --on-success-fg: #ffffff;
   /* Both accent glows take the scheme's own accent: the split between them
      exists only to preserve the two DEFAULTS, which disagree with each other
      about whether the halo follows the mode. A scheme has no such history. */
@@ -518,6 +609,8 @@ body[data-theme="clarity"] {
   --accent-mode-glow-rgb: 9, 105, 218;
   --danger-glow-rgb: 207, 34, 46;
   --submenu-arrow-opacity: 0.75;
+  /* MEASURED: 5.19 vs the white thumb / 4.88 vs the menu / 5.19 vs the hover fill / 3.64 vs the off track. */
+  --toggle-on-bg: #0969da;
 
   --code-bg: #f6f8fa;
   --code-fg: #1f2328;
@@ -525,6 +618,12 @@ body[data-theme="clarity"] {
   --code-inline-fg: #1f2328;
   --code-pre-code-bg: none;
   --code-selection-bg: #b6e3ff;
+  /* DERIVED, NOT PICKED: every scheme's selection ink is its own
+     --text-primary, the colour it already trusts for body copy. Measured on
+     the composited highlight: 11.60:1. The inherited default of white measured
+     1.36:1 here - selected code was very nearly invisible - which is the
+     defect this variable exists to close. */
+  --code-selection-fg: #1f2328;
 
   --syn-comment: #5a6570;
   --syn-punctuation: #1f2328;
@@ -590,10 +689,19 @@ body[data-theme="parchment"] {
   --danger-bg: #a33a2a;
   --danger-bg-hover: #872e20;
   --on-danger-fg: #ffffff;
+  /* A muted olive green for the warm paper surface - a GitHub-blue-adjacent
+     green would read as a foreign object here. White ink, matching
+     --on-accent-fg: 5.08:1 resting, 6.29:1 on hover, hover darkening in step
+     with this scheme's accent. */
+  --success-bg: #4c7a2f;
+  --success-bg-hover: #3f6b25;
+  --on-success-fg: #ffffff;
   --accent-glow-rgb: 156, 84, 32;
   --accent-mode-glow-rgb: 156, 84, 32;
   --danger-glow-rgb: 163, 58, 42;
   --submenu-arrow-opacity: 0.75;
+  /* MEASURED: 5.67 vs the white thumb / 4.95 vs the menu / 5.30 vs the hover fill / 3.70 vs the off track. */
+  --toggle-on-bg: #9c5420;
 
   --code-bg: #efe8da;
   --code-fg: #3b352a;
@@ -601,6 +709,9 @@ body[data-theme="parchment"] {
   --code-inline-fg: #3b352a;
   --code-pre-code-bg: none;
   --code-selection-bg: #ddcfab;
+  /* Its own --text-primary. Measured on the composited highlight: 7.86:1.
+     Inherited white measured 1.55:1. */
+  --code-selection-fg: #3b352a;
 
   --syn-comment: #6b614e;
   --syn-punctuation: #5c5344;
@@ -664,17 +775,42 @@ body[data-theme="abyss"] {
   --danger-bg: #b04a55;
   --danger-bg-hover: #963c46;
   --on-danger-fg: #ffffff;
+  /* THE INK IS DARK HERE, AND THAT IS THE WHOLE REASON THIS CELL NEEDS ITS
+     OWN TOKEN. This scheme paints accent buttons as a BRIGHT fill with a
+     near-black ink (--on-accent-fg: #11151c), so a dark success green with
+     white ink - the shape the two light schemes take - would make the copy
+     button invert as it flipped to "Copied". Tokyo Night's green, against
+     this scheme's own accent ink: 10.01:1 resting, 12.21:1 on hover, hover
+     LIGHTENING in step with --accent-hover. */
+  --success-bg: #9ece6a;
+  --success-bg-hover: #b6e08a;
+  --on-success-fg: #11151c;
   --accent-glow-rgb: 122, 162, 247;
   --accent-mode-glow-rgb: 122, 162, 247;
   --danger-glow-rgb: 176, 74, 85;
   --submenu-arrow-opacity: 0.75;
+  /* MEASURED: 3.87 vs the white thumb / 4.73 vs the menu / 4.41 vs the hover fill / 3.24 vs the off track. */
+  --toggle-on-bg: #4d7fe0;
 
   --code-bg: #1a2029;
   --code-fg: #d8dee9;
   --code-inline-bg: #1e2531;
   --code-inline-fg: #d8dee9;
   --code-pre-code-bg: #1a2029;
+  /* Restored to 35% together with the dark default: the step down to 16% was
+     made to protect tokens that a selected code block does not paint. See the
+     dark default for the measurement that retired that reasoning.
+     Measured at 35%: composite rgb(60,78,113), 1.95:1 against the code
+     background, ink on it 6.21:1 - but see below for the binding figure. */
   --code-selection-bg: rgba(122, 162, 247, 0.35);
+  /* Its own --text-primary. Measured on the composited highlight: 6.21:1 on
+     the plain code background, and 5.06:1 over .token.entity.named-entity,
+     which carries a background of its own - that lower figure is the one the
+     suite scores, and it is still comfortably clear of every bar.
+     The inherited --on-accent-fg is #11151c here - near-black ink meant for
+     the light-blue accent of a BUTTON - which measured 2.18:1 on this
+     highlight and made selected code effectively unreadable. */
+  --code-selection-fg: #d8dee9;
 
   --syn-comment: #7d8ba3;
   --syn-punctuation: #c9d3e0;
@@ -728,17 +864,36 @@ body[data-theme="ember"] {
   --danger-bg: #c0392b;
   --danger-bg-hover: #a12e22;
   --on-danger-fg: #ffffff;
+  /* Same bright-fill/dark-ink shape as abyss above, in this scheme's warmer
+     register - a yellow-green rather than a cool one, so it sits beside the
+     amber accent rather than against it. Against this scheme's own accent
+     ink (#1c1b18): 8.34:1 resting, 10.66:1 on hover. */
+  --success-bg: #b8bb26;
+  --success-bg-hover: #d0d24a;
+  --on-success-fg: #1c1b18;
   --accent-glow-rgb: 224, 164, 88;
   --accent-mode-glow-rgb: 224, 164, 88;
   --danger-glow-rgb: 192, 57, 43;
   --submenu-arrow-opacity: 0.75;
+  /* MEASURED: 3.32 vs the white thumb / 5.19 vs the menu / 4.79 vs the hover fill / 3.56 vs the off track. */
+  --toggle-on-bg: #c07f33;
 
   --code-bg: #262421;
   --code-fg: #eae6dd;
   --code-inline-bg: #2c2a26;
   --code-inline-fg: #eae6dd;
   --code-pre-code-bg: #262421;
+  /* Restored to 32%, the value it had before the alpha was briefly re-derived
+     against the wrong subject - see the dark default.
+     Measured at 32%: composite rgb(98,77,51), 1.93:1 against the code
+     background, ink on it 6.43:1 - but see below for the binding figure. */
   --code-selection-bg: rgba(224, 164, 88, 0.32);
+  /* Its own --text-primary. Measured on the composited highlight: 6.43:1 on
+     the plain code background, and 5.35:1 over .token.entity.named-entity,
+     which carries a background of its own - that lower figure is the one the
+     suite scores.
+     The inherited --on-accent-fg is #1c1b18 here, which measured 2.15:1. */
+  --code-selection-fg: #eae6dd;
 
   --syn-comment: #9a9286;
   --syn-punctuation: #e0dbd0;
@@ -1686,10 +1841,20 @@ body {
  * show a teal icon beside a rust or blue accent, and are widened to any element
  * because a scheme is a deliberate retint rather than a fidelity case.
  *
- * Deliberately NOT widened to `svg *`: the root rule only reaches children that
- * declare no stroke of their own, and every path in these five icons declares
- * either stroke="#279EA7" or stroke="none". Widening it would paint the
- * stroke="none" paths. */
+ * Deliberately NOT widened to `svg *`: MEASURED against src/index.html, the
+ * five icons' descendants declare NO stroke of their own at all - they inherit
+ * from the root <svg stroke="#279EA7"> presentation attribute, which is why a
+ * rule on the root works (a CSS declaration beats a presentation attribute).
+ * Exactly one descendant opts out, slide 4's <rect stroke="none">, and that
+ * single element is the whole reason not to widen: `svg *` would paint it.
+ *
+ * An earlier revision of this comment claimed every path declared either
+ * stroke="#279EA7" or stroke="none", and carried a
+ * `body[data-theme] .welcome-slide-icon svg [stroke="#279EA7"]` rule to serve
+ * the first half. MEASURED: no descendant anywhere carries that attribute, so
+ * the rule matched nothing and was deleted. The `[fill="#279EA7"]` form below
+ * IS wider than the `rect[...]` form beside it - it also reaches slide 1's
+ * circle - but that circle has r="0" and paints nothing either way. */
 .dark-mode .welcome-slide-icon svg,
 body[data-theme] .welcome-slide-icon svg {
   stroke: var(--welcome-accent);
@@ -1697,9 +1862,6 @@ body[data-theme] .welcome-slide-icon svg {
 .dark-mode .welcome-slide-icon svg rect[fill="#279EA7"],
 body[data-theme] .welcome-slide-icon svg [fill="#279EA7"] {
   fill: var(--welcome-accent);
-}
-body[data-theme] .welcome-slide-icon svg [stroke="#279EA7"] {
-  stroke: var(--welcome-accent);
 }
 
 .demo-mermaid {
@@ -2179,6 +2341,22 @@ html {
     display: none !important;
   }
 
+  /* IN-CONTENT OVERLAYS ARE SCREEN AFFORDANCES AND MUST NOT PRINT. These three
+     are absolutely positioned ON TOP of content that does print, and all three
+     rest at opacity 0 and fade in on hover - so they are invisible in a PDF
+     only for as long as nothing has hovered them. Export while the pointer sits
+     over a code block, a table or a diagram and the button prints over the
+     content, which is how it was found: 10i caught background-color still
+     animating on button.code-copy-btn at the export-ready signal, on a surface
+     the print stylesheet was documented as hiding and did not. A clipboard
+     button, a "maximise" button and a diagram expander have no meaning on
+     paper, so this is a hide rather than an opacity pin. */
+  .code-copy-btn,
+  .mermaid-maximize-btn,
+  .table-maximize-btn {
+    display: none !important;
+  }
+
   /* Make container and content full width */
   .container {
     height: auto;
@@ -2523,11 +2701,12 @@ html {
 }
 
 .code-copy-btn.copied {
-  background: #27ae60;
+  background: var(--success-bg);
+  color: var(--on-success-fg);
 }
 
 .code-copy-btn.copied:hover {
-  background: #2ecc71;
+  background: var(--success-bg-hover);
 }
 
 /* App Update Toast */
@@ -3239,7 +3418,7 @@ body.dark-mode .context-menu {
 }
 
 .tools-toggle-item.active .tools-toggle-track {
-  background: #4fc3f7;
+  background: var(--toggle-on-bg);
 }
 
 .tools-toggle-thumb {
@@ -3825,18 +4004,49 @@ pre[class*="language-"] {
   hyphens: none;
 }
 
-pre[class*="language-"]::-moz-selection,
-pre[class*="language-"] ::-moz-selection,
-code[class*="language-"]::-moz-selection,
-code[class*="language-"] ::-moz-selection {
-  background: var(--code-selection-bg);
-}
+/* THE FOREGROUND IS DECLARED HERE, and its absence was a real defect.
+   This group used to override `background` alone. The app-wide
+   `::selection { color: var(--on-accent-fg) }` further down therefore kept
+   winning the COLOUR for code as well, so selected code was painted in the ink
+   meant for a button label sitting on the accent - which is white in the two
+   frozen defaults (fine: 13.00:1 and 6.23:1) and NEAR-BLACK in abyss and ember,
+   whose accents are light. Measured off captured pixels, selected code came
+   out at 1.36:1 (clarity), 1.55 (parchment), 2.18 (abyss) and 2.15 (ember):
+   four of the six shipped schemes rendered a selected code block unreadable.
+   The abyss and ember figures were briefly recorded as 1.48 and 1.59 - real
+   measurements, but taken while those two highlights were still at the 16% and
+   18% alphas this file later retired. The two LIGHT schemes highlight with
+   OPAQUE pastels, so no alpha ever moved and their numbers never went stale;
+   that asymmetry is the fingerprint of the mistake, not a coincidence.
+   Naming the foreground separately is what lets a scheme fix that without
+   disturbing --on-accent-fg, which still paints button labels.
 
+   THE ::-moz-selection TWIN THAT USED TO SIT ABOVE THIS RULE IS GONE, and the
+   reason is measured rather than stylistic. Chromium does not merely ignore an
+   unrecognised pseudo-element - it DROPS THE WHOLE RULE at parse time. Planting
+   three rules and reading them back gave 1 of 3 survivors: the pure-moz rule
+   never entered the CSSOM at all, so no assertion in this project could ever
+   reach it and deleting it is provably a zero-appearance change. It was
+   inherited from the vendored PrismJS theme; the app's own `::selection` rule
+   has never had a moz twin, so keeping one here was vendor cruft rather than a
+   Firefox policy, and Folia ships Chromium only.
+
+   DO NOT "TIDY" IT BACK IN BY ADDING ::-moz-selection TO THE LIST BELOW. A
+   comma-separated selector list is NOT forgiving outside :is(): one invalid
+   selector invalidates the entire rule. The same probe measured
+   `pre.pboth::-moz-selection, pre.pboth::selection { ... }` producing ZERO
+   CSSOM rules, so that well-meaning edit would silently delete code selection
+   outright and hand it back to the app-wide accent - the exact defect the
+   foreground declaration above exists to fix. R357 is that edit, and the
+   computed-value assertions catch it. Vendor-prefixed PROPERTIES are different
+   and are fine (see -moz-tab-size above): an unknown property is dropped on its
+   own, an unknown selector takes its rule with it. */
 pre[class*="language-"]::selection,
 pre[class*="language-"] ::selection,
 code[class*="language-"]::selection,
 code[class*="language-"] ::selection {
   background: var(--code-selection-bg);
+  color: var(--code-selection-fg);
 }
 
 /* Code blocks */
