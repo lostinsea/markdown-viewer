@@ -233,6 +233,104 @@ function amendmentFor(mode, key, prop) {
 // check, and every revert R259-R265 would have gone VACUOUS behind it.
 const BASELINE_COMMIT = "4bbde83aa92a1c1a360925b183308b477254667b";
 
+// BORDER WIDTH IS THE ONLY DEVICE-PIXEL-SNAPPED QUANTITY IN THE GOLDEN, so it
+// is the only one whose CSS-pixel value depends on the DISPLAY the golden was
+// captured on rather than on the product. `.markdown-body pre` declares
+// `border: 1px` (styles.css); Chromium snaps a used border width to whole
+// device pixels, so that one declaration computes to 0.666667px at DPR 1.5 and
+// 0.8px at DPR 1.25 - two spellings of the SAME appearance, one device pixel.
+// Comparing the CSS strings therefore asserts a fact about the MACHINE. It bit
+// for real: the golden was captured on a 150%-scaled display and the four
+// `pre`/`preNoLang` assertions began failing the day the display moved to 125%,
+// on the unmodified tree, with nothing about the product changed.
+//
+// The fix needs the golden's capture DPR, which the golden does not record and
+// cannot be made to - it is frozen at BASELINE_COMMIT and re-capturing it here
+// would simply re-baseline these four numbers onto THIS display and break again
+// on the next one. So it is DERIVED, and the derivation is asserted rather than
+// asserted-by-comment: every golden border width must be a whole number of
+// device pixels at this DPR, and every non-zero one must be exactly ONE (which
+// is what `border: 1px` produces at any DPR < 2). That pins the value
+// uniquely - 0.666667 x 3 is also a whole number, but it is 2, not 1 - so a
+// wrong GOLDEN_DPR fails loudly instead of silently excusing a real regression.
+const GOLDEN_DPR = 1.5;
+const SNAPPED_BOX_PROPS = [
+  "borderTopWidth",
+  "borderRightWidth",
+  "borderBottomWidth",
+  "borderLeftWidth",
+];
+
+// THE SNAPPING LAW, MEASURED rather than assumed (a DPR sweep under
+// --force-device-scale-factor on this Electron/Chromium, declared -> used):
+//
+//   declared |  dpr 1  |  1.25   |   1.5    |   1.75   |    2    |   2.5   |  3
+//   ---------+---------+---------+----------+----------+---------+---------+------
+//     0.25px | 1px/1dp | 0.8px/1 | 0.667/1  | 0.571/1  | 0.5px/1 | 0.4px/1 | .33/1
+//        1px | 1px/1dp | 0.8px/1 | 0.667/1  | 0.571/1  | 1px/2dp | 0.8px/2 | 1px/3
+//        2px | 2px/2dp | 1.6px/2 | 2px/3dp  | 1.714/3  | 2px/4dp | 2px/5dp | 2px/6
+//
+// Two facts fall out of it, and BOTH are asserted below rather than trusted:
+//   1. the used width is ALWAYS a whole number of device pixels
+//      (used_css x dpr is an integer in every cell above), so rounding to
+//      device pixels is LOSSLESS on this quantity, not lossy;
+//   2. the count is `max(1, floor(declared x dpr))` - so ONE declaration does
+//      NOT keep a constant device-pixel count across displays. `border: 1px`
+//      is 1 device px below DPR 2 and 2 device px at DPR 2. Comparing raw
+//      device-pixel counts would therefore have re-broken these same four
+//      assertions on any 200%-scaled display (a 4K laptop's default), which is
+//      simply the first bug wearing the opposite sign.
+//
+// So the comparison is made on the only quantity that IS display-independent:
+// the set of DECLARED widths that could have produced the observation. From a
+// used count of n device pixels at some DPR, the declaration lay in
+// [n/dpr, (n+1)/dpr) - or in (0, 2/dpr) when n is 1, because the `max(1, ...)`
+// floor means any positive declaration below one device pixel is drawn as one.
+// Two observations agree iff those bands INTERSECT. That is exactly as
+// sensitive as the available information allows: it accepts every declaration
+// consistent with both readings and rejects every one that is not, at any DPR.
+// NOTE ON THE DIRECTION, because the two laws are easy to conflate and a
+// reviewer did: `max(1, floor(declared x dpr))` above is the FORWARD law, from
+// an author's declaration to the pixels Chromium paints. deviceWidth() runs the
+// INVERSE - its input is a CSSOM computed value, which is already the snapped
+// used width - so it must ROUND, not floor. At DPR 1.5 the used value reads
+// back as "0.666667px" and 0.666667 x 1.5 = 0.9999995: floor would report 0
+// device pixels for a border that is plainly drawn, and declaredBand would then
+// return the zero band and call it a mismatch. Rounding is not a loosening
+// here; it is the correct inverse of a quantity the engine already quantised.
+const deviceWidth = (cssLength, dpr) => Math.round(parseFloat(cssLength) * dpr);
+const declaredBand = (cssLength, dpr) => {
+  const n = deviceWidth(cssLength, dpr);
+  if (n === 0) return [0, 0]; // only a zero declaration paints zero pixels
+  return [n === 1 ? 0 : n / dpr, (n + 1) / dpr];
+};
+// THE LIMIT THIS BUYS, recorded because it is a real loss and not an oversight.
+// The n === 1 band is [0, 2/dpr), so below DPR 2 a regression from `border:1px`
+// to `border:0.5px` or `0.25px` is INVISIBLE here - all three paint one device
+// pixel and no observation can separate them. The old string comparison did
+// catch that, but only at exactly the golden's capture DPR and only by
+// accident: it equally reported a false failure whenever the display scaling
+// changed, which is the defect this replaced. Sub-device-pixel border
+// declarations are not something any scheme here uses, so the trade is
+// deliberate; a scheme that starts using them needs its own assertion on the
+// DECLARED value, which no computed-style reading can supply.
+const snappedWidthsAgree = (goldenCss, goldenDpr, liveCss, liveDpr) => {
+  const a = declaredBand(goldenCss, goldenDpr);
+  const b = declaredBand(liveCss, liveDpr);
+  if (a[1] === 0 || b[1] === 0) return a[1] === b[1];
+  return a[0] < b[1] - 1e-9 && b[0] < a[1] - 1e-9;
+};
+
+// The measured sweep above, kept verbatim so the portability of the comparator
+// is proven against REAL Chromium output rather than against a model of it.
+const SNAP_SWEEP_DPRS = [1, 1.25, 1.5, 1.75, 2, 2.5, 3];
+const SNAP_SWEEP = {
+  // `border: 1px` - what `.markdown-body pre` actually declares.
+  thin: ["1px", "0.8px", "0.666667px", "0.571429px", "1px", "0.8px", "1px"],
+  // `border: 2px` - the regression R424 installs, at the same seven displays.
+  thick: ["2px", "1.6px", "2px", "1.71429px", "2px", "2px", "2px"],
+};
+
 require("../src/main.js");
 
 app.whenReady().then(async () => {
@@ -449,6 +547,7 @@ app.whenReady().then(async () => {
     );
 
     const now = await captureBothModes(win);
+    const liveDpr = await exec("devicePixelRatio");
 
     // ─── 1. The census still measures something ─────────────────────────────
     // A probe that matches nothing compares {} to {} and passes. Coverage is
@@ -536,6 +635,186 @@ app.whenReady().then(async () => {
         `golden=${JSON.stringify(gp)} census=${JSON.stringify(np)}. Re-capture the golden from ${BASELINE_COMMIT}.`,
       );
     }
+    // GOLDEN_DPR IS DERIVED, SO IT IS ASSERTED. See its declaration: the
+    // comparison below reads the golden's snapped border widths in device
+    // pixels, and a wrong capture DPR would turn a real regression into a
+    // silent pass. This is the check that makes the constant a measurement
+    // rather than a magic number, and it is falsifiable in both directions -
+    // a golden captured at any other DPR fails it, and so does one whose
+    // border declaration was ever something other than the thinnest line.
+    {
+      const bad = [];
+      const parts = new Set();
+      let seen = 0;
+      let nonZero = 0;
+      for (const mode of ["light", "dark"]) {
+        for (const [part, rec] of Object.entries(golden[mode].box)) {
+          for (const p of SNAPPED_BOX_PROPS) {
+            if (!(p in rec)) continue;
+            seen++;
+            parts.add(`${mode}.${part}`);
+            const css = parseFloat(rec[p]);
+            if (css > 0) nonZero++;
+            const dev = css * GOLDEN_DPR;
+            const whole = Math.abs(dev - Math.round(dev)) < 1e-3;
+            const oneOrNone = Math.round(dev) === 0 || Math.round(dev) === 1;
+            if (!whole || !oneOrNone) {
+              bad.push(`${mode}.${part}.${p}=${rec[p]} -> ${dev.toFixed(4)}dp`);
+            }
+          }
+        }
+      }
+      check(
+        `the golden's snapped border widths are whole device pixels at the derived capture DPR (${GOLDEN_DPR})`,
+        seen === 48 && nonZero === 16 && parts.size === 12 && bad.length === 0,
+        `${seen} width(s) over ${parts.size} box part(s), ${nonZero} non-zero ` +
+          `(measured: 48 / 12 / 16), ${bad.length} inconsistent: ${bad.slice(0, 6).join(" | ")}`,
+      );
+    }
+    // THE COUNTS ABOVE ARE EXACT, NOT FLOORS, and that is the whole point of
+    // this block. `seen >= 48` was the first spelling and BOTH reviewers
+    // flagged it independently: a count tolerates precisely the substitution
+    // that goes wrong in practice - one box part losing its four border
+    // properties while another gains four - and it also said nothing about how
+    // many widths are NON-ZERO. Only the 16 non-zero entries pin GOLDEN_DPR at
+    // all; the other 32 are "0px", which is a whole number of device pixels at
+    // every DPR and would satisfy the derivation vacuously. Measured against
+    // the frozen golden: 12 box parts x 4 properties = 48, of which 16 are
+    // 0.666667px (pre and preNoLang, both modes) and 32 are 0px.
+
+    // THE COMPARATOR IS PROVEN PORTABLE AT THE UNIT LEVEL, against the real
+    // Chromium sweep recorded beside SNAP_SWEEP. This is deliberately NOT a
+    // property of the display the harness happens to run on: it asserts that
+    // ONE declaration reads as agreeing with itself across all seven displays,
+    // and that a DOUBLED declaration is still caught on every one of them.
+    // The first half is what stops the DPR >= 2 regression; the second is what
+    // stops the fix being bought by making the comparison blind.
+    //
+    // THE SECOND HALF HOLDS THE GOLDEN AT GOLDEN_DPR AND SWEEPS ONLY THE LIVE
+    // SIDE, because that is the real question and the general form is FALSE:
+    // measured, a golden captured at DPR 1 observes `border: 1px` as one
+    // device pixel, whose declared band is (0, 2px) - wide enough to contain a
+    // 2px declaration as seen at DPR 1.25 (1.6px) or 1.75 (1.714px), so those
+    // two pairings genuinely cannot be told apart. That is a limit of the
+    // information in an unscaled capture, not a defect in the comparator, and
+    // it is a second independent reason the capture DPR has to be pinned
+    // rather than assumed. The golden is at 1.5, where all seven bite.
+    {
+      const sameFails = [];
+      const missed = [];
+      for (let i = 0; i < SNAP_SWEEP_DPRS.length; i++) {
+        for (let j = 0; j < SNAP_SWEEP_DPRS.length; j++) {
+          const [da, db] = [SNAP_SWEEP_DPRS[i], SNAP_SWEEP_DPRS[j]];
+          const [ta, tb] = [SNAP_SWEEP.thin[i], SNAP_SWEEP.thin[j]];
+          if (!snappedWidthsAgree(ta, da, tb, db))
+            sameFails.push(`1px@${da}=${ta} vs 1px@${db}=${tb}`);
+        }
+      }
+      const gi = SNAP_SWEEP_DPRS.indexOf(GOLDEN_DPR);
+      for (let j = 0; j < SNAP_SWEEP_DPRS.length; j++) {
+        const db = SNAP_SWEEP_DPRS[j];
+        if (snappedWidthsAgree(SNAP_SWEEP.thin[gi], GOLDEN_DPR, SNAP_SWEEP.thick[j], db))
+          missed.push(`2px@${db}=${SNAP_SWEEP.thick[j]}`);
+      }
+      check(
+        "the snapped-width comparator reads one declaration as unchanged across every measured display scale",
+        sameFails.length === 0 && SNAP_SWEEP_DPRS.length === 7,
+        `Chromium ${process.versions.chrome} / Electron ${process.versions.electron}: ` +
+          `${sameFails.length}/49 pairing(s) wrongly differ: ${sameFails.slice(0, 4).join(" | ")}`,
+      );
+      check(
+        "the snapped-width comparator still catches a doubled border at every measured display scale",
+        missed.length === 0 && gi >= 0,
+        `Chromium ${process.versions.chrome} / Electron ${process.versions.electron}: ` +
+          `GOLDEN_DPR=${GOLDEN_DPR} at sweep index ${gi}; ${missed.length}/7 doubled reading(s) wrongly agree: ${missed.join(" | ")}`,
+      );
+    }
+
+    // THE LIVE SIDE OBEYS THE SAME SNAPPING LAW - a positive control, without
+    // which the band arithmetic above is a model rather than a measurement.
+    // It is also the assertion that answers "is rounding to device pixels too
+    // coarse": it is not, because a used border width is ALWAYS a whole number
+    // of device pixels, so the rounding is lossless. If a future Chromium ever
+    // paints a fractional one, this fails and says so instead of silently
+    // rounding the difference away.
+    {
+      const off = [];
+      let checked = 0;
+      for (const mode of ["light", "dark"]) {
+        for (const [part, rec] of Object.entries(now[mode].box)) {
+          if (!rec) continue;
+          for (const p of SNAPPED_BOX_PROPS) {
+            if (!(p in rec)) continue;
+            checked++;
+            const dev = parseFloat(rec[p]) * liveDpr;
+            if (Math.abs(dev - Math.round(dev)) > 1e-3)
+              off.push(`${mode}.${part}.${p}=${rec[p]} -> ${dev.toFixed(4)}dp`);
+          }
+        }
+      }
+      check(
+        `every live snapped border width is a whole number of device pixels at this display's DPR (${liveDpr})`,
+        checked === 48 && off.length === 0,
+        `${checked} width(s) checked (measured: 48), ${off.length} fractional: ${off.slice(0, 4).join(" | ")}`,
+      );
+      console.log(
+        `  note: snapped borders - golden ${GOLDEN_DPR}dpr / live ${liveDpr}dpr; ` +
+          `48 widths over 12 box parts, 16 non-zero; live sample ` +
+          `"${(now.light.box.pre || {}).borderTopWidth}" = ` +
+          `${deviceWidth((now.light.box.pre || {}).borderTopWidth || "0px", liveDpr)}dp, ` +
+          `golden "${golden.light.box.pre.borderTopWidth}" = ` +
+          `${deviceWidth(golden.light.box.pre.borderTopWidth, GOLDEN_DPR)}dp`,
+      );
+    }
+
+    // THE CONVERSION IS KEYED ON A LIST, SO THE LIST'S COMPLETENESS IS THE
+    // REAL ASSERTION (N6). Sections 3 and 4 both compare a snapped width as a
+    // band of declared widths - but only for the property NAMES
+    // SNAPPED_BOX_PROPS happens to carry. A width recorded under any other
+    // name (an outline, a column rule, a heading underline a future scheme
+    // wants thicker) would fall straight back to the exact string comparison
+    // and start failing on every display whose DPR is not the capture's, which
+    // is the entire defect this work exists to remove - and it would do it
+    // silently, because nothing else in the suite looks at the shape of the
+    // golden's keys.
+    //
+    // The property NAME is a sound signal here rather than a guess: Chromium
+    // snaps a USED border-style length to whole device pixels, and every such
+    // property in the CSSOM is spelled `*Width`. `width` itself does not match
+    // (capital W), which is deliberate - the box model's own width is not
+    // recorded here at all.
+    //
+    // The count is PINNED, not floored. A floor would tolerate exactly the
+    // substitution that matters - one width leaving the census while another
+    // arrives - which is the same magic-number disease as the licence guard's
+    // `> 200` against a real 220.
+    {
+      const unhandled = [];
+      let widths = 0;
+      for (const mode of ["light", "dark"]) {
+        for (const [group, recs] of [
+          ["box", golden[mode].box],
+          ["surfaces", golden[mode].surfaces],
+        ]) {
+          for (const [key, rec] of Object.entries(recs || {})) {
+            if (!rec) continue;
+            for (const p of Object.keys(rec)) {
+              if (!/Width$/.test(p)) continue;
+              widths++;
+              if (!SNAPPED_BOX_PROPS.includes(p))
+                unhandled.push(`${mode}.${group}.${key}.${p}`);
+            }
+          }
+        }
+      }
+      check(
+        "every device-pixel-snapped length the golden records goes through the declared-width band, not a string comparison",
+        widths === 48 && unhandled.length === 0,
+        `${widths} *Width propert(ies) recorded across box+surfaces ` +
+          `(measured: 48, all in the code box, none in surfaces); ` +
+          `${unhandled.length} not in SNAPPED_BOX_PROPS: ${unhandled.slice(0, 6).join(" | ") || "none"}`,
+      );
+    }
     for (const mode of ["light", "dark"]) {
       for (const part of [
         "pre",
@@ -564,6 +843,27 @@ app.whenReady().then(async () => {
         const amended = [];
         for (const [p, v] of Object.entries(want)) {
           if (got[p] === v) continue;
+          // A snapped width is compared as the band of DECLARED widths that
+          // could have produced it (see snappedWidthsAgree), so the two sides
+          // may legitimately spell the same declaration differently when the
+          // golden was captured on a differently-scaled display - including
+          // across the DPR 2 boundary, where the device-pixel COUNT itself
+          // changes. Everything else in BOX_PROPS is reported unsnapped by
+          // getComputedStyle - padding 13px, margin 6.5px and border-radius
+          // 3.9px all survive a DPR change untouched - so only these four need
+          // the conversion.
+          if (SNAPPED_BOX_PROPS.includes(p)) {
+            if (snappedWidthsAgree(v, GOLDEN_DPR, got[p], liveDpr)) continue;
+            const wb = declaredBand(v, GOLDEN_DPR);
+            const gb = declaredBand(got[p], liveDpr);
+            diffs.push(
+              `${p}: golden=${v} (${deviceWidth(v, GOLDEN_DPR)}dp @${GOLDEN_DPR}, ` +
+                `declared ${wb[0].toFixed(3)}-${wb[1].toFixed(3)}px) now=${got[p]} ` +
+                `(${deviceWidth(got[p], liveDpr)}dp @${liveDpr}, ` +
+                `declared ${gb[0].toFixed(3)}-${gb[1].toFixed(3)}px)`,
+            );
+            continue;
+          }
           const am =
             BOX_AMENDMENTS[mode] &&
             BOX_AMENDMENTS[mode][part] &&
@@ -604,7 +904,32 @@ app.whenReady().then(async () => {
           continue;
         }
         for (const [p, v] of Object.entries(want)) {
-          if (got[p] !== v) diffs.push(`${sel}.${p}: golden=${v} now=${got[p]}`);
+          if (got[p] === v) continue;
+          // THE SAME DPR-PORTABLE PATH AS THE CODE BOX ABOVE. Surfaces record
+          // only colours today, so this branch is unreachable - but the
+          // alternative is that the first scheme to give a heading rule or a
+          // blockquote bar its own width reintroduces the display-dependent
+          // string comparison here, silently, in the one section nobody would
+          // think to look in. Keeping the two loops' comparison identical is
+          // what stops that; the completeness assertion in section 3 is what
+          // stops a width arriving under a name this list does not carry.
+          if (SNAPPED_BOX_PROPS.includes(p)) {
+            if (snappedWidthsAgree(v, GOLDEN_DPR, got[p], liveDpr)) continue;
+            const wb = declaredBand(v, GOLDEN_DPR);
+            const gb = declaredBand(got[p], liveDpr);
+            diffs.push(
+              `${sel}.${p}: golden=${v} (${deviceWidth(v, GOLDEN_DPR)}dp @${GOLDEN_DPR}, ` +
+                `declared ${wb[0].toFixed(3)}-${wb[1].toFixed(3)}px) now=${got[p]} ` +
+                `(${deviceWidth(got[p], liveDpr)}dp @${liveDpr}, ` +
+                `declared ${gb[0].toFixed(3)}-${gb[1].toFixed(3)}px)`,
+            );
+            continue;
+          }
+          // Reached only when got[p] !== v - the equality case continued at the
+          // top of the loop - so the condition that used to guard this push was
+          // trivially true and has been dropped rather than left as a check
+          // that cannot fail.
+          diffs.push(`${sel}.${p}: golden=${v} now=${got[p]}`);
         }
       }
       check(

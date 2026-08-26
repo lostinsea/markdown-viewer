@@ -8356,6 +8356,124 @@ const REVERTS = [
       /^10p: both frozen defaults keep the exact copy-confirmation appearance, sub-AA ratios included$/,
     ],
   },
+  {
+    id: "R423",
+    // THE DERIVED CAPTURE DPR. GOLDEN_DPR is not recorded in the golden - it is
+    // derived from it - so it is exactly the kind of constant that can rot into
+    // a magic number, and a wrong value would turn every snapped border
+    // comparison into a silent pass. This is machine-independent ON PURPOSE:
+    // the assertion is a property of the GOLDEN's own numbers, so the verdict
+    // does not depend on the display the harness happens to run on.
+    // 0.666667 x 1.25 = 0.8333, which is not a whole device pixel.
+    //
+    // DO NOT WIDEN `expect` TO COVER 10i / 10j / 10o. A run of this revert can
+    // report up to 8 further failures there (pdf-export-ready never arriving,
+    // the theme menu not dismissing, the emulated OS colour-scheme flip not
+    // landing) with probe latencies in the 15000ms range against a 400ms
+    // ceiling. Those are NOT consequences of this edit: GOLDEN_DPR is read by
+    // nothing outside the section-3 device-pixel comparison, and R424 - the
+    // same suite, through the same harness, in the same batch - reported ZERO
+    // unlisted failures. They are cold-start / machine-load artifacts of the
+    // theme suite, pre-existing and unrelated to the DPR work. Listing them
+    // here would pardon a real 10i/10j/10o regression forever.
+    what: "derive the golden's capture DPR wrongly (1.25 rather than the measured 1.5)",
+    file: THEME_TEST,
+    from: "const GOLDEN_DPR = 1.5;",
+    to: "const GOLDEN_DPR = 1.25;",
+    suite: "test:theme",
+    expect: [
+      /^the golden's snapped border widths are whole device pixels at the derived capture DPR/,
+    ],
+  },
+  {
+    id: "R424",
+    // THE COMPARISON MUST STILL BITE. Normalising to device pixels makes the
+    // border check coarser, and a looser assertion that still passes is
+    // indistinguishable from a correct one. This widens the code box's border
+    // to a genuinely different appearance - two device pixels instead of one -
+    // which is wrong at EVERY display scale (2px declared is 3 device px at
+    // DPR 1.5 and 2 at DPR 1.25, never 1), so the proof holds on any machine.
+    what: "widen the code box border past one device pixel",
+    file: CSS,
+    from:
+      ".markdown-body pre {\n  padding: 16px;\n  border-radius: 8px;\n" +
+      "  overflow-x: auto;\n  margin: 1em 0;\n  border: 1px solid var(--border-color);\n}",
+    to:
+      ".markdown-body pre {\n  padding: 16px;\n  border-radius: 8px;\n" +
+      "  overflow-x: auto;\n  margin: 1em 0;\n  border: 2px solid var(--border-color);\n}",
+    suite: "test:theme",
+    expect: [
+      /^light: code box "pre" reproduces the golden exactly$/,
+      /^light: code box "preNoLang" reproduces the golden exactly$/,
+      /^dark: code box "pre" reproduces the golden exactly$/,
+      /^dark: code box "preNoLang" reproduces the golden exactly$/,
+    ],
+  },
+  {
+    id: "R425",
+    // THE COMPARATOR MUST BE DISPLAY-PORTABLE, NOT MERELY DISPLAY-AWARE. The
+    // first version of this fix compared raw DEVICE-PIXEL COUNTS, which cancels
+    // the snapping only while `floor(dpr) === 1`. Measured under
+    // --force-device-scale-factor: `border: 1px` computes to one device pixel
+    // at DPR 1 / 1.25 / 1.5 / 1.75 and to TWO at DPR 2 (and three at DPR 3),
+    // because the used width is `max(1, floor(declared x dpr))`. So on any
+    // 200%-scaled display - a 4K laptop's default - the naive comparison
+    // re-broke the very four assertions it was written to fix, with a more
+    // confusing message. The shipped comparator instead intersects the bands of
+    // DECLARED widths consistent with each reading, which is invariant.
+    //
+    // This revert restores the naive form. It is MACHINE-INDEPENDENT: the unit
+    // sweep it fails is a table of real Chromium readings, so the verdict does
+    // not depend on the display the harness runs on. On a DPR >= 2 machine the
+    // four code-box assertions fail too - that IS the defect - and would show
+    // up as unlisted rather than changing the verdict.
+    what: "compare snapped border widths as raw device-pixel counts (breaks at DPR >= 2)",
+    file: THEME_TEST,
+    from: "  return a[0] < b[1] - 1e-9 && b[0] < a[1] - 1e-9;",
+    to: "  return deviceWidth(goldenCss, goldenDpr) === deviceWidth(liveCss, liveDpr);",
+    suite: "test:theme",
+    expect: [
+      /^the snapped-width comparator reads one declaration as unchanged across every measured display scale$/,
+    ],
+  },
+  {
+    id: "R428",
+    // THE DPR-PORTABLE COMPARISON IS KEYED ON A LIST OF PROPERTY NAMES, so the
+    // list's completeness is the load-bearing part and nothing was checking it.
+    // Sections 3 and 4 both route a snapped width through the declared-width
+    // band - but only for the names SNAPPED_BOX_PROPS carries. A width under
+    // any other name falls back to an exact string comparison and starts
+    // failing on every display whose DPR is not the capture's, silently,
+    // because nothing else in the suite looks at the shape of the golden's
+    // keys. This drops one side from the list, which is exactly what removing
+    // an "unused" entry looks like.
+    //
+    // ITS PRIMARY VERDICT IS MACHINE-INDEPENDENT BY CONSTRUCTION: the three
+    // listed assertions are properties of the golden's own numbers and of the
+    // list, so they fail at any display scale. On a display whose DPR is not
+    // GOLDEN_DPR the four code-box comparisons fail too - the defect itself,
+    // now reaching the reader - and show up as unlisted. They are deliberately
+    // NOT in `expect`: on a 1.5x display they would not fail, and a revert
+    // whose verdict depends on the machine it ran on is not a proof.
+    what: "drop one border side from the device-pixel-snapped property list",
+    file: THEME_TEST,
+    from:
+      'const SNAPPED_BOX_PROPS = [\n  "borderTopWidth",\n  "borderRightWidth",\n' +
+      '  "borderBottomWidth",\n  "borderLeftWidth",\n];',
+    to:
+      'const SNAPPED_BOX_PROPS = [\n  "borderTopWidth",\n  "borderRightWidth",\n' +
+      '  "borderBottomWidth",\n];',
+    suite: "test:theme",
+    expect: [
+      /^every device-pixel-snapped length the golden records goes through the declared-width band, not a string comparison$/,
+      /^the golden's snapped border widths are whole device pixels at the derived capture DPR/,
+      /^every live snapped border width is a whole number of device pixels at this display's DPR/,
+    ],
+    mustPass: [
+      /^the snapped-width comparator reads one declaration as unchanged across every measured display scale$/,
+      /^the snapped-width comparator still catches a doubled border at every measured display scale$/,
+    ],
+  },
 ];
 
 const argv = process.argv.slice(2);
