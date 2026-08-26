@@ -252,7 +252,16 @@
   // report in which space and keeps working if the scale ever arrives by some
   // other route. Borders are added back because rect.height is a border-box
   // measurement while clientHeight is padding-box.
+  //
+  // Delegates to renderer.js's scrollerScale() when it is present, for the same
+  // reason getScroller() delegates to getViewerScroller(): the zoom
+  // reading-position anchor needs the identical conversion, and two copies of
+  // it are two copies that can silently disagree. The body below is kept as the
+  // fallback for the case where this overlay loads without the renderer.
   function scrollerScale(scroller) {
+    if (typeof window.scrollerScale === "function" && window.scrollerScale !== scrollerScale) {
+      return window.scrollerScale(scroller);
+    }
     const cs = getComputedStyle(scroller);
     const borders =
       (parseFloat(cs.borderTopWidth) || 0) + (parseFloat(cs.borderBottomWidth) || 0);
@@ -817,6 +826,14 @@
         }
         dismissUpdatePrompt();
         if (window.viewer) {
+          // Replaces the WHOLE viewer subtree with the welcome screen. A zoom
+          // anchor captured against the document being closed cannot describe
+          // anything afterwards, so it is stood down. Guarded because this file
+          // is an IIFE loaded alongside renderer.js, matching the convention
+          // used for window.setUnsavedState above.
+          if (window.noteViewerMutation) {
+            window.noteViewerMutation();
+          }
           window.viewer.innerHTML = `
             <div class="welcome">
               <h1>Welcome to Folia</h1>
@@ -1350,6 +1367,15 @@
     // targets the element the engine actually scrolls, rather than re-deriving
     // that guess in the test and proving nothing.
     __getScroller: getScroller,
+    // Exposed so the suite can prove the DELEGATION fires, not merely that the
+    // arithmetic is right. offsetWithin() produces almost the same number
+    // through either implementation - renderer.js's scrollerScale() or the
+    // fallback below it - so an end-to-end assertion on its RESULT measures the
+    // disjunction and would stay green if the delegation were deleted. The only
+    // way to tell them apart is to spy on window.scrollerScale while calling
+    // the real offsetWithin. Same test-seam convention as __getScroller: assert
+    // on the real function, never on a re-implementation of it.
+    __offsetWithin: offsetWithin,
     // Session restore runs on DOMContentLoaded, so the only way to drive the
     // real batch path without reloading the window - which would destroy the
     // suite's error sentinel and its state - is to call it. Same test-seam

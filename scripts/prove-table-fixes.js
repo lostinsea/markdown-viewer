@@ -31,6 +31,7 @@ const CUSTOM_CSS = path.join(SRC, "custom-styles.css");
 const CENSUS = path.join(ROOT, "test", "theme-census.js");
 const GOLDEN = path.join(ROOT, "test", "fixtures", "theme-golden.json");
 const THEME_TEST = path.join(ROOT, "test", "test-theme.js");
+const TABLE_TEST = path.join(ROOT, "test", "test-table-display.js");
 const THEME_FIXTURE = path.join(ROOT, "test", "fixtures", "syntax-census.md");
 const THEME_JS = path.join(SRC, "custom-theme.js");
 const PKG_TEST = path.join(ROOT, "test", "test-packaging.js");
@@ -228,9 +229,45 @@ const REVERTS = [
     id: "R60",
     what: "do not recalculate on zoom (a width set at 100% is 4x too wide at 400%)",
     file: RENDERER,
-    from: "  republishBreakoutBudgetForZoom(zoomLevel / 100);\n  viewer.style.zoom = `${zoomLevel / 100}`;\n  zoomResetBtn.textContent = `${zoomLevel}%`;\n  scheduleTableBreakout();",
-    to: "  viewer.style.zoom = `${zoomLevel / 100}`;\n  zoomResetBtn.textContent = `${zoomLevel}%`;",
-    expect: [/never leaves the window at any zoom level/],
+    // Two edits rather than one contiguous block: updateZoom()'s tail is no
+    // longer contiguous - the republish moved above the zoom write (R443) and a
+    // comment now sits between it and scheduleTableBreakout(). `--anchors`
+    // caught that the moment the reorder landed, which is the whole reason it
+    // exists. The DEFECT is unchanged: neither half of the zoom recalculation
+    // runs, so a width measured at 100% is still in force at 400%.
+    from: "  republishBreakoutBudgetForZoom(zoomLevel / 100);\n",
+    to: "",
+    also: {
+      file: RENDERER,
+      from: "  scheduleTableBreakout();\n",
+      to: "",
+    },
+    expect: [
+      /never leaves the window at any zoom level/,
+      // WIDENED WITH ITS REASON. This revert removes BOTH halves of the zoom
+      // recalculation - the budget republish and the coalesced remeasure - so
+      // every cell that reads geometry after a zoom step is an honest
+      // consequence, not collateral. Naming them is what stops the list from
+      // silently absorbing a future regression that has nothing to do with
+      // zoom recalculation. The three S5/S10 cells are the interesting ones:
+      // with no republish at all, the budget is never refreshed on the zoom
+      // path, so "measured against the CURRENT reading area" and "scaled by
+      // the zoom being applied" both fail for the same missing call.
+      /^a burst of six zoom steps does not remeasure every table six times$/,
+      /^the coalesced remeasure really ran$/,
+      /^the coalesced remeasure leaves final geometry, not an approximation$/,
+      /^a table does not leave the window in the frame a zoom burst lands$/,
+      /^a zoom step inside the coalescing window publishes a budget measured against the CURRENT reading area$/,
+      /^the table container does not move between the anchor frame and the coalesced pass$/,
+      /^the S10 stale leg really took the measuring branch, and the clean leg really did not$/,
+      /^the zoom path's re-measured budget is scaled by the zoom being applied, not the one being left$/,
+      /^an ordinary zoom step really does flip wrap-anyway AFTER the anchor frame, identically in both legs$/,
+      /^with the engine's scroll anchoring disabled the same step displaces the reader by exactly the reflow$/,
+      // And the anchor staleness cell, because a re-render that never
+      // republishes leaves the document at a geometry the anchor's oracle was
+      // not measured against.
+      /^a zoom anchor is dropped when the document was re-rendered under it$/,
+    ],
   },
   {
     id: "R61",
@@ -341,7 +378,18 @@ const REVERTS = [
     file: CSS,
     from: "  --mv-breakout-applied: min(var(--table-breakout-width), var(--mv-breakout-budget, 100%));",
     to: "  --mv-breakout-applied: var(--table-breakout-width);",
-    expect: [/clamped inside the window by CSS alone/],
+    expect: [
+      /clamped inside the window by CSS alone/,
+      // WIDENED WITH RATIONALE. The clamp is the only thing capping a stale
+      // stored width, so removing it is visible from every fixture that reads
+      // geometry after the anchor frame - the zoom-burst cell, the S4 deferred
+      // pass contract and the S5 container check all report the same defect
+      // through a different lens. Narrowing these away would have made the
+      // record claim the clamp mattered in one place only.
+      /^a table does not leave the window in the frame a zoom burst lands$/,
+      /^the table container does not move between the anchor frame and the coalesced pass$/,
+      /^the deferred table-breakout pass changes no geometry after the anchor frame$/,
+    ],
   },
   {
     id: "R71",
@@ -3919,9 +3967,25 @@ const REVERTS = [
     // passing and only the coalescing count may fail.
     what: "remeasure every table on every zoom step instead of coalescing the burst",
     file: RENDERER,
-    from: "  zoomResetBtn.textContent = `${zoomLevel}%`;\n  scheduleTableBreakout();",
-    to: "  zoomResetBtn.textContent = `${zoomLevel}%`;\n  applyTableBreakout();",
-    expect: [/does not remeasure every table six times/],
+    from: "  scheduleTableBreakout();",
+    to: "  applyTableBreakout();",
+    expect: [
+      /does not remeasure every table six times/,
+      // WIDENED WITH RATIONALE, and the extra failures are informative rather
+      // than noise. Running the full pass synchronously on every step moves the
+      // wrap-anyway flip from AFTER the anchor frame to DURING it, so the S8
+      // cell's precondition (waMid all zero) stops holding and its control
+      // stops describing the same experiment. The two zoom-anchor cells move
+      // for the same reason: the geometry under the reader is no longer settled
+      // in the frame the anchor restores. R257 is geometrically correct in its
+      // FINAL layout, which is why the final-geometry assertions below are
+      // still required to pass - what it changes is WHEN, and these four
+      // assertions are the ones that measure when.
+      /^an ordinary zoom step really does flip wrap-anyway AFTER the anchor frame, identically in both legs$/,
+      /^with the engine's scroll anchoring disabled the same step displaces the reader by exactly the reflow$/,
+      /^zooming with wide tables above the reading position keeps the reader's place$/,
+      /^what the reader was looking at is still on screen after a zoom burst$/,
+    ],
     mustPass: [
       /a widened table never leaves the window at any zoom level/,
       /a table does not leave the window in the frame a zoom burst lands/,
@@ -3940,7 +4004,24 @@ const REVERTS = [
     file: RENDERER,
     from: "  republishBreakoutBudgetForZoom(zoomLevel / 100);\n",
     to: "",
-    expect: [/a table does not leave the window in the frame a zoom burst lands/],
+    expect: [
+      /^a table does not leave the window in the frame a zoom burst lands$/,
+      // WIDENED WITH RATIONALE. R258 and R439 pin adjacent halves of one
+      // contract - R439 breaks the staleness FLAG that decides whether the
+      // budget is recomputed, R258 removes the synchronous publish outright -
+      // so the S5 cell, which was written for R439, necessarily reports this
+      // one too. It is the same defect reached from the other side, and the S5
+      // fixture measures it more sharply than the burst cell does: it names the
+      // published budget as well as the resulting movement.
+      /^a zoom step inside the coalescing window publishes a budget measured against the CURRENT reading area$/,
+      /^the table container does not move between the anchor frame and the coalesced pass$/,
+      // And the S4 contract, which is the general statement of the same thing:
+      // with the publish deferred, the coalesced pass becomes the thing that
+      // CORRECTS the geometry rather than merely confirming it, so it
+      // necessarily moves layout after the reading position was restored. S4
+      // exists to make exactly that migration fail loudly.
+      /^the deferred table-breakout pass changes no geometry after the anchor frame$/,
+    ],
   },
 
   // ─── item 5: the theme token system ──────────────────────────────────────
@@ -8357,6 +8438,389 @@ const REVERTS = [
     ],
   },
   {
+    id: "R412",
+    // THE WHOLE ZOOM READING-POSITION ANCHOR. Neutralising the capture is the
+    // real off switch: with nothing recorded applyZoomAnchor() returns on its
+    // first line, so the reverted tree is exactly the pre-fix product. It is
+    // done at the FUNCTION's first statement rather than by deleting the body,
+    // so no amount of restructuring inside can rot the anchor - the R53 pattern.
+    //
+    // What it restores is not subtle. `.content-wrapper` is the scroller in
+    // normal view and #viewer carries the CSS `zoom`, so the scroller sits
+    // outside the scaled subtree and scrollTop is left exactly where it was
+    // while scrollHeight grows. Three zoom clicks then throw the reader
+    // scrollTop * (ratio - 1) pixels: 13,426px at 50% depth and 24,745px - about
+    // 24 screens - at 90%. The OFF arm of section 12d measures precisely this,
+    // which is why every control assertion must keep passing here: with the fix
+    // reverted the two arms become the same measurement, and a revert that made
+    // its own control fail would be proving the probe rather than the product.
+    what: "neutralise the zoom reading-position capture",
+    file: RENDERER,
+    from: "  if (pendingZoomAnchor) return; // a burst reads once",
+    to: "  if (true) return; // R412",
+    suite: "test:tables",
+    expect: [
+      /^zooming in normal view keeps the reader's place$/,
+      /^zooming in split view keeps the reader's place$/,
+      /^what the reader was looking at is still on screen after a zoom burst$/,
+      // Honest consequences, widened in with their reason rather than narrowed
+      // away: this revert is the whole feature's off switch, so EVERY cell that
+      // measures the reader's place must fail, including the wide-table leg and
+      // the above-threshold leg. The staleness control fails for the same
+      // reason - with nothing ever captured there is no correction to apply,
+      // which is exactly what that control asserts does happen normally.
+      /^zooming with wide tables above the reading position keeps the reader's place$/,
+      /^zooming in normal view above the max-width threshold stays within one line box$/,
+      /^a zoom anchor is applied when nothing has invalidated it$/,
+      // The age trial's PRECONDITION belongs here for the same reason, and
+      // naming it is what keeps it from reading as collateral. That assertion
+      // pins "an anchor was still pending when the apply ran"; with the capture
+      // neutralised nothing is ever pending, so it is false by construction
+      // here. It is NOT evidence that the precondition is fragile - it is the
+      // precondition doing exactly its job, which is to refuse to certify a
+      // trial in which there was no anchor to age.
+      /^the age trial really aged a still-pending anchor without tripping any other clause$/,
+    ],
+    mustPass: [
+      /^with the zoom anchor disabled the same measurement sees the drift$/,
+      /^the zoom-anchor fixture is tall enough to exhibit a depth-proportional drift$/,
+      /^every zoom-anchor cell really moved the zoom level$/,
+      /^the tracked leaf sat close enough to the pane centre for the oracle to be sound$/,
+      /^the split-view legs really ran against #viewer as its own scroller$/,
+    ],
+  },
+  {
+    id: "R413",
+    // THE COORDINATE CONVERSION, AND IT IS SPLIT-VIEW-ONLY BY CONSTRUCTION.
+    // getBoundingClientRect() reports VIEWPORT pixels whether or not the element
+    // sits inside a `zoom`-scaled subtree, while scrollTop is in the SCROLLER's
+    // own pixels. In normal view the scroller is outside the zoom so the two
+    // spaces coincide and the divisor is 1.0003 - a no-op. In split view #viewer
+    // IS the scroller and also carries the zoom, so the divisor is the zoom
+    // factor itself and dropping it overshoots every correction by that factor.
+    //
+    // This is the same class of defect as 6a and R81 - a rect read in the wrong
+    // coordinate space - which this project has now got wrong three times and
+    // which is invisible at 100% because the factor is exactly 1. That is
+    // exactly why the suite runs its cells in BOTH view modes: a normal-view-only
+    // matrix would report a clean sweep.
+    what: "drop the viewport-to-scroller conversion from the zoom correction",
+    file: RENDERER,
+    from:
+      "(r.top + anchor.frac * r.height - (sRect.top + sRect.height / 2)) /\n" +
+      "    scrollerScale(scroller);",
+    to: "r.top + anchor.frac * r.height - (sRect.top + sRect.height / 2);",
+    suite: "test:tables",
+    // The on-screen assertion is an HONEST CONSEQUENCE, widened in rather than
+    // narrowed away: overshooting every split-view correction by the zoom factor
+    // moves the tracked content by up to 1043px, which really does take it out
+    // of the pane. Two witnesses to one defect, so both are named.
+    expect: [
+      /^zooming in split view keeps the reader's place$/,
+      /^what the reader was looking at is still on screen after a zoom burst$/,
+    ],
+    mustPass: [
+      /^zooming in normal view keeps the reader's place$/,
+      /^with the zoom anchor disabled the same measurement sees the drift$/,
+    ],
+  },
+  {
+    id: "R414",
+    // THE BURST GUARD IS LOAD-BEARING FOR CORRECTNESS, NOT ONLY FOR SPEED, and
+    // that is the reason this revert exists rather than a comment.
+    //
+    // A held key or a repeated click produces several updateZoom() calls in ONE
+    // task, with no frame between them - which is why the correction is deferred
+    // to a requestAnimationFrame at all. Without the guard, step 2 captures a
+    // fresh anchor from a layout that step 1 has already zoomed and NOT yet
+    // corrected, so the point recorded is one that has already drifted; step 3
+    // does it again. The surviving anchor holds the wrong content still and the
+    // reader keeps two steps' worth of drift - thousands of pixels at depth.
+    //
+    // The perf half (commit 4bbde83: a six-step burst went 1797ms -> 1ms of
+    // blocking JS) is pinned separately by R257/R258, and deliberately so: a
+    // timing assertion is how this suite would become flaky and it would not say
+    // what broke. This one pins the semantics, structurally.
+    what: "capture a fresh zoom anchor on every step of a burst",
+    file: RENDERER,
+    from: "  if (pendingZoomAnchor) return; // a burst reads once\n  if (!viewer) return;",
+    to: "  if (!viewer) return;",
+    suite: "test:tables",
+    expect: [
+      /^zooming in normal view keeps the reader's place$/,
+      /^zooming in split view keeps the reader's place$/,
+      // Honest consequence, widened in with its reason: a stale anchor holding
+      // the wrong content still leaves 3488px of residual drift in normal view,
+      // which takes the tracked content off screen entirely.
+      /^what the reader was looking at is still on screen after a zoom burst$/,
+      // Same widening, same reason: a stale anchor drifts every cell that
+      // measures the reader's place, not only the two originally listed.
+      /^zooming with wide tables above the reading position keeps the reader's place$/,
+      /^zooming in normal view above the max-width threshold stays within one line box$/,
+    ],
+    mustPass: [
+      /^with the zoom anchor disabled the same measurement sees the drift$/,
+      /^the tracked leaf sat close enough to the pane centre for the oracle to be sound$/,
+    ],
+  },
+  {
+    id: "R415",
+    // THE REFINEMENT WALK. Without it the anchor is whatever elementFromPoint
+    // returned, which for a point landing in the GAP between two blocks is their
+    // container - on the notices document a collapsible section 91,429px tall,
+    // 88 screens high, whose height does not track its text because it re-wraps
+    // (3,845 -> 3,864 line boxes across a 1.3x step in split view).
+    //
+    // MEASURED WITH THE LEAF-EDGE ORACLE against the rebuilt fixture: the
+    // gap-aim cell reads a 895px residual without the walk and -14px with it,
+    // against a 24px bar. The walk fires ONLY where the pane centre lands in a
+    // gap, which no ordinary depth sample reliably produces - this revert was
+    // VACUOUS until section 12d grew a pane-taller section and a cell that aims
+    // deterministically into a margin inside it. That narrowness is the point:
+    // an "improvement" that deleted the walk would look free on every other
+    // cell in the sweep (the other three split cells move by <= 1.5px).
+    what: "anchor to whatever elementFromPoint returned, however tall",
+    file: RENDERER,
+    from: "function refineZoomAnchor(el, aimY, paneHeight) {\n  for (let depth = 0; depth < 16; depth++) {",
+    to: "function refineZoomAnchor(el, aimY, paneHeight) {\n  if (el) return el;\n  for (let depth = 0; depth < 16; depth++) {",
+    suite: "test:tables",
+    // The on-screen assertion is named because it is an HONEST CONSEQUENCE, not
+    // collateral to be dodged: the gap-aim cell measures 895px of residual with
+    // the walk removed, on a pane a few hundred px tall, so the tracked leaf is
+    // necessarily off screen. Narrowing the record to hide that would describe
+    // the revert as smaller than it is.
+    expect: [
+      /^zooming in split view keeps the reader's place$/,
+      /^what the reader was looking at is still on screen after a zoom burst$/,
+    ],
+    mustPass: [
+      /^zooming in normal view keeps the reader's place$/,
+      /^with the zoom anchor disabled the same measurement sees the drift$/,
+    ],
+  },
+  {
+    id: "R416",
+    // THE FRACTION CLAMP, pinned at the unit level rather than through the
+    // drift tolerance - and that is a MEASURED decision, not a shortcut. Its
+    // induced error is |excess| * height * (ratio - 1); refineZoomAnchor caps
+    // the height at the pane and the aimed line is at most one collapsed margin
+    // outside the block, so the whole effect is a handful of px against section
+    // 12d's 24px tolerance. A revert measured that way came back VACUOUS, and
+    // would at ANY fixture shape. Same precedent as R202: an effect too small
+    // for the end-to-end oracle is still a contract, so restate it where it can
+    // bite. `mustPass` keeps the end-to-end assertions honest - this edit must
+    // not move them, or the unit oracle is not measuring what it claims.
+    what: "extrapolate outside the anchored block instead of clamping the fraction",
+    file: RENDERER,
+    from: "  if (!(raw > 0)) return 0; // also catches NaN\n  return raw > 1 ? 1 : raw;",
+    to: "  return raw;",
+    suite: "test:tables",
+    expect: [/^an out-of-range zoom anchor fraction is clamped to the block's nearest edge$/],
+    mustPass: [
+      /^zooming in normal view keeps the reader's place$/,
+      /^zooming in split view keeps the reader's place$/,
+      /^with the zoom anchor disabled the same measurement sees the drift$/,
+    ],
+  },
+  {
+    id: "R417",
+    // THE STAND-DOWN. The anchor is captured in updateZoom() and applied a
+    // frame later, so any scroll issued in between - a ToC click, an All-Notes
+    // click, a search hit, the reader's own wheel - is CLOBBERED by a
+    // correction computed before it existed. That is not a theoretical race: it
+    // was measured breaking five live assertions in test:patch section 3c, and
+    // the product path is worse than the test one, because
+    // scrollElementIntoView() smooth-scrolls and a zoom taken mid-flight aborts
+    // it half way. The two reviewers DISAGREED about this - one called it
+    // acceptable, one called it a defect - and the measurement settled it.
+    // This revert is the permanent record of who was right.
+    // Deliberately proven on test:patch rather than test:tables: section 12d
+    // never scrolls between a capture and its rAF, so it structurally cannot
+    // see this, and 3c is the suite that reproduces the real interleaving.
+    what: "let a pending zoom anchor overwrite a newer, deliberate scroll",
+    file: RENDERER,
+    from: "  if (zoomAnchorSuperseded(anchor)) return;\n",
+    to: "",
+    suite: "test:patch",
+    expect: [
+      /^clicking an All Notes entry centres the note in normal view at 100%$/,
+      /^clicking an All Notes entry centres the note in normal view at 200%$/,
+      /^clicking an All Notes entry centres the note in split view at 100%$/,
+      /^clicking an All Notes entry centres the note in split view at 200%$/,
+      // The vacuity guard fails too, and honestly: it asserts the note starts
+      // off screen, and it is measured AFTER the clobbered click, so the
+      // clobber is exactly what puts the note back off screen. Listed rather
+      // than dodged - it is a real consequence of the reverted defect.
+      /^the note really starts off screen in normal view at 100%, so centring can fail$/,
+    ],
+  },
+  {
+    id: "R418",
+    // THE SNAP. scrollerScale() divides a fractional rect.height by an
+    // INTEGER-ROUNDED offsetHeight, so the ratio is never exactly right: it
+    // measures 1.000331 in normal view where the truth is exactly 1.
+    //
+    // PINNED ON THE DIVISOR, NOT ON THE ZOOM RESIDUALS, and that is a
+    // correction rather than a preference. This revert was first written
+    // against "zooming in normal view keeps the reader's place" on the belief
+    // that the divisor explained that cell's 4px residual. It came back
+    // VACUOUS, and a controlled run - snap removed, everything else identical -
+    // reproduced the residuals UNCHANGED at 0.3/0.3/-0.3. The belief was simply
+    // wrong: the divisor scales the CORRECTION, which is offset*(ratio-1) and
+    // about 3515px in that cell, so 3.3e-4 of it is ~1.2px and never 4.
+    // A vacuous verdict caught a false attribution, which is the sixth time
+    // vacuity has meant a defect in the TEST rather than in the fix.
+    //
+    // The error is real regardless, and custom-tabs.js offsetWithin() inherits
+    // the same divisor through the delegation - there offsets reach tens of
+    // thousands of px on a refresh, so it is worth about 20px of reading
+    // position on the fork's primary feature. Too small for a zoom residual to
+    // resolve, so it is restated where it bites (the R202/R416 precedent), and
+    // `mustPass` keeps the end-to-end cells honest about not moving.
+    what: "trust the raw ratio instead of snapping it inside its own noise bound",
+    file: RENDERER,
+    from: "  const snapped = Math.round(raw * 20) / 20;",
+    to: "  const snapped = raw;",
+    suite: "test:tables",
+    expect: [
+      /^the scroller scale estimator snaps inside its noise bound and passes through outside it$/,
+    ],
+    mustPass: [
+      // The real-scroller contract must NOT move: measured, its raw ratio is
+      // integral at that instant, so the estimator has nothing to snap there.
+      // Listing it here rather than in `expect` is what a WRONG-GUARD verdict
+      // corrected - the harness caught the claim before it could rot.
+      /^the scroller scale reads exactly 1 where the scroller is outside the zoomed subtree$/,
+      /^zooming in normal view keeps the reader's place$/,
+      /^zooming in split view keeps the reader's place$/,
+      /^with the zoom anchor disabled the same measurement sees the drift$/,
+    ],
+  },
+  {
+    id: "R419",
+    // WITHDRAWN AS A PROOF, KEPT AS A RECORD - and the rationale below it is
+    // the falsified one, preserved deliberately because this project treats a
+    // wrong record as worse than no record.
+    //
+    // It was found by review and CONFIRMED by running it: the harness returned
+    // VACUOUS. The reason is that this same commit gave patchViewerDOM() a
+    // noteViewerMutation() call on its first line, so the `regen` trial - which
+    // drives a real re-render - now bumps BOTH counters. Delete the
+    // renderGeneration compare and the viewerMutationGen compare immediately
+    // below it still stands the anchor down, so the named assertion stays
+    // green. The rationale was written before that call existed and was never
+    // re-run against it: exactly the failure mode this project keeps
+    // rediscovering, and the reason `--expects` and the full-run exist.
+    //
+    // IT CANNOT BE MADE TO BITE, and that is a statement about the product
+    // rather than about the fixture. Every render path that mutates the viewer
+    // goes through patchViewerDOM(), the error-path replacement, or one of the
+    // post-render wrapping passes - and all of them now bump
+    // viewerMutationGen, including makeHeadersCollapsible(), which was the one
+    // gap and was closed in this same commit. A render that bumps
+    // renderGeneration WITHOUT mutating the viewer leaves the anchor measuring
+    // layout that is still valid, so applying it there is harmless. The
+    // compare is therefore defence-in-depth, not a load-bearing guard, and
+    // applyZoomAnchor's comment has been corrected to say so.
+    //
+    // Left disabled rather than deleted so that a future change which DOES
+    // make renderGeneration load-bearing - a render path that mutates the
+    // viewer without a mutation bump - has the proof already written.
+    skip: "vacuous by construction: patchViewerDOM bumps viewerMutationGen too",
+    // THE FALSIFIED RATIONALE (retained, do not act on it):
+    // THE RENDER-GENERATION CHECK. One reviewer judged the staleness handling
+    // already right; the other predicted a pending anchor could be applied to a
+    // document the reader is no longer looking at. The measurement settled it
+    // in the second's favour, and the oracle carries the proof with it: after a
+    // re-render the captured element is STILL connected and STILL inside
+    // #viewer - `survived: true` in the note - because patchViewerDOM's LCS
+    // diff matches and reuses nodes. So neither isConnected nor containment can
+    // see this, and without the generation compare the correction is re-imposed
+    // against layout it was never measured in.
+    //   ^ the last sentence is the false one: viewerMutationGen sees it.
+    what: "apply a pending zoom anchor across a re-render of the document",
+    file: RENDERER,
+    from: "  if (renderGeneration !== anchor.gen) return;\n",
+    to: "",
+    suite: "test:tables",
+    expect: [/^a zoom anchor is dropped when the document was re-rendered under it$/],
+    mustPass: [/^a zoom anchor is applied when nothing has invalidated it$/],
+  },
+  {
+    id: "R420",
+    // THE AGE LIMIT. A rAF in a background window is throttled and can be
+    // parked indefinitely, which strands the anchor AND latches the burst guard
+    // against every later capture. Without the limit the parked correction is
+    // applied whenever the window returns, however stale it has become.
+    //
+    // THIS CAME BACK VACUOUS TWICE, AND BOTH TIMES THE DEFECT WAS IN THE TEST
+    // RATHER THAN HERE - the sixth and seventh instances of that in this
+    // project. The trial aged the anchor by sleeping 700ms, and
+    // captureZoomAnchor() BOOKS ITS OWN RESTORE FRAME on its last line, so the
+    // product's rAF fired during the sleep, applied the correction and cleared
+    // pendingZoomAnchor. The manual apply then returned at its very first line
+    // with no anchor at all, "did not move" was true for a reason unrelated to
+    // age, and this line could be deleted with the assertion still green.
+    //
+    // THE FIRST DIAGNOSIS OF THAT WAS ALSO WRONG, and is recorded because a
+    // wrong record is worse than none. The scrollTop drift across the sleep
+    // (17115 -> 22363) was first attributed to the ENGINE's scroll anchoring
+    // tripping zoomAnchorSuperseded(), the clause immediately below this one.
+    // Two mechanisms could produce that number; it was assigned to one of them
+    // by assumption rather than by reading scheduleZoomAnchorRestore, and the
+    // "fix" built on it (hold the scroller across the sleep) left the verdict
+    // VACUOUS a second time - which is what exposed the real cause. The
+    // dGen/dMut readings had already ruled out the third candidate, the
+    // R419-style mutation-counter shadow.
+    //
+    // WHY THIS IS FIXED RATHER THAN WITHDRAWN LIKE R419. R419's shadow is
+    // STRUCTURAL - every viewer-mutating path bumps viewerMutationGen, so the
+    // clause it guards can never be the last one standing, and no fixture can
+    // change that. Nothing structural shadows this one: with the booked frame
+    // parked (which is what a throttled background window DOES to a rAF) and
+    // the scroller held, this is the only clause left, and deleting it moves
+    // the reader. The probe now pins all of that as a precondition in mustPass.
+    what: "apply a pending zoom anchor however long its frame was delayed",
+    file: RENDERER,
+    from: "  if (performance.now() - anchor.at > ZOOM_ANCHOR_MAX_AGE_MS) return;\n",
+    to: "",
+    suite: "test:tables",
+    expect: [/^a zoom anchor whose frame was delayed past its age limit is dropped$/],
+    mustPass: [
+      /^a zoom anchor is applied when nothing has invalidated it$/,
+      /^the age trial really aged a still-pending anchor without tripping any other clause$/,
+    ],
+  },
+  {
+    id: "R421",
+    // THE BOXLESS GUARD. isConnected does not imply having a box: a section
+    // collapsed in the same frame, or a display:contents element, reports an
+    // all-zero rect. The correction is then computed from zero against the pane
+    // centre, i.e. about minus half a pane, and the reader is thrown in a
+    // direction nothing asked for. Worth pinning precisely because it looks
+    // redundant next to the isConnected check directly above it.
+    what: "compute a zoom correction from an element that has no box",
+    file: RENDERER,
+    from: "  if (!r.height && !r.top && !r.bottom) return;\n",
+    to: "",
+    suite: "test:tables",
+    expect: [/^a zoom anchor whose element lost its box is dropped$/],
+    mustPass: [/^a zoom anchor is applied when nothing has invalidated it$/],
+  },
+  {
+    id: "R422",
+    // THE CONTAINMENT CHECK, which covers what the generation compare does not:
+    // an element moved out of #viewer WITHOUT a re-render still carries the
+    // right generation and is still connected.
+    what: "anchor to an element that is connected but no longer inside the viewer",
+    file: RENDERER,
+    from: "  if (!viewer || !viewer.contains(el)) return;\n",
+    to: "",
+    suite: "test:tables",
+    expect: [/^a zoom anchor whose element left the viewer is dropped$/],
+    mustPass: [/^a zoom anchor is applied when nothing has invalidated it$/],
+  },
+  {
     id: "R423",
     // THE DERIVED CAPTURE DPR. GOLDEN_DPR is not recorded in the golden - it is
     // derived from it - so it is exactly the kind of constant that can rot into
@@ -8437,6 +8901,102 @@ const REVERTS = [
     ],
   },
   {
+    id: "R426",
+    // THE BOTTOM-CLAMP BRANCH, which every residual cell in section 12d is
+    // structurally blind to. Those cells zoom out from depth 0.50-0.60, where
+    // the shortened document's new maximum still sits far below the reader, so
+    // `maxNow` never binds and `Math.min(anchor.top, maxNow)` is inert -
+    // writing plain `anchor.top` keeps all ten of them green.
+    //
+    // It is not inert near the end of a document. Zooming out there shortens
+    // the document and the ENGINE drags scrollTop down to the new maximum:
+    // MEASURED at 34584 -> 24706 on this fixture, ~9.9k px, four orders of
+    // magnitude past the 2px slack. That is a consequence of the zoom, not a
+    // competing agent, and reading it as one stands the correction down - so
+    // the reader loses their place on exactly the gesture the feature exists
+    // for, and only when they are near the end.
+    //
+    // Driven as a unit rather than through a residual on purpose: the clamp
+    // lands the scroller EXACTLY at the new maximum by construction, so from
+    // there only an upward correction is applicable at all, and whether this
+    // fixture happens to want one is a property of the fixture rather than of
+    // the guard. Same precedent as R202/R416 - an unreachable-by-cell branch
+    // is still a contract.
+    //
+    // IT IS NO LONGER UNREACHABLE. Opus S3 pointed out that no cell zoomed out
+    // at the bottom at all, and the cell written to close that gap drives this
+    // branch end-to-end: at 95% depth the pre-zoom scroll exceeds the post-zoom
+    // maximum, so with `maxNow` removed the engine's own clamp reads as a
+    // competing scroll, the correction stands down, and the reader is left
+    // pinned to the end of the document. Both of those assertions are named
+    // below alongside the unit one, because a revert that fails an assertion it
+    // does not name is exactly the unlisted-failure case this harness reports.
+    what: "compare the post-zoom scroll against where the reader was, ignoring the new maximum",
+    file: RENDERER,
+    from: "    now < Math.min(anchor.top, maxNow) - ZOOM_ANCHOR_SCROLL_SLACK",
+    to: "    now < anchor.top - ZOOM_ANCHOR_SCROLL_SLACK",
+    suite: "test:tables",
+    expect: [
+      /^a scroll the engine clamped because zooming out shortened the document is not treated as a competing scroll$/,
+      /^zooming out near the bottom holds the reading position instead of jumping to the end$/,
+      /^the reading position held near the bottom is at least a full pane clear of the end$/,
+    ],
+    // The ten residual cells must keep passing: this revert may only cost the
+    // near-bottom branch. If they move too, the edit has broken the anchor
+    // outright rather than isolating the clause.
+    mustPass: [
+      /^zooming in normal view keeps the reader's place$/,
+      /^a zoom anchor is applied when nothing has invalidated it$/,
+    ],
+  },
+  {
+    id: "R427",
+    // SET-AND-SCHEDULE SEPARATED - the arrangement this code shipped with, and
+    // one that no end-to-end cell can fault. updateZoom() is the only caller,
+    // so booking the restore frame from its tail produces identical behaviour
+    // on every path a reader can take: all ten residual cells stay green, which
+    // is why this is listed in mustPass rather than expect.
+    //
+    // What it costs is FAILURE containment. pendingZoomAnchor doubles as the
+    // burst guard and is cleared only by applyZoomAnchor(), so anything
+    // throwing between the store and the booking latches the guard with no
+    // frame outstanding - and captureZoomAnchor()'s own early return then
+    // refuses every subsequent capture. The feature dies for the SESSION, not
+    // for the step, and it dies silently. In the separated form the gap
+    // contains republishBreakoutBudgetForZoom(), a style write and
+    // scheduleTableBreakout(); in the shipped form it is empty by construction.
+    // It also stops captureZoomAnchor()'s four early returns booking a frame
+    // for an anchor that was never taken.
+    //
+    // Pinned at the unit level for the same reason as R202/R416/R426: an
+    // unreachable guard is still a contract, and the alternative is leaving the
+    // arrangement unproven because today's callers happen not to throw.
+    what: "book the zoom anchor's restore frame from updateZoom's tail instead of at the capture",
+    file: RENDERER,
+    from:
+      "  // early returns above booking a frame for an anchor that was never taken.\n" +
+      "  scheduleZoomAnchorRestore();",
+    to: "  // early returns above booking a frame for an anchor that was never taken.",
+    also: {
+      from:
+        "  scheduleTableBreakout();\n" +
+        "  // NOTE: the anchor's restore frame is booked by captureZoomAnchor() itself,",
+      to:
+        "  scheduleTableBreakout();\n" +
+        "  scheduleZoomAnchorRestore();\n" +
+        "  // NOTE: the anchor's restore frame is booked by captureZoomAnchor() itself,",
+    },
+    suite: "test:tables",
+    expect: [
+      /^capturing a zoom anchor books the frame that applies it$/,
+    ],
+    mustPass: [
+      /^zooming in normal view keeps the reader's place$/,
+      /^a zoom anchor is applied when nothing has invalidated it$/,
+      /^a zoom anchor is dropped when the document was re-rendered under it$/,
+    ],
+  },
+  {
     id: "R428",
     // THE DPR-PORTABLE COMPARISON IS KEYED ON A LIST OF PROPERTY NAMES, so the
     // list's completeness is the load-bearing part and nothing was checking it.
@@ -8474,7 +9034,697 @@ const REVERTS = [
       /^the snapped-width comparator still catches a doubled border at every measured display scale$/,
     ],
   },
-];
+  {
+    id: "R429",
+    // A TEST-SIDE REVERT (precedent R361/R362/R363), because the gap Opus S4
+    // names is a COVERAGE gap rather than a product defect: every zoom-anchor
+    // cell fired its three clicks in one task, so pendingZoomAnchor's burst
+    // guard admitted only the first and the entire sweep measured a HELD KEY.
+    // The gesture a reader actually makes - click, read, click - captures and
+    // applies three separate times, and three corrections compose where one
+    // does not, so a per-step bias small enough to clear the bar once is taken
+    // three times on the path that matters most.
+    //
+    // This removes the inter-click settle, which is exactly what "these sleeps
+    // are slowing the suite down" looks like, and returns the two stepwise
+    // cells to being slower copies of the burst cells. The `applied` counter is
+    // what notices: it reports 1 where the assertion requires 3. Without that
+    // counter the cells would keep passing - for the wrong reason, and with the
+    // gesture path unmeasured again - which is the recorded disjunction disease
+    // and the whole reason the control is there.
+    //
+    // The burst assertion is in mustPass, not expect: it filters to the
+    // non-stepwise cells, which this edit does not touch. So the revert has to
+    // break the gesture claim SPECIFICALLY, not merely make every cell alike.
+    what: "collapse the click-look-click gesture cells back into held-key bursts",
+    file: TABLE_TEST,
+    from:
+      "          for (let i = 0; i < 3; i++) {\n" +
+      "            btn.click();\n" +
+      "            if (perStep) await sleep(250);\n" +
+      "          }",
+    to:
+      "          for (let i = 0; i < 3; i++) {\n" +
+      "            btn.click();\n" +
+      "          }",
+    suite: "test:tables",
+    expect: [
+      /^the ordinary click-look-click gesture holds the reading position, not only a held-key burst$/,
+    ],
+    mustPass: [
+      /^a held-key zoom burst is corrected once, not once per step$/,
+      /^zooming in normal view keeps the reader's place$/,
+      /^zooming in split view keeps the reader's place$/,
+    ],
+  },
+  {
+    id: "R430",
+    // THE REJECTED BINARY SEARCH, kept as a permanent trap.
+    //
+    // firstChildReaching() is O(index) in rect reads, and the cost is REAL:
+    // 3.4ms / 1795 reads at 2k top-level blocks, 15.5ms / 8996 at 10k, on the
+    // zoom click handler's critical path. Both reviewers raised it
+    // independently, a binary search was built, and it was A/B-measured at
+    // 0.6ms / 17 reads. It is still wrong, and it is reverted.
+    //
+    // The search needs the children's bottoms to be non-decreasing. That holds
+    // for normal block flow, but refineZoomAnchor walks arbitrary descendant
+    // lists 16 deep and SANITIZE_CONFIG keeps the style attribute, so a float,
+    // a position:absolute box or a negative margin arrives from ORDINARY
+    // MARKDOWN and inverts the order. Measured over 1800 aims on the real app:
+    // 426 wrong, and in a nested list it returned null where a child did reach
+    // the aim - so the walk fell through to kids[last] and anchored on an
+    // unrelated block. The linear scan broke the postcondition zero times.
+    //
+    // THIS IS THE SHAPE OF THE ACCIDENT, WHICH IS WHY THE REVERT RE-ADDS THE
+    // CODE RATHER THAN DELETING SOMETHING. Nobody deletes a linear scan; they
+    // replace it, having convinced themselves - as I did, from three measured
+    // document states - that block bottoms are sorted. The trap has to be the
+    // optimisation itself. Same precedent as R84 (the glyphs-only 5ch marker
+    // gutter) and R83 (upstream's 3em): the specific wrong answer is pinned so
+    // it cannot be reintroduced silently.
+    //
+    // `expect` names only the equivalence assertion. The residual/geometry
+    // assertions are in mustPass because this revert is NOT geometrically
+    // neutral in general but IS on the section's own prose fixture, whose
+    // bottoms really are sorted - which is exactly why the dedicated
+    // out-of-flow cell had to exist for the defect to be visible at all.
+    what: "replace the reading-position scan with the rejected binary search",
+    file: path.join(SRC, "renderer.js"),
+    from:
+      "function firstChildReaching(kids, aimY) {\n" +
+      "  for (let i = 0; i < kids.length; i++) {\n" +
+      "    if (kids[i].getBoundingClientRect().bottom >= aimY) return kids[i];\n" +
+      "  }\n" +
+      "  return null;\n" +
+      "}",
+    to:
+      "function firstChildReaching(kids, aimY) {\n" +
+      "  if (!(aimY > 0)) {\n" +
+      "    for (let i = 0; i < kids.length; i++) {\n" +
+      "      if (kids[i].getBoundingClientRect().bottom >= aimY) return kids[i];\n" +
+      "    }\n" +
+      "    return null;\n" +
+      "  }\n" +
+      "  let lo = 0;\n" +
+      "  let hi = kids.length - 1;\n" +
+      "  let found = null;\n" +
+      "  while (lo <= hi) {\n" +
+      "    const mid = (lo + hi) >> 1;\n" +
+      "    let i = mid;\n" +
+      "    let rect = null;\n" +
+      "    while (i <= hi) {\n" +
+      "      const r = kids[i].getBoundingClientRect();\n" +
+      "      if (r.width !== 0 || r.height !== 0) {\n" +
+      "        rect = r;\n" +
+      "        break;\n" +
+      "      }\n" +
+      "      i++;\n" +
+      "    }\n" +
+      "    if (rect === null) {\n" +
+      "      hi = mid - 1;\n" +
+      "      continue;\n" +
+      "    }\n" +
+      "    if (rect.bottom >= aimY) {\n" +
+      "      found = kids[i];\n" +
+      "      hi = i - 1;\n" +
+      "    } else {\n" +
+      "      lo = i + 1;\n" +
+      "    }\n" +
+      "  }\n" +
+      "  return found;\n" +
+      "}",
+    suite: "test:tables",
+    // THREE assertions fail, and the third one is the most valuable of the set.
+    // The out-of-flow cell builds its inversion from inline styles. The wrapper
+    // cell builds it from a hand-assembled .code-block-container, which proves
+    // the STYLESHEET inverts the order but not that the product emits it. The
+    // third cell renders a REAL fenced code block through renderMarkdown,
+    // waits for the requestIdle() pass that adds the copy buttons, and sweeps
+    // the container the PRODUCT built - measured child bottoms [1588, 40], no
+    // author CSS and no inline style anywhere in the document. That failure is
+    // the direct measurement of why a third child matters. A two-child list is
+    // safe only because the search's first probe is always index 0, so it
+    // either returns index 0 or advances to index 1 and skips nothing; add one
+    // more child - a language label, a gutter, a wrap toggle - and the same
+    // product markup is silently mis-anchored. (An earlier draft of this note
+    // said a two-child binary "degenerates into an in-order exhaustive probe".
+    // That is wrong, and the correction has itself been mis-stated twice since,
+    // so it is now MEASURED rather than reasoned: running the `to:` function
+    // below against stubbed children that count their own rect reads gives
+    // bottoms [1588,40] aim 80 -> 1 read, probes [0], returns 0; bottoms
+    // [40,1588] aim 80 -> 2 reads, probes [0,1], returns 1; both AGREE with the
+    // linear scan. It stops after one read only WHEN INDEX 0 REACHES; when it
+    // misses, `while (lo <= hi)` re-enters with lo = hi = 1 and reads index 1.
+    // The three-child inversion [1600,40,1720] aim 80 probes [1,2] and returns
+    // 2 where linear returns 0 - it never reads index 0 at all. The safety
+    // conclusion is unchanged; the reason is that with two children nothing is
+    // skipped, NOT that only one read happens.)
+    //
+    // The structural assertion is in mustPass, not expect: it reports layout
+    // shape, not search behaviour, so the revert must NOT move it. If it ever
+    // fails, the product stopped emitting the markup this whole argument rests
+    // on, and that is a different bug from the one being trapped here.
+    expect: [
+      /^the reading-position walk finds the first block reaching the aim even when children are out of flow$/,
+      /^the reading-position walk holds inside a Folia block wrapper, whose own button inverts the child order$/,
+      /^the reading-position walk holds inside the product's own wrapper once a third child makes the list skippable$/,
+    ],
+    mustPass: [
+      /^the out-of-flow fixture really does invert block order \(the walk assertion is not vacuous\)$/,
+      /^out-of-flow layout is reachable from ordinary markdown \(an inline style survives sanitization\)$/,
+      /^the wrapper really inverts its children, from product CSS rather than an inline style$/,
+      /^the product's own rendered code-block wrapper puts its copy button after the code and out of flow$/,
+      /^zooming in normal view keeps the reader's place$/,
+      /^zooming in split view keeps the reader's place$/,
+    ],
+  },
+        {
+          id: "R431",
+          // THE GUARD renderGeneration CANNOT SUBSTITUTE FOR.
+          //
+          // applyZoomAnchor already compared renderGeneration, and an earlier version
+          // of its comment called that compare "exact rather than heuristic". It is
+          // not. renderMarkdown bumps renderGeneration on its FIRST line, but
+          // renderMarkdownFull is async, so a render already in flight when the
+          // anchor is captured has ALREADY bumped it: anchor.gen matches, and that
+          // render landing in the frame between capture and the restore is invisible.
+          // Both reviewers reached this independently and from opposite directions.
+          //
+          // The sharper half is that a reparent needs no render at all.
+          // addCodeBlockCopyButtons runs in a requestIdle callback AFTER the render
+          // promise has resolved and moves every <pre> under a new container, so an
+          // anchor taken a moment earlier points at a node that is about to move
+          // while renderGeneration sits perfectly still. Measured: the counter goes
+          // 63 -> 64 across that pass, with the reading taken after the await.
+          //
+          // Deleting the line leaves the OTHER four staleness guards in place, which
+          // is the point - if any of them could cover this case, this revert would
+          // come back VACUOUS and the guard would be redundant. It does not.
+          what: "drop the viewer-mutation half of the zoom anchor staleness gate",
+          file: path.join(SRC, "renderer.js"),
+          from:
+            "  if (renderGeneration !== anchor.gen) return;\n" +
+            "  if (viewerMutationGen !== anchor.mut) return;",
+          to: "  if (renderGeneration !== anchor.gen) return;",
+          suite: "test:tables",
+          expect: [
+            /^a zoom anchor is dropped when the viewer tree was mutated under it without a new render$/,
+          ],
+          mustPass: [
+            // The sensitivity control: the correction must still RUN when nothing has
+            // invalidated the anchor, or "did not move" would be satisfied by a probe
+            // that had simply stopped applying anything.
+            /^a zoom anchor is applied when nothing has invalidated it$/,
+            /^a zoom anchor is dropped when the document was re-rendered under it$/,
+            /^zooming in normal view keeps the reader's place$/,
+            /^zooming in split view keeps the reader's place$/,
+          ],
+        },
+        {
+          id: "R432",
+          // THE CALL SITE, PINNED SEPARATELY FROM THE CONTRACT.
+          //
+          // R431 proves that a NOTED mutation stands a pending anchor down. It says
+          // nothing about whether the product ever notes one - and a guard nobody
+          // calls is worth exactly nothing. These have to be two reverts, because one
+          // revert cannot distinguish "the gate is missing" from "the gate is never
+          // armed", and those are different bugs with different fixes.
+          //
+          // This site is the one that was MEASURED to matter: it reparents a live
+          // <pre> from a requestIdle callback that fires after renderMarkdownFull has
+          // already resolved.
+          what: "stop reporting the code-block wrap as a viewer mutation",
+          file: path.join(SRC, "renderer.js"),
+          from:
+            "    noteViewerMutation();\n" +
+            "    pre.parentNode.insertBefore(container, pre);",
+          to: "    pre.parentNode.insertBefore(container, pre);",
+          suite: "test:tables",
+          expect: [
+            /^wrapping a code block in its container is reported as a viewer mutation$/,
+          ],
+          mustPass: [
+            // The wrap itself must still happen - otherwise this would read as a
+            // missing notification when the product had actually stopped wrapping.
+            /^the product's own rendered code-block wrapper puts its copy button after the code and out of flow$/,
+            /^a zoom anchor is dropped when the viewer tree was mutated under it without a new render$/,
+            /^a zoom anchor is applied when nothing has invalidated it$/,
+          ],
+        },
+        {
+          id: "R433",
+          // THE DELEGATION, WHICH EVERY OTHER ASSERTION MEASURES AS A DISJUNCTION.
+          //
+          // custom-tabs.js keeps a private scrollerScale() as a fallback and hands
+          // off to renderer.js's when that one is loaded. The two produce almost
+          // the same number, so every assertion that reads offsetWithin's RESULT is
+          // satisfied by either of them - which is exactly why this needs its own
+          // revert and its own spy.
+          //
+          // Only the renderer's version applies snapScrollerScale, so losing the
+          // delegation reintroduces the off-grid divisor on the tab scroll-restore
+          // path, where offsets reach tens of thousands of pixels.
+          //
+          // Neutralised at the condition rather than deleted, so the body stays
+          // syntactically live and the anchor cannot rot on an edit to it.
+          what: "stop the tab overlay delegating its scroller-scale conversion to the renderer's snapped one",
+          file: TABS,
+          from:
+            '    if (typeof window.scrollerScale === "function" && window.scrollerScale !== scrollerScale) {',
+          to: "    if (false) {",
+          suite: "test:tables",
+          expect: [
+            /^the tab overlay's scroll arithmetic goes through the renderer's scroller scale, not its own fallback$/,
+          ],
+          mustPass: [
+            // The fallback is behaviourally near-identical, and that is the whole
+            // point: if these went red the revert would be reading as a broken
+            // overlay rather than as a lost delegation.
+            /^zooming in split view keeps the reader's place$/,
+            /^the scroller scale reads exactly 1 where the scroller is outside the zoomed subtree$/,
+          ],
+        },
+        {
+          id: "R434",
+          // FOUR DIRECT-MUTATION SITES, FOUR REVERTS. R431 proves a NOTED
+          // mutation stands a pending anchor down and R432 proves the product
+          // notes the code-block wrap. Neither says anything about the paths
+          // that insert or remove nodes without a render at all - and review
+          // found those HALF-COVERED: both render-into-DOM functions reported
+          // their `replace` branch and stayed silent on their `insert` branch.
+          //
+          // One revert per site because one revert cannot tell which site went
+          // silent, and a site that goes silent is invisible to every other
+          // assertion in the file. Same precedent as R203-R206.
+          //
+          // CORRECTION, recorded rather than rewritten: "reported their
+          // `replace` branch" describes the PRODUCT at the time, not the
+          // COVERAGE. Those two replace branches had no revert and no probe
+          // until R445/R446, so for a while this comment read as if they were
+          // pinned when nothing drove them at all.
+          what: "stop reporting a DOM table insert as a viewer mutation",
+          file: path.join(SRC, "renderer.js"),
+          from:
+            "    // Adds a table container to #viewer, shifting everything below it. The\n" +
+            "    // replace branch above was told; this one is just as structural.\n" +
+            "    noteViewerMutation();\n" +
+            "    const anchor = getDomInsertAnchor();",
+          to: "    const anchor = getDomInsertAnchor();",
+          suite: "test:tables",
+          expect: [
+            /^inserting a table into the DOM is reported as a viewer mutation$/,
+          ],
+          mustPass: [
+            // The insert itself must still happen, or this reads as a missing
+            // notification when the product had stopped inserting.
+            /^each direct viewer-mutation path under test really inserted or removed the node it reports$/,
+            /^deleting a table from the DOM is reported as a viewer mutation$/,
+          ],
+        },
+        {
+          id: "R435",
+          what: "stop reporting a DOM table delete as a viewer mutation",
+          file: path.join(SRC, "renderer.js"),
+          from:
+            "    // Removes a live node from the viewer subtree; a pending zoom anchor's\n" +
+            "    // recorded element and offsets are no longer describable.\n" +
+            "    noteViewerMutation();\n" +
+            "    tableContainerToRemove.parentElement.removeChild(tableContainerToRemove);",
+          to:
+            "    tableContainerToRemove.parentElement.removeChild(tableContainerToRemove);",
+          suite: "test:tables",
+          expect: [
+            /^deleting a table from the DOM is reported as a viewer mutation$/,
+          ],
+          mustPass: [
+            /^each direct viewer-mutation path under test really inserted or removed the node it reports$/,
+            /^inserting a table into the DOM is reported as a viewer mutation$/,
+          ],
+        },
+        {
+          id: "R436",
+          what: "stop reporting a DOM mermaid insert as a viewer mutation",
+          file: path.join(SRC, "renderer.js"),
+          from:
+            "    // Adds a mermaid container to #viewer, shifting everything below it. The\n" +
+            "    // replace branch above was told; this one is just as structural.\n" +
+            "    noteViewerMutation();\n" +
+            "    const anchor = getDomInsertAnchor();",
+          to: "    const anchor = getDomInsertAnchor();",
+          suite: "test:tables",
+          expect: [
+            /^inserting a mermaid diagram into the DOM is reported as a viewer mutation$/,
+          ],
+          mustPass: [
+            /^each direct viewer-mutation path under test really inserted or removed the node it reports$/,
+            /^deleting a mermaid diagram from the DOM is reported as a viewer mutation$/,
+          ],
+        },
+        {
+          id: "R437",
+          what: "stop reporting a DOM mermaid delete as a viewer mutation",
+          file: path.join(SRC, "renderer.js"),
+          from:
+            "    // Removes a live node from the viewer subtree; a pending zoom anchor's\n" +
+            "    // recorded element and offsets are no longer describable.\n" +
+            "    noteViewerMutation();\n" +
+            "    container.parentElement.removeChild(container);",
+          to: "    container.parentElement.removeChild(container);",
+          suite: "test:tables",
+          expect: [
+            /^deleting a mermaid diagram from the DOM is reported as a viewer mutation$/,
+          ],
+          mustPass: [
+            /^each direct viewer-mutation path under test really inserted or removed the node it reports$/,
+            /^inserting a mermaid diagram into the DOM is reported as a viewer mutation$/,
+          ],
+        },
+        {
+          id: "R445",
+          // THE TWO `replace` BRANCHES, WHICH THE CELL THAT EXISTS FOR THEM
+          // NEVER DROVE.
+          //
+          // R434-R437's own comment records that review found the two
+          // render-into-DOM functions half-covered: each reported `replace` and
+          // stayed silent on `insert`. The fix wired the insert branches - and
+          // the four legs written to prove it drove insert and delete only. So
+          // the branches that prompted the whole cell were themselves unpinned:
+          // deleting either noteViewerMutation() left the suite green.
+          //
+          // These are not theoretical paths. `replace` is the context-menu
+          // "Edit Table" / "Edit Diagram" flow, i.e. the one a reader actually
+          // reaches, and it reparents a live node while a zoom anchor may be
+          // pending against the node it destroys.
+          what: "stop reporting a DOM table replace as a viewer mutation",
+          file: path.join(SRC, "renderer.js"),
+          from:
+            "      // Reparents a live node; see addCodeBlockCopyButtons for why the zoom\n" +
+            "      // anchor has to be told.\n" +
+            "      noteViewerMutation();\n" +
+            "      replaceEl.parentElement.replaceChild(container, replaceEl);",
+          to: "      replaceEl.parentElement.replaceChild(container, replaceEl);",
+          suite: "test:tables",
+          expect: [
+            /^replacing a table in the DOM is reported as a viewer mutation$/,
+          ],
+          mustPass: [
+            /^each direct viewer-mutation path under test really inserted or removed the node it reports$/,
+            /^replacing a mermaid diagram in the DOM is reported as a viewer mutation$/,
+          ],
+        },
+        {
+          id: "R446",
+          // The mermaid half of R445. Separate entry for the same reason every
+          // other site in this family has one: a single revert cannot say which
+          // branch went silent.
+          what: "stop reporting a DOM mermaid replace as a viewer mutation",
+          file: path.join(SRC, "renderer.js"),
+          from:
+            "    // Reparents a live node; see addCodeBlockCopyButtons for why the zoom\n" +
+            "    // anchor has to be told.\n" +
+            "    noteViewerMutation();\n" +
+            "    replaceTarget.parentElement.replaceChild(container, replaceTarget);",
+          to: "    replaceTarget.parentElement.replaceChild(container, replaceTarget);",
+          suite: "test:tables",
+          expect: [
+            /^replacing a mermaid diagram in the DOM is reported as a viewer mutation$/,
+          ],
+          mustPass: [
+            /^each direct viewer-mutation path under test really inserted or removed the node it reports$/,
+            /^replacing a table in the DOM is reported as a viewer mutation$/,
+          ],
+        },
+        {
+          id: "R438",
+          // THE FIFTH SITE, AND THE ONLY ONE OUTSIDE renderer.js. Closing the
+          // last tab replaces the WHOLE viewer subtree with the welcome screen
+          // by assigning innerHTML, with no render involved, so renderGeneration
+          // does not move and a zoom anchor captured against the document being
+          // closed would still look valid.
+          //
+          // Lives in the tabs suite because that is where the tab lifecycle is
+          // driven. Neutralised at the condition rather than deleted so the
+          // guarded call stays syntactically live and the anchor cannot rot.
+          what: "stop reporting the last-tab welcome-screen replacement as a viewer mutation",
+          file: TABS,
+          from: "          if (window.noteViewerMutation) {",
+          to: "          if (false) {",
+          suite: "test:tabs",
+          expect: [
+            /^replacing the closed document with the welcome screen is reported as a viewer mutation$/,
+          ],
+          mustPass: [
+            // The close must still do what it claims, or this reads as a
+            // missing notification when the product had stopped replacing.
+            /^closing the last tab really replaced the document with the welcome screen$/,
+            /^closing the last tab leaves no watcher raising prompts$/,
+          ],
+        },
+        {
+          id: "R439",
+          // THE STALE-BUDGET HALF OF THE ZOOM PATH. republishBreakoutBudgetForZoom
+          // deliberately reads no layout (item 4 took 190-235ms per step off the
+          // zoom path that way) and divides a CACHED width by the new zoom
+          // factor. Both resize paths defer the recompute that refreshes that
+          // cache by 120ms, so a zoom landing inside that window published a
+          // budget describing a reading area the reader could no longer see -
+          // MEASURED at 716px too wide, after which the deferred pass corrected
+          // the layout AFTER the zoom anchor had already restored the reading
+          // position.
+          //
+          // Neutralised at the CONDITION rather than by deleting the flag, so
+          // the flag stays declared and written and only the consumption is
+          // removed. That is the realistic accident: a future reader deciding
+          // the extra clause is redundant because "the cache is refreshed by
+          // every full pass".
+          what: "stop consulting the stale-budget flag on the zoom path",
+          file: path.join(SRC, "renderer.js"),
+          from: "  if (lastBreakoutAvailable === null || breakoutBudgetStale) {",
+          to: "  if (lastBreakoutAvailable === null) {",
+          suite: "test:tables",
+          expect: [
+            /^a zoom step inside the coalescing window publishes a budget measured against the CURRENT reading area$/,
+            // WIDENED, NOT NARROWED: the second failure is this revert's own
+            // reader-visible payload. A budget 716px too wide lets the
+            // container paint 1232.45px in the anchor frame and the coalesced
+            // pass then pulls it back to 1224 - movement AFTER the reading
+            // position has already been restored, which is the whole reason
+            // the flag exists.
+            /^the table container does not move between the anchor frame and the coalesced pass$/,
+          ],
+          mustPass: [
+            // The precondition is deliberately readable on a broken tree too -
+            // it describes the state at the click, not the outcome - so if it
+            // stops passing the cell has stopped reaching the defect and the
+            // contract above is passing or failing for the wrong reason.
+            /^the stale-budget window really was reached \(the cached width disagreed with live layout at the click\)$/,
+          ],
+        },
+        {
+          id: "R440",
+          // S8's CONTRACT AND ITS CONTROL, PINNED AGAINST THE ONE EDIT THAT
+          // WOULD SILENTLY REMOVE THE THING DOING THE WORK.
+          //
+          // An ordinary zoom step crosses the wrap-anyway threshold - `available`
+          // is measured outside the zoom-scaled subtree and `wanted` inside it -
+          // and reflows every table AFTER the anchor frame, with no DOM mutation
+          // for noteViewerMutation() to see. The reader does not move anyway,
+          // and the A/B says why: Chromium's own scroll anchoring absorbs the
+          // whole 26px. `overflow-anchor` appears NOWHERE in src/, so what is
+          // holding the reading position is an engine default.
+          //
+          // This revert is the realistic future accident that removes it: one
+          // declaration on the scroller, of exactly the kind a containment or
+          // content-visibility experiment adds.
+          //
+          // It fails THREE assertions and all three are honest. The declaration
+          // is on the scroller, so it reaches the control leg too: the ON leg
+          // stops being the product's default and the A/B stops being a
+          // comparison. That is why the admissibility guard is a separate
+          // assertion from the crossing precondition - the crossing still
+          // happens, so the contract's failure is real rather than setup noise.
+          what: "disable the engine's scroll anchoring on the reading scroller",
+          file: path.join(SRC, "styles.css"),
+          from: ".content-wrapper {\n  flex: 1;",
+          to: ".content-wrapper {\n  overflow-anchor: none;\n  flex: 1;",
+          suite: "test:tables",
+          expect: [
+            /^the reflow an ordinary zoom step triggers after the anchor frame does not move the reader$/,
+            /^with the engine's scroll anchoring disabled the same step displaces the reader by exactly the reflow$/,
+            /^the two legs really did run with different scroll anchoring \(the A\/B is a genuine comparison\)$/,
+            // THREE FURTHER FAILURES, WIDENED WITH THEIR RATIONALE RATHER THAN
+            // DODGED - and they are a finding in their own right. The S3
+            // zoom-out-near-bottom cell holds its reading position partly
+            // because the engine absorbs the reflow too, so removing anchoring
+            // from the scroller moves it as well. That is the same mechanism
+            // this revert exists to expose, observed on an independent fixture:
+            // engine scroll anchoring is load-bearing across the zoom feature,
+            // not only in the S8 document. Narrowing these away would have
+            // hidden exactly that.
+            /^zooming out near the bottom holds the reading position instead of jumping to the end$/,
+            /^the reading position held near the bottom is at least a full pane clear of the end$/,
+            /^at the very bottom the zoom anchor leaves the clamped position exactly where the engine put it$/,
+          ],
+          mustPass: [
+            // The step must still cross the threshold, or the cell is measuring
+            // a document that never reflowed and the contract above failed for
+            // a reason that has nothing to do with anchoring.
+            /^an ordinary zoom step really does flip wrap-anyway AFTER the anchor frame, identically in both legs$/,
+          ],
+        },
+        {
+          id: "R441",
+          // A TEST-SIDE REVERT (precedent R361/R362/R363), because the property
+          // being defended is a property of the FIXTURE.
+          //
+          // The crossing point is arithmetic: settled `available` is 1224 at a
+          // 1300px window against wanted@zoom1 = 1120.41, so the threshold sits
+          // at 1.0925 and the 100->110 step straddles it. At the suite's own
+          // 2000px window `available` is 1924 and NO 10% step from 100% can
+          // reach it. Drop the resize and the cell still runs, still zooms,
+          // still measures - and measures nothing, because no table reflows.
+          //
+          // This is what proves the precondition assertion is load-bearing
+          // rather than decorative: the contract passes VACUOUSLY here.
+          what: "measure the zoom-reflow cell at a window width where no table can cross the threshold",
+          file: TABLE_TEST,
+          from: "  await resizeWindow({ ...s8Bounds, width: 1300 });",
+          to: "  await resizeWindow({ ...s8Bounds });",
+          suite: "test:tables",
+          expect: [
+            /^an ordinary zoom step really does flip wrap-anyway AFTER the anchor frame, identically in both legs$/,
+            // WIDENED WITH ITS REASON: with no reflow the OFF leg's identity
+            // holds trivially (0 = 0 * 1.1), but its two companion clauses -
+            // that the reader really is displaced past the bar and that the ON
+            // leg's scrollTop really did compensate - are exactly the claims a
+            // vacuous fixture cannot support. A second, independent witness to
+            // the same thinning, which is what makes this a proof about the
+            // fixture rather than about one assertion.
+            /^with the engine's scroll anchoring disabled the same step displaces the reader by exactly the reflow$/,
+          ],
+          mustPass: [
+            // The contract passes VACUOUSLY here - zero displacement is what a
+            // working anchor and a document that never reflowed both report -
+            // and the admissibility guard is untouched by a window width. Both
+            // staying green is the whole demonstration.
+            /^the reflow an ordinary zoom step triggers after the anchor frame does not move the reader$/,
+            /^the two legs really did run with different scroll anchoring \(the A\/B is a genuine comparison\)$/,
+          ],
+        },
+        {
+          id: "R442",
+          // THE REALISTIC ACCIDENT, not an artificial one. The Ctrl+wheel path
+          // is anchored today for FREE: captureZoomAnchor() is the first
+          // statement of updateZoom(), so every entry point inherits it. The
+          // way that gets lost is not by deleting the anchor - it is by a wheel
+          // handler that stops calling updateZoom() at all, which is exactly
+          // what "zoom toward the cursor" or "make the held-wheel burst
+          // cheaper" would produce. This writes the zoom directly, the way such
+          // a refactor would, and leaves every other zoom path untouched.
+          //
+          // MEASURED, NOT ASSUMED, before this was written: a trusted CDP wheel
+          // event showed the handler is the WHOLE of the product's response -
+          // webFrame's own zoom factor stays 1.0 across Ctrl+wheel steps and
+          // the native scroll contributes 0px - so bypassing updateZoom() loses
+          // the anchor and nothing else compensates for it.
+          what: "make the Ctrl+wheel zoom-in write the zoom directly instead of going through updateZoom()",
+          file: RENDERER,
+          from:
+            "        zoomLevel += ZOOM_CONFIG.step;\n" +
+            "        updateZoom();",
+          to:
+            "        zoomLevel += ZOOM_CONFIG.step;\n" +
+            "        viewer.style.zoom = zoomLevel / 100;\n" +
+            "        zoomResetBtn.textContent = zoomLevel + '%';",
+          suite: "test:tables",
+          expect: [
+            /^Ctrl\+wheel holds the reading position exactly as the zoom buttons do$/,
+          ],
+          mustPass: [
+            // The precondition must SURVIVE: the reverted handler still reaches
+            // zoom 110 from the same start, so the two legs remain a genuine
+            // comparison and the failure above is about the reading position
+            // rather than about the wheel having stopped working.
+            /^a Ctrl\+wheel really does drive a zoom step, from the same start as the button leg$/,
+            // The BUTTON path is untouched by this edit, so its own anchor
+            // quality assertions must stay green - that is what makes this a
+            // proof about the wheel entry point specifically.
+            /^zooming in normal view keeps the reader's place$/,
+            /^the ordinary click-look-click gesture holds the reading position, not only a held-key burst$/,
+          ],
+        },
+        {
+          id: "R443",
+          // A TRUE REORDER, expressed as a delete plus an insert, because the
+          // realistic accident is someone "tidying" updateZoom() by grouping
+          // the two style writes at the top and letting the budget follow.
+          //
+          // MEASURED before this was written: with the republish AFTER the zoom
+          // write, the stale branch's wrapper.clientWidth read becomes a forced
+          // synchronous relayout of the whole zoomed document inside the click
+          // handler - 14.7ms against 0.7ms on a 9-table/90-section document,
+          // and it grows with the document. The cheap path is unaffected, which
+          // is why S10 measures the two legs against each other.
+          what: "republish the breakout budget AFTER the zoom is written instead of before it",
+          file: RENDERER,
+          from: "  republishBreakoutBudgetForZoom(zoomLevel / 100);\n",
+          to: "",
+          also: {
+            file: RENDERER,
+            from: "  scheduleTableBreakout();",
+            to: "  republishBreakoutBudgetForZoom(zoomLevel / 100);\n  scheduleTableBreakout();",
+          },
+          suite: "test:tables",
+          expect: [
+            /^a zoom step on the stale-budget path does not force a layout into the click handler$/,
+          ],
+          mustPass: [
+            // The stale branch must STILL be the one taken - otherwise the
+            // failure above would be about the experiment collapsing rather
+            // than about the ordering.
+            /^the S10 stale leg really took the measuring branch, and the clean leg really did not$/,
+            // And the budget must remain CORRECT under the reorder: moving the
+            // read after the zoom write makes computed style agree with the
+            // passed factor, so this stays green and the two reverts stay
+            // independent of one another.
+            /^the zoom path's re-measured budget is scaled by the zoom being applied, not the one being left$/,
+          ],
+        },
+        {
+          id: "R444",
+          // The other half, and the one with a timing-free oracle. Dropping the
+          // explicit factor is the natural "simplification" - the parameter
+          // looks redundant next to a function that already reads the zoom off
+          // computed style - and it is only wrong BECAUSE of R443's ordering.
+          // Together the two pin a single decision that cannot be split.
+          what: "let the zoom path's budget re-measure read the zoom factor back off computed style",
+          file: RENDERER,
+          from: "    publishBreakoutBudget(zoomFactor);",
+          to: "    publishBreakoutBudget();",
+          suite: "test:tables",
+          expect: [
+            /^the zoom path's re-measured budget is scaled by the zoom being applied, not the one being left$/,
+            // WIDENED WITH ITS REASON. S5 exercises the same stale branch from
+            // the other end - it manufactures the staleness with a real
+            // ResizeObserver rather than by raising the flag - so a budget
+            // divided by the factor the reader is LEAVING is wrong there for
+            // exactly the same reason, and its downstream container movement
+            // follows. Two independent fixtures reaching the same defect is
+            // what makes this a proof about the product rather than about one
+            // cell's arrangement.
+            /^a zoom step inside the coalescing window publishes a budget measured against the CURRENT reading area$/,
+            /^the table container does not move between the anchor frame and the coalesced pass$/,
+          ],
+          mustPass: [
+            /^the S10 stale leg really took the measuring branch, and the clean leg really did not$/,
+            // Reading computed style is a layout read, but it happens BEFORE
+            // the zoom write here, so it is still free: this revert must not
+            // borrow R443's failure.
+            /^a zoom step on the stale-budget path does not force a layout into the click handler$/,
+          ],
+        },
+      ];
 
 const argv = process.argv.slice(2);
 // A refactor cannot break a revert's ASSERTIONS without also running its suite,
@@ -8737,6 +9987,9 @@ function anchorRe(s) {
 }
 
 let bad = 0;
+// Counted separately from `bad` and from the proven total, so a withdrawn
+// proof can never be mistaken for a passing one in the summary line.
+let skipped = 0;
 // A revert harness that leaves the tree dirty is worse than none at all: the
 // next run would measure a file it had itself corrupted. Snapshot every file
 // any chosen revert can touch, and compare at the end. (The previous version of
@@ -8809,6 +10062,19 @@ for (const r of chosen) {
     console.log(`${r.id}  anchor OK  (${path.relative(ROOT, r.file)})`);
     continue;
   }
+  // A WITHDRAWN PROOF, NOT A DISABLED ONE. `skip` is for a revert that has been
+  // MEASURED not to bite and whose reason is a property of the product rather
+  // than of the fixture - see R419. It deliberately runs everything above this
+  // line, so the anchors are still resolved and still proven unique on every
+  // sweep: a withdrawn record that quietly stopped matching its own source
+  // would be worse than no record, and that is exactly how the entry rotted
+  // into being wrong in the first place. It simply does not run the suite, and
+  // it is not counted as proven.
+  if (r.skip) {
+    console.log(`${r.id}  SKIPPED       ${r.skip}  (${r.what})`);
+    skipped += 1;
+    continue;
+  }
   for (const [file, text] of working) fs.writeFileSync(file, text);
   let out;
   try {
@@ -8879,7 +10145,7 @@ console.log(
       ? `\nALL ${chosen.length} ANCHORS RESOLVE - nothing is proven; run without --anchors for that`
       : `\n${bad} revert(s) can no longer find what they perturb`
     : bad === 0
-      ? "\nALL REVERTS PROVEN"
+      ? `\nALL REVERTS PROVEN${skipped ? ` (${skipped} withdrawn, see SKIPPED above)` : ""}`
       : `\n${bad} revert(s) did not prove their fix`,
 );
 process.exit(bad === 0 && dirty === 0 ? 0 : 1);

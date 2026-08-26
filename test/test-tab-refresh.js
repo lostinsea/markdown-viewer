@@ -1141,11 +1141,65 @@ async function run(win) {
       // and blocks the run.
       const active = window.CustomTabs.getActiveTab && window.CustomTabs.getActiveTab();
       window.originalMarkdown = active ? active.originalContent : '';
-      window.CustomTabs.getTabs().slice().forEach(t => window.CustomTabs.closeTab(t.id));
-      window.dismissFileUpdateNotification();
+      // ALL BUT THE LAST. The final close is done separately below so the
+      // viewer-mutation counter can be read around IT specifically: closing a
+      // non-last tab activates its neighbour and re-renders, which bumps the
+      // counter too, so a delta taken across the whole loop would be satisfied
+      // by any of those and would measure the disjunction rather than the
+      // welcome-screen replacement it is named for.
+      window.CustomTabs.getTabs().slice(0, -1).forEach(t => window.CustomTabs.closeTab(t.id));
       return window.CustomTabs.getTabs().length;
     })()
   `);
+  // Let any render kicked off by those closes land, so it cannot be counted
+  // against the final close.
+  await sleep(600);
+  const lastClose = JSON.parse(
+    await exec(`
+      (() => {
+        const gen = () => window.viewerMutationGeneration();
+        const tabs = window.CustomTabs.getTabs();
+        if (tabs.length !== 1) return JSON.stringify({ single: false, n: tabs.length });
+        const before = gen();
+        const hadWelcome = !!document.querySelector('#viewer .welcome');
+        window.CustomTabs.closeTab(tabs[0].id);
+        const after = gen();
+        return JSON.stringify({
+          single: true,
+          delta: after - before,
+          hadWelcomeBefore: hadWelcome,
+          welcomeShown: !!document.querySelector('#viewer .welcome'),
+          remaining: window.CustomTabs.getTabs().length,
+        });
+      })()
+    `),
+  );
+  console.log("note: last tab close " + JSON.stringify(lastClose));
+  await exec(`(window.dismissFileUpdateNotification(), true)`);
+  // Soundness: the delta means nothing unless the close really did replace the
+  // viewer with the welcome screen, and unless the welcome screen was not
+  // already there before.
+  check(
+    "closing the last tab really replaced the document with the welcome screen",
+    lastClose.single === true &&
+      lastClose.hadWelcomeBefore === false &&
+      lastClose.welcomeShown === true &&
+      lastClose.remaining === 0,
+    JSON.stringify(lastClose),
+  );
+  // The viewer subtree is replaced wholesale here without any render, so a zoom
+  // anchor captured against the document being closed would otherwise still
+  // look valid and be applied to the welcome screen.
+  // EXACTLY ONE, NOT "AT LEAST ONE". `>= 1` reports that SOMETHING bumped the
+  // counter across the close, not that THIS site did - the disjunction defect.
+  // The measured delta is exactly 1, and pinning it means a second, unrelated
+  // bump appearing in this window can no longer keep the assertion green after
+  // the welcome-screen bump itself has been reverted away.
+  check(
+    "replacing the closed document with the welcome screen is reported as a viewer mutation",
+    lastClose.delta === 1,
+    JSON.stringify(lastClose),
+  );
   await sleep(400);
   // Write to the file the watcher was last armed on (the last tab closed),
   // otherwise no change event fires at all and the check proves nothing.

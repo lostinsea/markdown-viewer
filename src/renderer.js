@@ -910,6 +910,79 @@ function getViewerScroller() {
   return contentWrapper || viewer;
 }
 
+// Returns `scroller`'s own scale factor: the ratio between the VIEWPORT pixels
+// getBoundingClientRect() reports and the pre-zoom pixels scrollTop,
+// clientHeight and scrollHeight are all expressed in.
+//
+// In normal view the scroller is .content-wrapper, which sits OUTSIDE the zoom
+// updateZoom() puts on #viewer, so the two spaces coincide and this is 1. In
+// split view the scroller IS #viewer and carries the zoom, so at 200% a rect
+// delta is twice the scrollTop it would be added to - measured directly, not
+// inferred: moving scrollTop by 300 moved the rect delta by 600.
+//
+// Derived from the scroller itself rather than read off
+// getComputedStyle(...).zoom, so it needs no assumption about which metric
+// reports in which space and keeps working if the scale ever arrives by some
+// other route. custom-tabs.js delegates to this so the two cannot drift apart.
+//
+// offsetHeight, NOT `clientHeight + borders`. Both are border-box and both are
+// in the element's own pre-zoom px, so they agree today - MEASURED, offsetH ===
+// clientH === 1007 with borders 0 - but they part company the moment a
+// HORIZONTAL scrollbar appears: rect.height and offsetHeight both include it,
+// clientHeight does not. That is reachable: styles.css makes split-view #viewer
+// `overflow-y: auto`, which computes overflow-x to auto, so a wide table or an
+// unbreakable URL puts a ~15px scrollbar on a ~1000px pane and inflates the
+// divisor by 1.5%. It also drops a getComputedStyle() from the rAF path.
+function scrollerScale(scroller) {
+  if (!scroller) return 1;
+  const local = scroller.offsetHeight;
+  if (!local) return 1;
+  const raw = scroller.getBoundingClientRect().height / local;
+  if (!(raw > 0)) return 1;
+  return snapScrollerScale(raw, local);
+}
+
+// THE DIVISOR IS INTEGER-ROUNDED AND THE NUMERATOR IS NOT, so the raw ratio is
+// never exactly right - MEASURED at 1.000331 in normal view, where the true
+// scale is exactly 1 because the scroller sits outside the zoomed subtree
+// (rect.height 1007.333 against offsetHeight 1007). That is a MULTIPLICATIVE
+// error on a correction whose magnitude is scrollTop * (ratio - 1), i.e.
+// thousands of px, and it was the ENTIRE normal-view residual section 12d was
+// absorbing: the 50%-in and 50%-out cells reported the same 4.3e-4 ratio with
+// the sign flipped, which no reflow or quantisation effect can produce. It is
+// inherited by custom-tabs.js offsetWithin() through the delegation above, so
+// it was also costing the reading position ~4e-4 of its own depth on refresh.
+//
+// The scale is quantised in BOTH arrangements - exactly 1 in normal view, and
+// zoomLevel/100 in 10% steps in split view - so it is always a multiple of
+// 1/20. But snapping unconditionally would be a guess: it would silently
+// mangle any future scale that is genuinely not on that grid. Snap only when
+// the quantised value lies inside the measurement's OWN uncertainty, which is
+// derivable rather than chosen: local = round(L), so
+// |raw - true| ~= raw * 0.5 / L ~= raw * 0.5 / local.
+// MEASURED, all four cases snap exactly with 1.5-3x of margin to spare:
+//   normal any%  raw 1.000331  err 3.31e-4  noise 4.97e-4  -> 1.00
+//   split  130%  raw 1.299785  err 2.15e-4  noise 8.39e-4  -> 1.30
+//   split  200%  raw 1.998677  err 1.32e-3  noise 1.98e-3  -> 2.00
+//   split  400%  raw 3.997355  err 2.65e-3  noise 7.93e-3  -> 4.00
+// Extracted as its own function so a unit oracle can exist without a fixture
+// that reaches the layout (the R202/R416 precedent): renderer.js is a classic
+// script, so a top-level declaration is reachable as window.snapScrollerScale.
+function snapScrollerScale(raw, local) {
+  const snapped = Math.round(raw * 20) / 20;
+  const noise = (0.5 / local) * raw;
+  // THE DEGENERATE CASE, closed because it is unguarded rather than because it
+  // is reachable. `noise` is the propagated bound of an integer-rounded
+  // divisor, so it grows as the divisor shrinks: at local <= 20 it reaches
+  // 0.025, half the 1/20 grid, and the snap becomes UNCONDITIONAL - it would
+  // move the ratio by up to a full grid step on evidence that cannot support
+  // it. A scroller that short is not a reading pane (the real one measures
+  // ~1000px), so returning the raw ratio there costs nothing and removes a
+  // threshold nothing has forced the suite to justify.
+  if (!(local > 20)) return raw;
+  return Math.abs(snapped - raw) <= noise ? snapped : raw;
+}
+
 // Scroll a rendered element into view.
 //
 // Every caller of this used to compute the destination by hand as
@@ -1196,12 +1269,457 @@ document.addEventListener('keydown', (e) => {
   }
 });
 
+// ============================================
+// ZOOM READING-POSITION ANCHOR
+// ============================================
+//
+// MEASURED DEFECT. CSS `zoom` on #viewer scales the document but leaves the
+// scroller's scrollTop alone, so the whole page slides under a fixed viewport
+// by exactly
+//     drift = scrollTop * (newDocHeight / oldDocHeight - 1)
+// Confirmed against that pre-registered formula at three depths in both
+// directions (errors of 9-17px on predictions of 6,558-24,736px), with
+// `scrollTop UNCHANGED` at every one of them. It is DEPTH-PROPORTIONAL, which
+// is exactly why it survived for years: on THIRD-PARTY-NOTICES.md, three
+// zoom-in steps move the reader 17px at the top of the document, 6,567px (6.4
+// screens) at 25% depth, 13,426px (13.0 screens) at 50% and 24,745px (24.0
+// screens) at 90%. Zoom out mirrors it, and additionally CLAMPS scrollTop when
+// the document shrinks below the current offset. So a reader who presses
+// Ctrl+= mid-document is thrown a dozen screens from what they were reading.
+//
+// The fix holds ONE document point stationary: the point at the CENTRE of the
+// pane, which is the reader's stated preference and the likeliest thing they
+// are looking at. That point is remembered as an ELEMENT plus a fraction of
+// that element's height - never as a pixel offset - so no model is needed of
+// how much of the scroll space actually scales (it is not all of it: the
+// document-height model fitted from the drift data has ~353px of non-scaling
+// wrapper chrome, so a naive `scrollTop *= ratio` is wrong by that offset).
+// The engine re-lays the element out and we simply ask where it went.
+//
+// PERFORMANCE. This is constrained by commit 4bbde83, which removed forced
+// layouts from updateZoom() after measuring a held-key burst at 1797ms of
+// blocking JS (per step 279-313ms -> 0ms). Three properties keep that:
+//   1. the capture reads layout BEFORE any style write in the frame, so the
+//      layout is still clean and the read costs nothing;
+//   2. it is guarded on `pendingZoomAnchor`, so a burst - which Chromium
+//      coalesces into a single task - reads ONCE, not once per click, and the
+//      point held stationary is the one from before the burst began;
+//   3. the correction is applied in a single requestAnimationFrame, where the
+//      forced layout falls in a frame that was going to lay out anyway.
+let pendingZoomAnchor = null;
+let zoomAnchorFrame = 0;
+// Bumped wherever #viewer's element tree is STRUCTURALLY REBUILT, as opposed to
+// where a render is merely requested (that is renderGeneration). A pending zoom
+// anchor points at a specific element in a specific layout, so it is this
+// counter changing - not a render starting - that makes it stale. See the guard
+// chain in applyZoomAnchor() for why one counter was not enough.
+//
+// Deliberately NOT bumped for cosmetic in-place changes (syntax highlighting
+// inside an existing <code>, a class toggle): those keep the anchored element
+// and its box, and standing the anchor down for them would disable the feature
+// during exactly the auto-refresh this fork exists to serve.
+let viewerMutationGen = 0;
+function noteViewerMutation() {
+  viewerMutationGen++;
+}
+// Read-only accessor. viewerMutationGen is a `let`, so unlike the top-level
+// functions in this classic script it is not reachable from tests otherwise.
+function viewerMutationGeneration() {
+  return viewerMutationGen;
+}
+
+// Walk down from `el` to the finest block that still spans the aimed-at line,
+// stopping as soon as the candidate is no taller than the pane.
+//
+// WHY THIS IS NEEDED, MEASURED. elementFromPoint returns the deepest element
+// under the point - but only when there IS one. A point landing in the gap
+// between two blocks resolves to their CONTAINER, and on THIRD-PARTY-NOTICES.md
+// that container can be a collapsible section 91,429px tall. Anchoring to a
+// fraction of a box 88 screens high is fragile, because such a box need not
+// scale proportionally: in split view the reading measure narrows as zoom grows
+// (offsetWidth 932 -> 704 across a 1.3x step) and that section re-wrapped from
+// 3,845 to 3,864 line boxes, so its height moved 1.3055x against the 1.3000x
+// the text itself did. A block that fits on screen either does not re-wrap at
+// all or re-wraps by a bounded amount.
+//
+// THE FIRST MEASUREMENT OF THIS SAID THE WALK MADE THINGS WORSE, AND THAT
+// MEASUREMENT WAS WRONG. Scored by an oracle that tracked a fraction of the
+// anchored container's height, the walk read -89px against -58px without it.
+// But in this one cell the oracle's own subject is the re-wrapping 91k section,
+// so the oracle slides against the words on the screen and cannot tell "the fix
+// drifted" from "the oracle drifted". Re-scored by tracking the TOP EDGE of the
+// leaf element nearest the pane centre - no fraction, no height model - the same
+// two cells read -6px with the walk and +33px without it, i.e. the order
+// INVERTED. Every other cell measured is byte-identical either way, because the
+// walk only fires when the centre lands in a gap: it ran in exactly 1 of the 8
+// cells swept. See test-table-display.js section 12d.
+//
+// The nearest-following-child rule is the same one the top-level scan used, so
+// this subsumes it: starting the walk at #viewer reproduces the old fallback
+// exactly, and there is only one rule to reason about.
+// Find the first child whose bottom reaches the aim line.
+//
+// THIS SCAN IS DELIBERATELY LINEAR. It was replaced by a binary search, the
+// replacement was measured to be WRONG, and it was reverted. Do not "optimise"
+// it back - the sub-linear version is pinned as a permanent trap by R430 and by
+// section 12d's out-of-flow equivalence cell. What follows is the whole record.
+//
+// THE COST IS REAL AND IS ACCEPTED. Measured on the real app at a genuine
+// fallback position, one captureZoomAnchor() costs 3.4ms / 1795 rect reads at
+// 2k top-level blocks and 15.5ms / 8996 reads at 10k. Those figures, and the
+// fallback frequencies below, are DATED DIAGNOSTIC MEASUREMENTS from the probe
+// that decided this - they are not asserted anywhere and no test will fail if
+// they drift. What IS asserted is the correctness the decision rests on. Treat
+// the numbers as the evidence for a judgement already made, and re-measure
+// rather than cite them if the question is reopened. It is accepted because
+// the severity is far below the correctness risk of removing it:
+//   - the happy path is FREE. elementFromPoint lands on a leaf, so the walk
+//     returns on `!kids.length` before reading a single child rect - 2 reads,
+//     ~0.15ms, at every document size.
+//   - in the documents measured, the scan was reached when the aim fell in an
+//     inter-block gap or over an overlay: 14/41 scroll positions in plain prose,
+//     38/601 in a mixed fixture. That is an observation about those fixtures,
+//     not a closed enumeration - refinement runs whenever the aim lands on a
+//     tall element that has children, and other layouts can reach it too.
+//   - captureZoomAnchor() opens with `if (pendingZoomAnchor) return`, so a
+//     held-key burst pays the cost ONCE, not once per step.
+//   - and that single 15.5ms sits against the ~190ms relayout Chromium must do
+//     anyway to paint a 10k-block document at a new scale.
+//
+// WHY BINARY SEARCH IS WRONG. It needs the children's bottoms to be
+// non-decreasing in document order. That holds for normal block flow - measured
+// 0 inversions across a flat document, an alternating collapse and a contiguous
+// leading run of collapses - but refineZoomAnchor walks ARBITRARY descendant
+// lists 16 levels deep, and the order is inverted TWO ways, one of which needs
+// no author CSS at all:
+//
+//   1. FOLIA'S OWN WRAPPERS ALREADY INVERT IT. Every block wrapper appends an
+//      absolutely-positioned button AFTER the tall content it decorates:
+//      .code-block-container is [pre, copyBtn] (appendChild pair below, with
+//      .code-copy-btn { position:absolute; top:8px } in styles.css), and
+//      .table-container, .img-zoom-container and .mermaid-container are all the
+//      same shape. This is MEASURED, not read off the source: section 12d
+//      renders a real fenced code block through renderMarkdown(), waits for the
+//      requestIdle() pass that adds the buttons, and reads the container the
+//      product built - child bottoms [1588, 40], two children, last one
+//      .code-copy-btn, computed position absolute, and NO inline style
+//      anywhere. Strictly inverted, from a plain fenced code block, with no
+//      styling by the author. And refineZoomAnchor descends into exactly those
+//      containers, because it descends precisely when a block is taller than
+//      the pane. This does not bite a binary search TODAY only because those
+//      lists have exactly two children: with two, the first probe is always
+//      index 0, so the search either returns index 0 or advances to index 1 -
+//      it skips nothing, and so cannot miss an earlier child that reaches. A
+//      third child - a language label, a line-number gutter, a wrap toggle -
+//      makes it live, and section 12d measures that too by appending one
+//      controlled child to the product's own container. Do not treat the
+//      two-child shape as a safety margin.
+//
+//   2. AUTHOR CSS REACHES IT TOO. SANITIZE_CONFIG keeps the `style` attribute
+//      (see ADD_ATTR above); filterCssDeclarations removes only CSS
+//      resource-loading constructs (@import, url(), image-set()) and leaves
+//      every layout declaration intact, so a float, a position:absolute box or
+//      a negative margin arrives from ordinary markdown and inverts the order
+//      as well.
+//
+// MEASURED on the real app over 1800 comparisons (the author-CSS route, which
+// is the one a fixture can build without depending on wrapper markup):
+//
+//   fixture              disagreements   binary breaks spec   linear breaks spec
+//   flat prose (control)       0/225                   0                     0
+//   tall float               153/225                 153                     0
+//   position:absolute        177/225                 177                     0
+//   negative margin           27/225                  27                     0
+//   nested, depth 2           69/225                  69                     0
+//
+// 426/1800 wrong, and in the nested case binary returns null where a child does
+// reach the aim - so the walk falls through to kids[kids.length - 1] and anchors
+// on a completely unrelated block.
+//
+// AND THERE IS NO CHEAPER CORRECT VERSION WITHOUT MAINTAINING EXTRA LAYOUT
+// STATE, which is why this is a revert rather than a repair. Verifying a binary
+// result's postcondition costs O(index) - the exact cost being removed, and
+// expensive in precisely the cases where it matters. Detecting out-of-flow
+// children needs getComputedStyle per child, i.e. worse than the scan. Any
+// sub-linear search needs the monotone invariant, and the invariant does not
+// hold. The claim is scoped to this STATELESS signature: a maintained spatial
+// index over the children could answer in sub-linear time, but it would have to
+// be built and invalidated on every render, patch, collapse, image load and
+// font swap, which is far more machinery - and far more ways to be silently
+// stale - than the 15.5ms it would save on a document nobody has yet reported.
+//
+// IT WAS ALSO NOT UNCONDITIONALLY FASTER, which removes the temptation to retry
+// it "more carefully". The rejected version walked forward off a degenerate
+// probe, so its worst case was ~2N rect reads, not O(log N); and on the shape
+// "answer at index 0 followed by a long degenerate run" it cost ~N where this
+// scan costs 1.
+//
+// (The degeneracy handling the binary version needed is not needed here either,
+// and that is not an accident: a `display: none` collapsed section reports an
+// all-zero rect, so bottom 0 never reaches a POSITIVE aim and the scan skips it
+// for free. The aim is always positive here because it is a viewport coordinate
+// of a visible scroller's centre - see captureZoomAnchor. Near-miss worth
+// recording: that version tested `width !== 0 || height !== 0`, i.e. BOTH must
+// be zero, and that was right - testing `height === 0` alone would have skipped
+// an empty <p>, which has full column width, zero height, a real bottom, and is
+// perfectly monotone.)
+//
+// TWO THINGS HERE ARE DELIBERATELY NOT PINNED BY A REVERT. The `>= aimY`
+// boundary differs from `> aimY` only when a bottom exactly equals the aim,
+// which is measure-zero against fractional rects, so such a revert would come
+// back VACUOUS. And the accepted cost above is not timed - timed assertions are
+// how this suite goes flaky - but the two STRUCTURAL claims it rests on are
+// pinned: section 12d asserts that every gap position fires this walk AND that
+// at least four non-gap positions do not, so an overlay change that made every
+// capture fall back would fail rather than silently turn 15.5ms into a per-zoom
+// cost.
+function firstChildReaching(kids, aimY) {
+  for (let i = 0; i < kids.length; i++) {
+    if (kids[i].getBoundingClientRect().bottom >= aimY) return kids[i];
+  }
+  return null;
+}
+
+function refineZoomAnchor(el, aimY, paneHeight) {
+  for (let depth = 0; depth < 16; depth++) {
+    const kids = el.children;
+    if (!kids.length) return el;
+    if (el.getBoundingClientRect().height <= paneHeight) return el;
+    const next = firstChildReaching(kids, aimY);
+    el = next || kids[kids.length - 1];
+  }
+  return el;
+}
+
+// The aimed-at line can fall in the GAP between two blocks, in which case the
+// nearest following block starts BELOW it and the raw fraction is negative -
+// MEASURED at -0.119 on a 53px <h2>. `top + frac*height` would then name a
+// point OUTSIDE the element, so the element's height change is EXTRAPOLATED
+// rather than tracked and the error grows with the zoom step instead of staying
+// put. Clamping holds that block's nearest EDGE still: a real rendered position
+// a few px from where the reader was looking, tracked exactly.
+//
+// ITS EFFECT IS BOUNDED BY CONSTRUCTION, WHICH IS WHY IT IS PINNED HERE AND NOT
+// BY A DRIFT TOLERANCE. The induced error is |excess| * height * (ratio - 1),
+// and after refineZoomAnchor the anchored block is no taller than the pane and
+// the aimed line is at most one margin outside it - a handful of px, far under
+// section 12d's 24px tolerance. A revert of the clamp measured through that
+// tolerance therefore comes back VACUOUS however the fixture is shaped, so the
+// property is restated at the unit level instead. Extracted as its own function
+// purely so that unit oracle can exist: renderer.js is a classic script, so a
+// top-level declaration is reachable as window.clampZoomFraction.
+function clampZoomFraction(raw) {
+  if (!(raw > 0)) return 0; // also catches NaN
+  return raw > 1 ? 1 : raw;
+}
+
+function captureZoomAnchor() {
+  if (pendingZoomAnchor) return; // a burst reads once
+  if (!viewer) return;
+  const scroller = getViewerScroller();
+  if (!scroller) return;
+  const sRect = scroller.getBoundingClientRect();
+  if (!sRect.height) return;
+  const aimY = sRect.top + sRect.height / 2;
+  const aimX = sRect.left + sRect.width / 2;
+
+  // elementFromPoint gives the DEEPEST element under the centre, which makes
+  // the anchor as fine-grained as a single highlighted token. Anything outside
+  // #viewer (the search panel, the ToC drawer, a dialog) is not part of the
+  // document and must not be anchored to; falling back to #viewer lets the
+  // refinement walk find the block nearest the centre instead.
+  let el = document.elementFromPoint(aimX, aimY);
+  if (el === viewer || (el && !viewer.contains(el))) el = null;
+  el = refineZoomAnchor(el || viewer, aimY, sRect.height);
+  if (!el || el === viewer) return;
+
+  const r = el.getBoundingClientRect();
+  const raw = r.height > 0 ? (aimY - r.top) / r.height : 0;
+  pendingZoomAnchor = {
+    scroller,
+    el,
+    frac: clampZoomFraction(raw),
+    // Everything below is for deciding, one frame later, whether this anchor is
+    // still the newest statement about where the reader wants to be. See
+    // zoomAnchorSuperseded().
+    top: scroller.scrollTop,
+    at: performance.now(),
+    // Which document this fraction was measured against. See applyZoomAnchor.
+    gen: renderGeneration,
+    // ...and which STATE of that document. renderGeneration alone is not
+    // enough; see the guard in applyZoomAnchor for why.
+    mut: viewerMutationGen,
+  };
+  // SET AND SCHEDULE ARE ONE STEP ON PURPOSE. `pendingZoomAnchor` doubles as
+  // the burst guard - the early return at the top of this function reads it -
+  // and only applyZoomAnchor() clears it. If anything between the capture and
+  // the schedule threw, the guard would stay latched with no frame booked to
+  // release it, and the feature would be silently dead for the rest of the
+  // session with no error the reader could act on. Keeping the two adjacent
+  // means there is no code that can throw in the gap. It also stops the four
+  // early returns above booking a frame for an anchor that was never taken.
+  scheduleZoomAnchorRestore();
+}
+
+// The correction is applied a frame after it is captured, and in that gap
+// ANOTHER agent can scroll the same scroller - a ToC or All-Notes click
+// (scrollElementIntoView), a search hit, a tab switch restoring its position,
+// or the reader's own wheel. That agent's destination is the NEWER intent and
+// must win; re-imposing a fraction captured before it is exactly the "document
+// jumps back" defect this whole block exists to remove, in a new disguise.
+//
+// THIS IS NOT HYPOTHETICAL - it was measured breaking five live assertions in
+// test/test-render-patch.js section 3c, whose sequence is zoom -> reset
+// scrollTop -> click an All-Notes entry. The click landed the scroller at 1924
+// and the pending correction dragged it back to 177.
+//
+// The test has to tell "another agent moved it" apart from "the ENGINE clamped
+// it because the document got shorter", which is a legitimate consequence of
+// zooming out and must NOT stand the correction down. MEASURED across eight
+// bottom-of-document and mid-document steps in both view modes, the step alone
+// never moves scrollTop except by clamping to the new maximum, and the observed
+// disagreement with min(top, maxNow) never exceeded 1.0px - the residue of
+// scrollHeight and clientHeight both being integer-rounded while the true
+// maximum is not. Hence a 2px slack, which is far below any scroll a reader or
+// a scrollIntoView performs.
+const ZOOM_ANCHOR_SCROLL_SLACK = 2;
+// A rAF in a background window is throttled and can be parked indefinitely
+// (backgroundThrottling defaults true), which would otherwise leave the burst
+// guard latched and apply a minutes-old anchor on the frame the window returns.
+// One frame is ~16ms, so this is ~30 frames of headroom and cannot flake.
+const ZOOM_ANCHOR_MAX_AGE_MS = 500;
+
+function zoomAnchorSuperseded(anchor) {
+  const { scroller } = anchor;
+  const maxNow = Math.max(0, scroller.scrollHeight - scroller.clientHeight);
+  const now = scroller.scrollTop;
+  // Growing is impossible for the zoom alone; shrinking is possible, but only
+  // as far as the new maximum.
+  return (
+    now > anchor.top + ZOOM_ANCHOR_SCROLL_SLACK ||
+    now < Math.min(anchor.top, maxNow) - ZOOM_ANCHOR_SCROLL_SLACK
+  );
+}
+
+function applyZoomAnchor() {
+  const anchor = pendingZoomAnchor;
+  pendingZoomAnchor = null;
+  if (!anchor) return;
+  const { scroller, el } = anchor;
+  if (!el.isConnected || !scroller.isConnected) return;
+  // isConnected is not enough on its own, and neither is containment.
+  // patchViewerDOM()'s LCS diff REUSES matched nodes, so after a tab switch or
+  // an incremental re-render the captured element can still be connected AND
+  // still inside #viewer while now carrying a different document's text at a
+  // different place - the fraction would be re-imposed against layout it was
+  // never measured in. The containment and scroller checks stay for the cases a
+  // re-render does not cover: a node moved out of #viewer, and a view-mode
+  // switch changing which element is the scroller.
+  //
+  // TWO COUNTERS, NOT ONE, and the second exists because the first is NOT the
+  // exact test an earlier version of this comment claimed it was.
+  // renderGeneration is bumped on renderMarkdown()'s FIRST line, but
+  // renderMarkdownFull() is async and opens with an await. So a render already
+  // IN FLIGHT when the anchor is captured has ALREADY bumped it: anchor.gen
+  // equals it, and that render LANDING in the frame between capture and the
+  // restore is invisible to this compare. Both reviewers reached that
+  // independently, and it is directly reachable - the reader zooms while a
+  // file-watch refresh is mid-flight, which is this fork's primary feature.
+  //
+  // viewerMutationGen answers the question actually being asked - "has the
+  // content under this anchor been rebuilt since I measured it?" - because it
+  // is bumped where the DOM is MUTATED rather than where a render is
+  // REQUESTED: patchViewerDOM's entry, the error-path replacement, and the
+  // post-render passes that wrap blocks in new containers. That last group
+  // matters and is easy to miss: addCodeBlockCopyButtons() runs in a
+  // requestIdle() callback AFTER renderMarkdownFull resolves and REPARENTS
+  // every <pre> into a new .code-block-container, so an anchor on a <pre>
+  // captured a moment earlier is pointing at a node that is about to move.
+  // renderGeneration is kept as well, but as DEFENCE IN DEPTH and not as a
+  // load-bearing guard - a distinction established by measurement, not by
+  // reading. An earlier version of this comment said it was "already
+  // revert-proven"; it is not. R419, which deletes this line, was run and came
+  // back VACUOUS, because every render path that mutates the viewer also bumps
+  // viewerMutationGen - including makeHeadersCollapsible(), which was the one
+  // gap and was closed alongside this correction - so the compare below
+  // catches the case on its own. A render that bumps renderGeneration WITHOUT
+  // touching the viewer leaves the anchor measuring layout that is still
+  // valid, so standing it down there is the conservative direction rather than
+  // a correction. R419 is retained in withdrawn form so the proof is already
+  // written if that ever stops being true.
+  if (renderGeneration !== anchor.gen) return;
+  if (viewerMutationGen !== anchor.mut) return;
+  if (!viewer || !viewer.contains(el)) return;
+  if (getViewerScroller() !== scroller) return;
+  if (performance.now() - anchor.at > ZOOM_ANCHOR_MAX_AGE_MS) return;
+  if (zoomAnchorSuperseded(anchor)) return;
+  const sRect = scroller.getBoundingClientRect();
+  if (!sRect.height) return;
+  const r = el.getBoundingClientRect();
+  // A boxless anchor (a collapsible section closed in the same frame, or a
+  // display:contents element) reports an all-zero rect, which would compute a
+  // correction of about minus half a pane and jump the reader hard in a
+  // direction nothing asked for. isConnected does not imply having a box.
+  if (!r.height && !r.top && !r.bottom) return;
+  // Where the anchored point sits now, against where it has to be. Both terms
+  // are viewport pixels, so the difference is converted into the scroller's own
+  // space before it is added to scrollTop - the conversion split view needs and
+  // normal view resolves to a no-op.
+  const correction =
+    (r.top + anchor.frac * r.height - (sRect.top + sRect.height / 2)) /
+    scrollerScale(scroller);
+  if (!(Math.abs(correction) >= 0.5)) return;
+  scroller.scrollTop += correction;
+}
+
+function scheduleZoomAnchorRestore() {
+  if (zoomAnchorFrame) return;
+  zoomAnchorFrame = requestAnimationFrame(() => {
+    zoomAnchorFrame = 0;
+    applyZoomAnchor();
+  });
+}
+
 // Update zoom display
 function updateZoom() {
+  // Read the reading position FIRST - before any style write in this frame, so
+  // the layout is clean and the read is free. See the block comment above.
+  captureZoomAnchor();
   // Clamp defensively: four separate call sites increment/decrement by step
   // before calling in, so a max that is not a whole number of steps from the
   // default would otherwise overshoot the bound.
   zoomLevel = Math.min(ZOOM_CONFIG.max, Math.max(ZOOM_CONFIG.min, zoomLevel));
+  // BEFORE the zoom write, and that ordering is MEASURED, not stylistic.
+  //
+  // The cheap path (the common one) touches no layout either way. The stale
+  // path calls publishBreakoutBudget(), which reads wrapper.clientWidth. Run
+  // AFTER `viewer.style.zoom` is written, that read is a forced synchronous
+  // relayout of the whole zoomed document, inside the click handler: MEASURED
+  // on a 9-table/90-section document at 14.7ms against 0.7ms for the cheap
+  // path, a 21x cost, and it grows with the document. Run BEFORE the write,
+  // the layout is still clean - captureZoomAnchor() has just read it and
+  // nothing has invalidated it since - so the same read is free.
+  //
+  // It is SOUND to read it early because `available` is measured entirely
+  // outside the zoom-scaled subtree (#viewer sits inside .content-wrapper), so
+  // the pending zoom write cannot change it. Only the divisor changes, and
+  // that is why the factor is passed in explicitly rather than read back.
+  //
+  // Both reviewers flagged the forced layout; one proposed simply moving the
+  // zoom write later, which would have published `available / oldZoom` -
+  // publishBreakoutBudget used to derive the factor from computed style. The
+  // explicit factor is what makes the reorder safe, and retiring that hidden
+  // dependency also retires the duplicated zoom write this function used to
+  // carry (the first write existed only so the read-back saw the new value).
+  //
+  // MEASURED and NOT a consequence of this ordering: the forced layout does
+  // NOT move scrollTop before the anchor's restore frame. A reviewer predicted
+  // Chromium's scroll anchoring would fire during it and trip the 2px slack,
+  // silently discarding the correction. Measured with a positive control that
+  // the stale branch really ran (it lowers the flag as a side effect): the
+  // shift was 0.00px on both paths and the reader moved identically. The
+  // reorder is a performance fix, not a correctness one.
+  republishBreakoutBudgetForZoom(zoomLevel / 100);
   viewer.style.zoom = `${zoomLevel / 100}`;
   zoomResetBtn.textContent = `${zoomLevel}%`;
   // Zooming changes how much of the window a table can occupy, and does not
@@ -1219,16 +1737,17 @@ function updateZoom() {
   //     the stylesheet clamps every stored breakout width against it (R70), so
   //     a width measured at 100% cannot paint off the window at 400%. It must
   //     therefore happen on EVERY step, synchronously - and it does, without
-  //     reading layout back, because the only term that changed is the zoom
-  //     factor and that is already known here. Reading `--mv-breakout-budget`
-  //     back off the DOM after writing `zoom` was itself forcing the 190ms
-  //     relayout INTO the handler, six times over during a held-key burst.
+  //     reading layout back on the cheap path, because the only term that
+  //     changed is the zoom factor and that is already known here. Reading
+  //     `--mv-breakout-budget` back off the DOM after writing `zoom` was itself
+  //     forcing the 190ms relayout INTO the handler, six times over during a
+  //     held-key burst.
   //  3. Remeasuring every table. ~40ms on that document, ~1.6ms per table, and
   //     only the last step's result is ever seen. Coalesced.
-  republishBreakoutBudgetForZoom(zoomLevel / 100);
-  viewer.style.zoom = `${zoomLevel / 100}`;
-  zoomResetBtn.textContent = `${zoomLevel}%`;
   scheduleTableBreakout();
+  // NOTE: the anchor's restore frame is booked by captureZoomAnchor() itself,
+  // at the top of this function - see the comment there for why the two cannot
+  // be separated.
 }
 
 // ============================================
@@ -3585,6 +4104,20 @@ function _collapseKey(headerId) {
 }
 
 function makeHeadersCollapsible() {
+  // This is a post-render pass that REPARENTS live nodes - flatten unwraps
+  // every section, then every block below a heading is appended into a fresh
+  // wrapper - so a pending zoom anchor measured before it runs is pointing at a
+  // node whose parentage and geometry are about to change. Same class as
+  // addCodeBlockCopyButtons(), and missed when that one was fixed.
+  //
+  // The interleaving is REACHABLE, and by this fork's headline feature: a
+  // file-watch refresh is async, so renderGeneration was bumped before the
+  // reader zoomed (anchor.gen matches) and patchViewerDOM's bump also predates
+  // the capture (anchor.mut matches) - then this pass runs in the render's
+  // synchronous tail, after the capture and before the restore frame.
+  // Bumping FIRST, like patchViewerDOM does, so a throw below still leaves the
+  // anchor stood down rather than re-imposed against a half-wrapped document.
+  noteViewerMutation();
   // Idempotent: re-wrapping an already-wrapped viewer would nest each section
   // inside a fresh wrapper on every call. patchViewerDOM() normally flattens
   // first, but not every render path goes through it.
@@ -4052,6 +4585,12 @@ function _mermaidNode(el) {
 // Patch viewer's top-level children in-place — only replace nodes that actually changed.
 // Unchanged nodes (same hash) are left untouched, preserving scroll position and event listeners.
 function patchViewerDOM(newHtml) {
+  // BEFORE flattenCollapsibleSections, not after, and not on exit. That call
+  // mutates the live tree immediately, so an exception anywhere below would
+  // leave #viewer half-rebuilt; an exit-only bump would then let a pending zoom
+  // anchor be re-imposed against a partially mutated document. Bumping first
+  // makes the invalidation unconditional.
+  noteViewerMutation();
   flattenCollapsibleSections();
 
   const temp = document.createElement('div');
@@ -4526,6 +5065,9 @@ async function renderMarkdownFull(content, generation) {
           // Wrap in container
           const container = document.createElement('div');
           container.className = 'mermaid-container';
+          // Reparents a live node; see addCodeBlockCopyButtons for why the zoom
+          // anchor has to be told.
+          noteViewerMutation();
           el.parentNode.insertBefore(container, el);
           container.appendChild(el);
 
@@ -4623,6 +5165,10 @@ async function renderMarkdownFull(content, generation) {
     }
   } catch (error) {
     console.error('Error rendering markdown:', error);
+    // Replaces the whole tree without going through patchViewerDOM, so it needs
+    // its own invalidation. A pending zoom anchor would usually be rejected
+    // here anyway (its element is detached), but "usually" is not a guard.
+    noteViewerMutation();
     viewer.innerHTML = `<div style="color: red; padding: 20px;">
       <strong>Error rendering markdown:</strong><br>${error.message}
     </div>`;
@@ -4897,6 +5443,9 @@ function addTableMaximizeButtons() {
 
   // Batch insert all containers and buttons
   updates.forEach(({ table, container, maxBtn }) => {
+    // Reparents a live node; see addCodeBlockCopyButtons for why the zoom
+    // anchor has to be told.
+    noteViewerMutation();
     table.parentNode.insertBefore(container, table);
     container.appendChild(table);
     container.appendChild(maxBtn);
@@ -4940,12 +5489,35 @@ function scheduleTableBreakout() {
 // without reading layout back - see republishBreakoutBudgetForZoom.
 let lastBreakoutAvailable = null;
 
+// The cache's validity bit. Set wherever the reading area's width can have
+// moved without anything re-measuring it, cleared in publishBreakoutBudget()
+// - the one place the cache is written - so the two can never disagree.
+//
+// It exists because the recompute those paths schedule is DEBOUNCED by 120ms
+// (TABLE_BREAKOUT_COALESCE_MS), and a zoom step landing inside that window used
+// to publish a budget measured against the PREVIOUS window size. MEASURED:
+// resize .content-wrapper 1972 -> 1272 and zoom one step 35ms later, and the
+// budget published at the anchor frame was still 1924 - 700px too wide - so the
+// deferred pass then corrected the table 1232.45 -> 1224 and moved document
+// height 6928 -> 7027. That 99px landed AFTER the zoom anchor had already
+// restored the reading position, so the reader was left 99px from where they
+// were, with nothing to notice it: a widening pass mutates no DOM structure, so
+// noteViewerMutation() is not called and the anchor cannot stand itself down.
+//
+// A boolean is used rather than re-measuring eagerly in the resize paths on
+// purpose: a resize can fire every frame during a drag, and publishing eagerly
+// there would force a full-document relayout per frame - the exact cost item 4
+// removed from the zoom path (190-235ms per step on a 150-table document).
+// Setting a flag costs nothing, and the measurement is deferred to the one
+// caller whose correctness depends on it, at most once per stale episode.
+let breakoutBudgetStale = false;
+
 // The cheap half of applyTableBreakout(), split out so the zoom path can keep
 // the safety net synchronous while deferring the measurement. ONE implementation
 // on purpose: a second copy of this arithmetic that drifted from the one the
 // measurement pass uses would clamp tables against a budget no measurement ever
 // agreed with.
-function publishBreakoutBudget() {
+function publishBreakoutBudget(zoomFactorOverride) {
   const wrapper = document.querySelector('.content-wrapper');
   const editorPane = document.getElementById('editorPanel');
   // In split view #viewer is `width: 50%; max-width: none` and is its own
@@ -4969,9 +5541,19 @@ function publishBreakoutBudget() {
   // instead of the width it asked for, and the surplus went to the one column
   // able to absorb it, stretching an explanation column to 120 characters.
   // That is precisely what the reading measure exists to prevent.
-  const zoomFactor = parseFloat(getComputedStyle(viewer).zoom) || 1;
+  // The zoom path passes the factor it is ABOUT to write, because it calls in
+  // BEFORE writing it - see updateZoom(). Reading it back off computed style
+  // there would return the OLD factor and publish a budget scaled to the zoom
+  // the reader just left. Every other caller omits it and reads the live value,
+  // which is correct for them: they run when the zoom is already settled.
+  const zoomFactor =
+    zoomFactorOverride || parseFloat(getComputedStyle(viewer).zoom) || 1;
   const available = wrapper ? wrapper.clientWidth - paneWidth - TABLE_BREAKOUT_GUTTER * 2 : 0;
   lastBreakoutAvailable = available;
+  // Cleared HERE, beside the write, so "the cache is current" and "the flag is
+  // down" are the same event. Every path that can refresh the cache does so by
+  // calling this function, so there is no second place to keep in step.
+  breakoutBudgetStale = false;
 
   // Published as an inherited custom property BEFORE applyTableBreakout's
   // visibility bail-out, because the case it exists for is exactly the one that
@@ -4999,10 +5581,12 @@ function publishBreakoutBudget() {
 // six-step burst, all of it blocking.
 //
 // The cached width is refreshed by every full pass, including the coalesced one
-// scheduled by this same zoom step, so the widest window in which it can be
-// stale is the coalescing delay - and it can only be stale at all if the window
-// or the editor pane moved without a recompute in between, which is itself what
-// the resize debounce and the ResizeObserver exist to prevent.
+// scheduled by this same zoom step. It can go stale only in the window between
+// the reading area changing width and that recompute landing - see the note on
+// breakoutBudgetStale, which MEASURES that window rather than arguing it away.
+// An earlier version of this comment claimed the resize debounce and the
+// ResizeObserver prevented staleness; they are what CREATE it, by deferring the
+// recompute 120ms.
 function republishBreakoutBudgetForZoom(zoomFactor) {
   // A classList read is not a layout read, so this stays free and stays current.
   const wrapper = document.querySelector('.content-wrapper');
@@ -5010,10 +5594,13 @@ function republishBreakoutBudgetForZoom(zoomFactor) {
     viewer.style.removeProperty('--mv-breakout-budget');
     return;
   }
-  // Nothing has measured yet (no table has ever been laid out): fall back to
-  // the measuring version rather than publishing a budget derived from nothing.
-  if (lastBreakoutAvailable === null) {
-    publishBreakoutBudget();
+  // Nothing has measured yet (no table has ever been laid out), or the reading
+  // area has moved since the last measurement: fall back to the measuring
+  // version rather than publishing a budget derived from nothing, or one
+  // derived from a width the reader can no longer see. Both are rare, and
+  // publishBreakoutBudget() lowers the flag, so a burst pays for this once.
+  if (lastBreakoutAvailable === null || breakoutBudgetStale) {
+    publishBreakoutBudget(zoomFactor);
     return;
   }
   viewer.style.setProperty(
@@ -5141,6 +5728,10 @@ function applyTableBreakout() {
 // leaving split view does not, so that path calls applyTableBreakout directly.
 let tableBreakoutResizeTimer = null;
 window.addEventListener('resize', () => {
+  // The reading area may have just changed width, and the recompute below is
+  // 120ms away. Mark the cached budget suspect so a zoom step arriving inside
+  // that window measures instead of trusting it.
+  breakoutBudgetStale = true;
   clearTimeout(tableBreakoutResizeTimer);
   tableBreakoutResizeTimer = setTimeout(applyTableBreakout, 120);
 });
@@ -5165,6 +5756,11 @@ if (typeof ResizeObserver === 'function') {
       const width = entries[0] && entries[0].contentRect.width;
       if (width == null || width === lastObservedWidth) return;
       lastObservedWidth = width;
+      // Same reason as the `resize` listener: the recompute is 120ms away, so
+      // the cached budget no longer describes the width just observed. The
+      // guard above is what keeps this honest - a callback that observed no
+      // change has not invalidated anything.
+      breakoutBudgetStale = true;
       clearTimeout(tableBreakoutResizeTimer);
       tableBreakoutResizeTimer = setTimeout(applyTableBreakout, 120);
     }).observe(scrollerHost);
@@ -5197,6 +5793,9 @@ function initImageZoom() {
       });
     });
 
+    // Reparents a live node; see addCodeBlockCopyButtons for why the zoom
+    // anchor has to be told.
+    noteViewerMutation();
     img.parentNode.insertBefore(container, img);
     container.appendChild(img);
     container.appendChild(btn);
@@ -5262,6 +5861,15 @@ function addCodeBlockCopyButtons() {
     });
 
     // Wrap pre in container and add button
+    //
+    // THIS REPARENTS AN EXISTING NODE, which is why the zoom anchor has to know
+    // about it. This pass runs in a requestIdle() callback AFTER
+    // renderMarkdownFull has already resolved, so a <pre> anchored a moment
+    // earlier moves under a brand-new container without renderGeneration
+    // changing at all. Bumped per wrap rather than per pass: the early return
+    // above means most calls wrap nothing, and invalidating an anchor for a
+    // pass that changed nothing would disable the feature needlessly.
+    noteViewerMutation();
     pre.parentNode.insertBefore(container, pre);
     container.appendChild(pre);
     container.appendChild(copyBtn);
@@ -7821,6 +8429,9 @@ function deleteMermaidFromSource(svgTexts, mermaidEl) {
   // Remove from DOM directly (no full re-render)
   const container = mermaidEl?.closest('.mermaid-container') || mermaidEl?.parentElement;
   if (container && container.parentElement) {
+    // Removes a live node from the viewer subtree; a pending zoom anchor's
+    // recorded element and offsets are no longer describable.
+    noteViewerMutation();
     container.parentElement.removeChild(container);
   }
 
@@ -7903,6 +8514,9 @@ function deleteTableFromSource(tableEl, headers, cellTexts = []) {
     ? tableEl.parentElement
     : tableEl;
   if (tableContainerToRemove.parentElement) {
+    // Removes a live node from the viewer subtree; a pending zoom anchor's
+    // recorded element and offsets are no longer describable.
+    noteViewerMutation();
     tableContainerToRemove.parentElement.removeChild(tableContainerToRemove);
   }
 
@@ -7991,8 +8605,14 @@ async function renderMermaidInDOM(code, mode, replaceTarget) {
   container.appendChild(maxBtn);
 
   if (mode === 'replace') {
+    // Reparents a live node; see addCodeBlockCopyButtons for why the zoom
+    // anchor has to be told.
+    noteViewerMutation();
     replaceTarget.parentElement.replaceChild(container, replaceTarget);
   } else {
+    // Adds a mermaid container to #viewer, shifting everything below it. The
+    // replace branch above was told; this one is just as structural.
+    noteViewerMutation();
     const anchor = getDomInsertAnchor();
     if (anchor && anchor.parentElement === viewer) {
       viewer.insertBefore(container, anchor.nextSibling);
@@ -8074,8 +8694,16 @@ function renderTableInDOM(mdTable, mode, replaceTarget) {
     const replaceEl = replaceTarget.parentElement?.classList.contains('table-container')
       ? replaceTarget.parentElement
       : replaceTarget;
-    if (replaceEl.parentElement) replaceEl.parentElement.replaceChild(container, replaceEl);
+    if (replaceEl.parentElement) {
+      // Reparents a live node; see addCodeBlockCopyButtons for why the zoom
+      // anchor has to be told.
+      noteViewerMutation();
+      replaceEl.parentElement.replaceChild(container, replaceEl);
+    }
   } else {
+    // Adds a table container to #viewer, shifting everything below it. The
+    // replace branch above was told; this one is just as structural.
+    noteViewerMutation();
     const anchor = getDomInsertAnchor();
     if (anchor && anchor.parentElement === viewer) {
       viewer.insertBefore(container, anchor.nextSibling);
