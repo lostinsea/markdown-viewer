@@ -10103,6 +10103,22 @@ for (const r of chosen) {
     console.log(
       `${r.id}  COLLATERAL    the expected assertion failed, but so did its own setup, so it proves nothing. broke=${collateral}`,
     );
+    // A COLLATERAL verdict used to print the mustPass REGEX and nothing else,
+    // so the one thing a diagnosis needs - the evidence the broken setup
+    // assertion carried - was thrown away. That cost a full re-run to recover
+    // for R414, and a load-dependent COLLATERAL cannot be reproduced on demand
+    // at all. Print every failure, evidence included, marked with which list
+    // (if any) named it. Same reasoning as the `~` unlisted-failure report in
+    // the PROVEN branch below: the verdict is the summary, not the record.
+    for (const f of fails) {
+      const n = assertionNameOf(f);
+      const mark = (r.mustPass || []).some((re) => re.test(n))
+        ? "!"
+        : (r.expect || []).some((re) => re.test(n))
+          ? " "
+          : "~";
+      console.log(`      ${mark} ${f}`);
+    }
     bad += 1;
   } else {
     console.log(`${r.id}  PROVEN        ${fails.length} assertion(s) failed  <- ${r.what}`);
