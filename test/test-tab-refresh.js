@@ -6,7 +6,6 @@
 // Uses only the Electron already required to run the app - no test framework.
 const { app, BrowserWindow } = require("electron");
 const fs = require("fs");
-const os = require("os");
 const path = require("path");
 const {
   inspectVisual,
@@ -14,6 +13,8 @@ const {
   startErrorSentinel,
   proveSentinelAlive,
   trapExternalOpens,
+  tempDir,
+  releaseTempDir,
 } = require("./test-visual-utils");
 
 // Isolate this suite's userData profile before main.js exists and before the
@@ -22,7 +23,7 @@ require("./test-userdata-isolation");
 
 require("../src/main.js");
 
-const dir = fs.mkdtempSync(path.join(os.tmpdir(), "mdv-e2e-"));
+const dir = tempDir("mdv-e2e-");
 const fileA = path.join(dir, "alpha.md");
 const fileB = path.join(dir, "beta.md");
 const fileM = path.join(dir, "diagram.mmd");
@@ -2858,7 +2859,7 @@ app.whenReady().then(async () => {
   }
   console.log(`\n=== ${results.length - failed}/${results.length} passed ===`);
   try {
-    fs.rmSync(dir, { recursive: true, force: true });
+    releaseTempDir(dir);
   } catch (e) {
     /* ignore */
   }

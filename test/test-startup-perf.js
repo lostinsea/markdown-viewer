@@ -22,12 +22,19 @@
 // together rather than leaving a load check standing over a deleted package.
 // Section 2 loads it explicitly and checks the shape the call sites depend on.
 
-// This suite is the ONLY one that requires ../src/main.js, which means it is the
-// only one where main.js's ipcMain "confirm-large-render" handler is live and a
-// real window is created. Running it against the developer's real profile let a
-// restored session containing a large document open a main-process modal that no
-// test can dismiss. Isolation must therefore be established before main.js is
-// required, and before the app becomes ready.
+// Isolation must be established before ../src/main.js is required and before the
+// app becomes ready: main.js registers the ipcMain "confirm-large-render"
+// handler and creates a real window, so running against the developer's real
+// profile let a restored session containing a large document open a
+// main-process modal that no test can dismiss.
+//
+// RETRACTED: this comment used to say "this suite is the ONLY one that requires
+// ../src/main.js". That is false and was false when written - MEASURED, nine
+// suites require it (mermaid, popups, security, patch, search, startup, tabs,
+// tables, theme), which is exactly why one poisoned shared profile blocked the
+// whole chain rather than one suite. `.github/copilot-instructions.md` already
+// carries the correction; the claim is retracted here too because it is the
+// stated rationale for the isolation assertions below.
 const isolation = require("./test-userdata-isolation");
 
 const { app } = require("electron");
@@ -75,14 +82,13 @@ app.whenReady().then(async () => {
   await new Promise((r) => setTimeout(r, 3000));
 
   // --- 0. This suite must not be touching the developer's profile ----------
-  // This is the only suite that requires ../src/main.js, so it is the only one
-  // where main.js's ipcMain "confirm-large-render" handler is registered and a
-  // real window is created. Run against the real profile, a restored session
-  // holding an expensive document reaches dialog.showMessageBoxSync(), which is
-  // modal IN THE MAIN PROCESS: the watchdog above cannot fire, because the
-  // process that would run its timer is the process that is blocked. Measured
-  // A/B: seeded profile hung indefinitely with zero assertions; empty profile
-  // finished 7/7 in 8s.
+  // main.js registers ipcMain "confirm-large-render" and creates a real window,
+  // so run against the real profile, a restored session holding an expensive
+  // document reaches dialog.showMessageBoxSync(), which is modal IN THE MAIN
+  // PROCESS: the watchdog above cannot fire, because the process that would run
+  // its timer is the process that is blocked. Measured A/B: seeded profile hung
+  // indefinitely with zero assertions; empty profile finished 7/7 in 8s. Nine
+  // suites require main.js, so that is nine suites, not one.
   //
   // These assertions exist so that losing isolation fails FAST and BY NAME
   // instead of hanging, which is the only failure mode a harness can act on.
@@ -106,6 +112,24 @@ app.whenReady().then(async () => {
     "the suite booted from a profile with no inherited session",
     isolation.POST_WIPE_ENTRIES === 0,
     `entries=${isolation.POST_WIPE_ENTRIES}`,
+  );
+  // The CAUSE, asserted beside the consequence above. main.js redirects a
+  // non-packaged run to a "<name>-dev" profile so a development launch does not
+  // fight the installed app over one userData directory - and userData is what
+  // requestSingleInstanceLock() is keyed on, so sharing it means the dev launch
+  // hands its file to the installed app and exits.
+  //
+  // That redirect has to decline when something has ALREADY relocated the
+  // profile, which is the case in every one of the nine suites that require
+  // main.js. Without the guard all nine would land in one shared "Electron-dev"
+  // directory - re-creating the exact cross-suite poisoning test-userdata-
+  // isolation.js exists to prevent, and doing it silently: the assertions above
+  // report only that the profile is not the one isolation chose, never why.
+  const devSibling = path.join(app.getPath("appData"), app.getName() + "-dev");
+  check(
+    "main.js's dev-profile redirect declined an already-relocated userData directory",
+    path.resolve(activeUserData) !== path.resolve(devSibling),
+    `userData=${activeUserData} devSibling=${devSibling}`,
   );
 
   // --- 1. The heavy module is not loaded by startup ------------------------

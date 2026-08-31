@@ -153,8 +153,12 @@ function escapeHtml(value) {
     .replace(/'/g, '&#39;');
 }
 
-// Single source of truth for what the sanitizer permits, so the two render
-// paths cannot drift apart again.
+// Single source of truth for what the sanitizer permits in the DOCUMENT
+// pipeline, so the two render paths cannot drift apart again. It is not the
+// only config in the file: the table paths use TABLE_SANITIZE_CONFIG below,
+// which derives the security-critical settings from this one by reference
+// rather than restating them. Claiming to be the single source of truth while
+// five call sites quietly used a bare DOMPurify.sanitize() was SEC-29.
 const SANITIZE_CONFIG = {
   ADD_TAGS: ['iframe', 'style'],
   ADD_ATTR: [
@@ -179,8 +183,38 @@ const SANITIZE_CONFIG = {
   // a navigation the DOM never expressed (window.open, meta refresh, an @@@html
   // frame relocating itself), which is why main.js also denies navigation on
   // the main window. Neither layer is sufficient alone. (SEC-11)
-  FORBID_TAGS: ['form'],
-  FORBID_ATTR: ['action', 'formaction']
+  //
+  // `download` is stripped for a related but distinct reason. (SEC-30)
+  // It is present in DOMPurify 3.4.12's default ALLOWED_ATTR (measured: 118
+  // entries, `download` and `href` in, `target` and `ping` out), and an
+  // <a download href="https://..."> is not a navigation - so main.js's
+  // will-navigate deny never sees it and CSP has no directive for it. Inside
+  // #viewer the attribute is already inert, because every arm of the click
+  // delegation calls preventDefault() and routes the link to shell.openExternal
+  // or to the local-file policy instead. That invariant only became true with
+  // N11: the local-file arm used to test `!hrefAttr.startsWith('http')`, so an
+  // href like `httpd.md` matched no arm at all and fell through to Chromium's
+  // native follow. Both arms now share one case-insensitive ABSOLUTE_WEB_URL
+  // test over complementary inputs, blank hrefs return early, and SVG anchors
+  // (whose `href` is an object that used to throw before any preventDefault)
+  // are normalised - so every href a sanitized anchor IN #viewer can carry is
+  // handled here rather than by the browser. Note the scope: this says nothing
+  // about anchors outside #viewer, which is exactly why the attribute is
+  // stripped at the sanitizer as well.
+  // The reachable surface is #tableInsertPreview, which sits OUTSIDE
+  // #viewer and has no delegation: a download anchor rendered there was
+  // measured issuing a live outbound request from the Node-privileged renderer.
+  // Stripping it here is the layer that prevents the request - main.js's
+  // will-download guard only fires once the response has begun, so it stops the
+  // file drop, not the beacon. The table preview is covered automatically
+  // because TABLE_SANITIZE_CONFIG aliases this array by reference.
+  //
+  // Frozen because TABLE_SANITIZE_CONFIG aliases both arrays by reference, and
+  // because DOMPurify's addToSet lowercases entries back INTO the caller's
+  // array unless it is frozen. Both are no-ops today (already lowercase, and
+  // nothing pushes to them) - the freeze is what keeps them that way.
+  FORBID_TAGS: Object.freeze(['form']),
+  FORBID_ATTR: Object.freeze(['action', 'formaction', 'download'])
 };
 
 // DOMPurify's default URI allowlist rejects Windows drive paths and file://
@@ -538,9 +572,12 @@ function installSanitizerHooks() {
   // Keep local image paths the default allowlist would drop, and drop remote
   // ones it would keep. Note that DOMPurify hooks are global: these apply to
   // every DOMPurify.sanitize() call in the renderer, not only to
-  // sanitizeHtml(). That is intended - the other call sites (table/markdown
-  // previews) render the user's own input and want the same image handling -
-  // but it is why the hooks are kept this narrow.
+  // sanitizeHtml(). That is intended - the other call sites (the table
+  // renderer and the table dialog preview, both via sanitizeTableHtml below)
+  // want the same image handling - and it is why the hooks are kept this
+  // narrow. NOT because that input is trusted: the dialog's 'edit' path is fed
+  // from the open document, so it is attacker-controlled too. Believing
+  // otherwise is what let SEC-29 survive; see the note on sanitizeTableHtml.
   DOMPurify.addHook('uponSanitizeAttribute', (node, data) => {
     if (node.tagName !== 'IMG' || data.attrName !== 'src') return;
     const src = String(data.attrValue || '').trim();
@@ -557,6 +594,50 @@ installSanitizerHooks();
 
 function sanitizeHtml(html) {
   return DOMPurify.sanitize(html, SANITIZE_CONFIG);
+}
+
+// The table dialogs and the context-menu table renderer parse and sanitize
+// markdown of their own, and used to do it with a bare DOMPurify.sanitize() -
+// which silently opted out of SANITIZE_CONFIG, and therefore out of the SEC-11
+// <form> control. The global hooks still applied (they are registered on the
+// DOMPurify instance, not per call), so the image handling was right and only
+// the config was missing, which is exactly why it went unnoticed. (SEC-29)
+//
+// Reachability, measured: renderTableInDOM extracts only the <table> element
+// from its scratch div, so a <form> that is a SIBLING of the table is dropped
+// by the extraction - but one nested inside a table CELL travels with the
+// table and is appended into the Node-privileged viewer. The dialog preview is
+// a live element in that window too, and its 'edit' path is fed from the open
+// document, so its input is attacker-controlled as well.
+//
+// Deliberately NOT sanitizeHtml(). That config serves the document pipeline
+// and adds <iframe> plus srcdoc/sandbox/target; a table preview needs none of
+// them, and the global afterSanitizeAttributes hook force-sandboxes every
+// iframe with allow-scripts, so reusing it would newly hand attacker-controlled
+// markdown a script-running frame in the previews. (<style>, class, id and
+// style are already in DOMPurify's own default allowlists, so they are NOT
+// part of that config's delta - measured against the vendored build's tag and
+// attribute sets rather than inferred from reading ADD_TAGS/ADD_ATTR.)
+//
+// Only the security-critical settings are shared, and they are taken from
+// SANITIZE_CONFIG by reference so that adding a tag there can never leave this
+// path behind again. Everything else stays on DOMPurify's defaults, which is
+// what these sites already had.
+//
+// The behavioural delta is therefore exactly two things: <form> is unwrapped,
+// and `action` is dropped from EVERY element. DOMPurify's attribute allowlist
+// is global rather than per-tag and `action` is in its defaults, so this does
+// narrow slightly beyond <form>. Kept rather than trimmed back: `action` on a
+// non-form element is inert HTML, and keeping the two deny-lists identical is
+// the whole mechanism behind the forward-defence above. `formaction` is absent
+// from DOMPurify's defaults entirely, so that entry is forward-defence only.
+const TABLE_SANITIZE_CONFIG = {
+  FORBID_TAGS: SANITIZE_CONFIG.FORBID_TAGS,
+  FORBID_ATTR: SANITIZE_CONFIG.FORBID_ATTR
+};
+
+function sanitizeTableHtml(html) {
+  return DOMPurify.sanitize(html, TABLE_SANITIZE_CONFIG);
 }
 
 // The @@@html fence, in ONE place because the light-format and full render
@@ -806,6 +887,9 @@ const UI_STRINGS = {
   'update.download': 'Download',
   'search.counter': '${current} of ${total}',
   'search.zero': '0 of 0',
+  'table.invalidFormat': '\u26A0 Invalid table format. Check the markdown table syntax (columns separated by | are required).',
+  'render.failed': 'Error rendering markdown:',
+  'render.unknownError': 'Unknown rendering error',
 };
 
 function i18n(key, params) {
@@ -2051,14 +2135,16 @@ let mermaidWorkQueue = Promise.resolve();
 let mermaidRunSeq = 0;
 let mermaidNodeIdSeq = 0;
 
-// Build the "this diagram failed" banner from DOM nodes rather than an HTML
-// string. The message is NOT trusted input: mermaid quotes the diagram source
-// back in some of its errors ("No diagram type detected ... for text: <src>"),
-// and that source comes straight out of the document being viewed. An innerHTML
-// assignment here would therefore be a document-controlled HTML sink inside the
-// Node-privileged renderer - the same sink class as SEC-13/14, which were fixed
-// the same way. Styles are applied through the CSSOM, so the rendering is
-// byte-for-byte what the old inline style attribute produced.
+// Normalise a caught value into text a reader can act on.
+//
+// The result is NOT trusted input, and every caller must place it as a TEXT
+// NODE. mermaid quotes the diagram source back in some of its errors ("No
+// diagram type detected ... for text: <src>") and marked/DOMPurify quote
+// document content in theirs, so the message is document-controlled wherever
+// it comes from. An innerHTML assignment carrying it would be a sink inside
+// the Node-privileged renderer - the same class as SEC-13/14, fixed the same
+// way.
+//
 // Accepts the exception itself, not err.message: mermaid rejects with plain
 // strings and bare objects in places, and reading .message off those yields
 // undefined, which used to render the literal text "undefined" and now would
@@ -2067,7 +2153,11 @@ let mermaidNodeIdSeq = 0;
 // The empty cases are deliberate: `new Error('')` stringifies to the useless
 // word "Error" and `{ message: '' }` to "[object Object]", both non-empty and
 // both worse than saying nothing useful was reported.
-function mermaidErrorText(err, fallback) {
+//
+// Named generically rather than for mermaid because the markdown render
+// failure banner (N12) shares it: two copies of this normalisation is exactly
+// the shape that has silently diverged elsewhere in this file.
+function errorText(err, fallback) {
   const generic = fallback || 'Unknown diagram error';
   const nonEmpty = (v) => typeof v === 'string' && v.trim() !== '';
   if (err && nonEmpty(err.message)) return err.message;
@@ -2079,18 +2169,25 @@ function mermaidErrorText(err, fallback) {
   return generic;
 }
 
+// Styled from a class, never from box.style.*. The five CSSOM assignments this
+// replaces were a fixed red on a fixed light pink - the same defect as N10 and
+// N12, on the third of the three error surfaces. It is the worst of them to
+// hardcode: this banner replaces the contents of a <pre class="mermaid">, whose
+// own background is --surface-raised, so on the three dark themes a light pink
+// slab measured 11.6-13.8 against the panel it was pasted onto.
+//
+// See the .mermaid-error rule in styles.css for the measured contrast table and
+// for why there is no fill. role="alert" for parity with the other two banners:
+// all three replace live content after the reader has moved on.
 function buildMermaidErrorBanner(err) {
   const box = document.createElement('div');
-  box.style.color = 'red';
-  box.style.padding = '20px';
-  box.style.background = '#ffe6e6';
-  box.style.border = '1px solid #ff0000';
-  box.style.borderRadius = '4px';
+  box.className = 'mermaid-error';
+  box.setAttribute('role', 'alert');
   const label = document.createElement('strong');
   label.textContent = 'Mermaid Rendering Error:';
   box.appendChild(label);
   box.appendChild(document.createElement('br'));
-  box.appendChild(document.createTextNode(mermaidErrorText(err)));
+  box.appendChild(document.createTextNode(errorText(err)));
   return box;
 }
 
@@ -2101,7 +2198,7 @@ function buildMermaidErrorBanner(err) {
 function buildMermaidPreviewError(err, fallback) {
   const span = document.createElement('span');
   span.className = 'mermaid-preview-error';
-  span.textContent = '\u26a0 ' + mermaidErrorText(err, fallback);
+  span.textContent = '\u26a0 ' + errorText(err, fallback);
   return span;
 }
 
@@ -2472,6 +2569,66 @@ function resolveLinkTarget(targetPath) {
 // - so this has to be checked *before* fs is touched, not after.
 const isNetworkPath = (p) => /^(\\\\|\/\/)/.test(p);
 
+// The single spelling of "this is an absolute web URL", shared by the two arms
+// of the viewer click delegation that partition on it. It is ONE constant on
+// purpose: the arms test complementary halves of the same predicate over two
+// different inputs (the resolved url, then the raw href attribute), and two
+// separate literals are free to drift apart - which is exactly the defect N11
+// fixed, where one arm said `startsWith('http')` and the other `startsWith
+// ('http://') || startsWith('https://')`, leaving `httpd.md` claimed by
+// neither. Case-insensitive because Chromium only lowercases a scheme it can
+// PARSE: `HTTPS://api.example.invalid:PORT/v1` fails to parse, so `.href`
+// hands back the attribute verbatim, uppercase and all (measured). No `g`
+// flag, so `.test()` carries no lastIndex state and one compiled object is
+// reused for every click. (N11)
+const ABSOLUTE_WEB_URL = /^https?:\/\//i;
+
+// Whitespace that the URL parser strips, i.e. C0 controls and space. Used to
+// decide whether an href is "empty".
+//
+// AN EARLIER VERSION OF THIS COMMENT WAS WRONG AND IS CORRECTED HERE RATHER
+// THAN QUIETLY REWRITTEN - twice, and the second correction overturned the
+// mechanism the first one asserted.
+//
+// The first claim was that `href="\u00A0"` resolves to a distinct URL
+// (`.../%C2%A0`) so `trim()` would swallow a live link. True of a hand-built
+// DOM node, which is where it was measured, and false of anything that reaches
+// this handler.
+//
+// The second claim was that "DOMPurify normalises the whole ATTR_WHITESPACE
+// class out of a URL attribute". Also false, and it named the wrong constant.
+// Read out of the vendored dompurify rather than assumed: ATTR_WHITESPACE
+// (purify.js:332) does NOT contain \uFEFF, and it is used only to normalise the
+// value for the IS_ALLOWED_URI *test* (purify.js:1805) - it never rewrites what
+// is stored. THE ACTUAL FILTER IS NATIVE String.trim():
+// `let value = name === 'value' ? initValue : stringTrim(initValue)`
+// (purify.js:1917), followed by the validity chain's final
+// `else if (value) { return false; }` (purify.js:1805-1806), which keeps an
+// attribute whose trimmed value is empty and drops one that is not.
+//
+// So the carriers split into TWO outcomes, not one, and that is what makes the
+// equivalence total:
+//   \u00A0, \u2003, \uFEFF - inside JS's trim set, so they arrive here as the
+//     EMPTY STRING and both predicates trivially agree.
+//   \u0001-\u0008, \u000E-\u001F - the direction where URL_BLANK is the broader
+//     predicate. These survive trim(), fail IS_ALLOWED_URI, and DOMPurify
+//     REMOVES THE ATTRIBUTE. `link.href` is then "" and the outer guard on this
+//     handler declines the anchor before either predicate is evaluated.
+// Three carriers measured (`&#160;`, `&#65279;`, `&#1;`), covering both
+// directions. Note the irony: the predicate the withdrawn R468 proposed
+// swapping IN is the one the sanitizer itself already applies.
+//
+// So URL_BLANK and `trim()` cannot disagree on anything this handler can
+// observe, in either direction. The predicate is kept as-is because it is the
+// CORRECT one - it is exactly the class the URL parser strips, and it costs a
+// compiled regex - not because a measured difference defends it. What defends
+// it is that the equivalence rests on a DEPENDENCY's behaviour: pinned by
+// "N11 the sanitizer neutralises every whitespace-only href..." in
+// test-render-security.js, so a dompurify bump that changes either half - the
+// trim, or the keep-if-empty - fails loudly instead of silently making the
+// distinction live again. (N11)
+const URL_BLANK = /^[\u0000-\u0020]*$/;
+
 // Handle links in rendered markdown
 viewer.addEventListener('click', (e) => {
   // Find the closest anchor tag (in case click was on child element).
@@ -2484,10 +2641,49 @@ viewer.addEventListener('click', (e) => {
   // here it obeys exactly the same rules as every other link. (SEC-11)
   const link = e.target.closest('a, area');
   if (link && link.href) {
-    const url = link.href;
+    // An <a> inside inline SVG is an SVGAElement, not an HTMLAnchorElement, and
+    // its `href` is an SVGAnimatedString OBJECT rather than a string. Measured
+    // against this app's own vendored DOMPurify and its real SANITIZE_CONFIG:
+    // `<svg><a href="http://...">` survives sanitization byte-identically,
+    // `closest('a, area')` matches it, and the object is always truthy - so it
+    // reached this handler, and `link.href.startsWith(...)` then threw
+    // "svgA.href.startsWith is not a function", aborting before any
+    // preventDefault and handing the click straight to Chromium's native
+    // follow. Normalising to the baseVal string routes an SVG anchor through
+    // exactly the same three arms as an HTML one. (N11)
+    const url = typeof link.href === 'string' ? link.href : String(link.href.baseVal ?? '');
 
-    // Get the href attribute directly to handle relative paths and anchors
-    const hrefAttr = link.getAttribute('href');
+    // Get the href attribute directly to handle relative paths and anchors.
+    //
+    // SVG spells the same link two ways. Measured: for the legacy
+    // `xlink:href` form, `getAttribute('href')` is null while `href.baseVal`
+    // IS populated - so without this fallback the attribute-driven arms below
+    // saw an empty href and the link became a silent no-op. Both spellings now
+    // route identically. (N11)
+    const hrefAttr = link.getAttribute('href') ?? link.getAttribute('xlink:href');
+
+    // An empty href is a link to nowhere - markdown's `[text]()`, which authors
+    // use as a placeholder. DOMPurify keeps it (measured: the attribute
+    // survives sanitization and `link.href` resolves to index.html itself), and
+    // every arm below requires a non-empty hrefAttr, so before N11 this fell
+    // through to Chromium's native follow. That is a navigation of the TOP
+    // FRAME to index.html: had main.js's will-navigate deny not been there, one
+    // click on a placeholder link would have reloaded the app and destroyed
+    // every open tab. Doing nothing is the correct behaviour; doing nothing
+    // *deliberately* is what stops it depending on a deny in another process.
+    //
+    // The `!hrefAttr` half is NOT dead code, and it is not reachable the way it
+    // looks. A plain <a> with no href attribute cannot get here at all: its
+    // `.href` is the empty string (measured), so the outer guard above rejects
+    // it. What makes this branch reachable is an SVG anchor carrying only
+    // `xlink:href` under some future edit that drops the fallback above - and a
+    // sanitized SVG anchor with neither spelling, whose `.href` object is
+    // truthy while both getAttribute() calls return null. Do not delete it as
+    // unreachable noise. (N11)
+    if (!hrefAttr || URL_BLANK.test(hrefAttr)) {
+      e.preventDefault();
+      return;
+    }
 
     // Check if it's an internal anchor link (starts with #)
     if (hrefAttr && hrefAttr.startsWith('#')) {
@@ -2542,15 +2738,69 @@ viewer.addEventListener('click', (e) => {
       return;
     }
 
-    // Check if it's an external web link (http or https)
-    if (url.startsWith('http://') || url.startsWith('https://')) {
+    // Check if it's an external web link (http or https).
+    //
+    // Matched CASE-INSENSITIVELY, which is not cosmetic. Chromium lowercases a
+    // scheme only when it can PARSE the URL; when parsing fails, the `.href`
+    // getter hands back the attribute verbatim. So `HTTPS://api.example.com:
+    // PORT/v1` arrives here still uppercase (measured), and under the old
+    // `startsWith('http://')` test it matched neither this arm nor the local
+    // -file arm below - the same non-totality N11 fixed one spelling over.
+    if (ABSOLUTE_WEB_URL.test(url)) {
       e.preventDefault();
-      shell.openExternal(url);
+      // openExternal returns a promise that REJECTS when the OS has no handler
+      // for the URL. Unhandled, that surfaces as an unhandledrejection in a
+      // Node-privileged renderer and is caught by the test suites' error
+      // sentinel; the reader gets nothing either way, so say something.
+      Promise.resolve(shell.openExternal(url)).catch(() => {
+        showNotification(i18n('notif.sectionNotFound') + url, 3000);
+      });
       return;
     }
 
-    // Check if it's a local file link (file:// or relative path)
-    if (hrefAttr && !hrefAttr.startsWith('#') && !hrefAttr.startsWith('http')) {
+    // Everything the arm above did not take is treated as a local file link
+    // (file://, absolute, or relative to the current document).
+    //
+    // The guard is `^https?://` on the ATTRIBUTE, not `startsWith('http')` as
+    // it used to be. That older test made the delegation non-total in a way
+    // shaped like a filename: a sibling called `httpd.md` or `https-notes.txt`
+    // begins with "http", so this arm skipped it, while it resolves to `file:`
+    // so the arm above skipped it too. Nothing called preventDefault, Chromium
+    // followed the link natively, and main.js's will-navigate deny killed the
+    // navigation - so the link silently did nothing, with no notification. Bare
+    // relative hrefs (`httpd.md` rather than `./httpd.md`) are the common
+    // authoring style, which is what made this reachable. (N11)
+    //
+    // The two arms share ONE regex (ABSOLUTE_WEB_URL) applied to two inputs,
+    // and that is what makes them exactly complementary rather than merely
+    // adjacent. Measured: whenever URL parsing fails, `url === hrefAttr`, so
+    // this arm's negation is the precise complement of the arm above; and when
+    // parsing succeeds, a resolved absolute URL was already claimed there.
+    // Non-http schemes DOMPurify permits (mailto:, tel:, ftp:) took this arm
+    // before the change and still do - they are misrouted as file paths, which
+    // is a REAL and separately tracked defect (N14), not something this change
+    // introduced or fixed.
+    //
+    // With the empty-href return above and the SVG normalisation, every href a
+    // sanitized anchor in #viewer can carry now lands in exactly one arm:
+    // blank is a deliberate no-op, `#` is an in-document anchor, absolute
+    // http(s) goes to the external opener, and everything else comes here.
+    //
+    // THAT TOTALITY IS LOAD-BEARING FOR MORE THAN "THE LINK IS DEAD", and the
+    // difference was MEASURED rather than reasoned about. An unhandled click on
+    // an href Chromium cannot PARSE - `HTTPS://api.example.invalid:PORT/v1`, a
+    // real shape once a port is templated wrong - does not merely navigate and
+    // get denied. No cancellable Electron event fires at all (will-navigate,
+    // will-redirect and will-frame-navigate were all observed silent for it),
+    // and Chromium commits its own `about:blank#blocked` page OVER this
+    // document: every open tab and every unsaved edit gone, window blank, no
+    // way back but a restart. main.js's SEC-11 deny is a real second layer for
+    // every href that parses, and no layer at all for one that does not - so
+    // this handler being total is the ONLY thing standing in front of that
+    // case. Pinned by "N11 an unhandled link click never navigates the top
+    // frame out of the app" in test-render-security.js, and by R463, whose
+    // failure IS that page replacing the app. (N11/N15)
+    if (!hrefAttr.startsWith('#') && !ABSOLUTE_WEB_URL.test(hrefAttr)) {
       e.preventDefault();
 
       // Resolve the path relative to current file
@@ -4844,19 +5094,10 @@ function renderLightFormat(content, generation) {
     html = html.replace(new RegExp(`<p>${ph}</p>|${ph}`), rawHtmlIframeMarkup(code));
   });
 
-  // Protect data URIs
-  const dataUriStore = [];
-  html = html.replace(/<img([^>]*?)src\s*=\s*"(data:image\/[^"]+)"([^>]*?)>/gi, (match, before, dataUri, after) => {
-    const idx = dataUriStore.length;
-    dataUriStore.push(dataUri);
-    return `<img${before}src="https://data-uri-placeholder.local/${idx}"${after}>`;
-  });
-
+  // Sanitize last; nothing may be spliced in after this line. See the note on
+  // the same call in renderMarkdownFull() for why data: image URIs need no
+  // protect/restore dance here (SEC-28).
   html = sanitizeHtml(html);
-
-  dataUriStore.forEach((uri, idx) => {
-    html = html.replace(`https://data-uri-placeholder.local/${idx}`, uri);
-  });
 
   if (generation !== renderGeneration) return;
 
@@ -4967,22 +5208,35 @@ async function renderMarkdownFull(content, generation) {
       html = html.replace(new RegExp(`<p>${placeholder}</p>|${placeholder}`), rawHtmlIframeMarkup(code));
     });
 
-  // Protect data URI images from DOMPurify (it strips data: URIs by default)
-  const dataUriStore = [];
-  html = html.replace(/<img([^>]*?)src\s*=\s*"(data:image\/[^"]+)"([^>]*?)>/gi, (match, before, dataUri, after) => {
-    const idx = dataUriStore.length;
-    dataUriStore.push(dataUri);
-    return `<img${before}src="https://data-uri-placeholder.local/${idx}"${after}>`;
-  });
-
   // Sanitize last, once everything has been assembled, so that nothing can be
   // spliced in behind the sanitizer's back.
+  //
+  // Nothing may be spliced in AFTER this line either. There used to be a
+  // protect/restore dance here that swapped data: image URIs for a fixed
+  // placeholder, sanitized, then string-replaced the raw URIs back. That was
+  // SEC-28: `String.replace(string, ...)` rewrites only the FIRST occurrence of
+  // a predictable literal, so a document could plant a decoy copy of the
+  // placeholder in a code span and have its own unsanitized markup spliced into
+  // the already-sanitized HTML - an <img onerror> the sanitizer never saw, in a
+  // window that runs with Node access. It also passed attacker text as a
+  // replacement string, making $&, $` and $' live.
+  //
+  // The dance was never needed FOR THE REASON ITS COMMENT GAVE ("DOMPurify
+  // strips data: URIs by default"): DOMPurify permits data: on <img> natively
+  // via DATA_URI_TAGS. Measured against the vendored build, not assumed.
+  //
+  // It was, however, doing one real thing by accident. Swapping the URI out
+  // before the parse meant DOMPurify's SAFE_FOR_XML filter never judged the
+  // payload. That filter is on by default, drops any attribute matching
+  // /((--!?|])>)|<\/(style|script|title|xmp|textarea|noscript|iframe|noembed|
+  // noframes)/i, and runs BEFORE forceKeepAttr, so no hook can rescue it.
+  // Consequence of this deletion, measured: raw, entity-encoded and
+  // DTD-internal-subset SVG data URIs now lose their src; base64 and
+  // percent-encoded are unaffected. Accepted deliberately - the markup the
+  // dance protected is indistinguishable from the markup it exfiltrated.
+  // Pinned by "FEATURE base64 data-image survives SAFE_FOR_XML ..." in
+  // test/test-render-security.js.
   html = sanitizeHtml(html);
-
-  // Restore data URI images after sanitization
-  dataUriStore.forEach((uri, idx) => {
-    html = html.replace(`https://data-uri-placeholder.local/${idx}`, uri);
-  });
 
   // Patch only changed DOM nodes — preserves scroll, avoids full relayout.
   // Bail out if a newer render started while this one was awaiting, otherwise a
@@ -5169,9 +5423,25 @@ async function renderMarkdownFull(content, generation) {
     // its own invalidation. A pending zoom anchor would usually be rejected
     // here anyway (its element is detached), but "usually" is not a guard.
     noteViewerMutation();
-    viewer.innerHTML = `<div style="color: red; padding: 20px;">
-      <strong>Error rendering markdown:</strong><br>${error.message}
-    </div>`;
+    // Built from nodes rather than an innerHTML template, and themed rather
+    // than hardcoded red - N12, the same two defects N10 fixed one line at a
+    // time in insertTableFromDialog(). This one was strictly worse: it
+    // interpolated ${error.message} directly, and marked and DOMPurify both
+    // quote document content back in their errors, so the failure of one
+    // document could inject markup into the Node-privileged renderer that
+    // rendered it. errorText() records why the message is normalised rather
+    // than read off .message.
+    const box = document.createElement('div');
+    box.className = 'render-error';
+    box.setAttribute('role', 'alert');
+    const label = document.createElement('strong');
+    label.textContent = i18n('render.failed');
+    box.appendChild(label);
+    box.appendChild(document.createElement('br'));
+    box.appendChild(
+      document.createTextNode(errorText(error, i18n('render.unknownError')))
+    );
+    viewer.replaceChildren(box);
     hideLoadingScreenFor(generation);
   }
 }
@@ -8663,7 +8933,7 @@ async function renderMermaidInDOM(code, mode, replaceTarget) {
 // mode='insert': inserts after the right-click anchor child of viewer
 // mode='replace': replaces replaceTarget (<table> element, parent .table-container used if present)
 function renderTableInDOM(mdTable, mode, replaceTarget) {
-  const html = DOMPurify.sanitize(marked.parse(mdTable));
+  const html = sanitizeTableHtml(marked.parse(mdTable));
   const tempDiv = document.createElement('div');
   tempDiv.innerHTML = html;
   const tableEl = tempDiv.querySelector('table');
@@ -9050,6 +9320,63 @@ const tableInsertHeaderEl = document.getElementById('tableInsertHeader');
 const tableInsertPreviewEl = document.getElementById('tableInsertPreview');
 const tableInsertMarkdownEl = document.getElementById('tableInsertMarkdown');
 
+// SEC-30: the table dialog's preview is a PREVIEW - nothing rendered in it is
+// meant to be interactive. It sits outside #viewer, so the click delegation
+// that polices document links (preventDefault, then shell.openExternal under
+// the SEC-12 extension policy) never runs for it. That made it the one
+// clickable surface in the app with no policy attached, and its content is
+// attacker-controlled on the 'edit' path, which is fed from the open document.
+// Measured there: a plain link attempted a real top-frame navigation (denied by
+// main.js), and an <a download> reached the network outright.
+//
+// A capture-phase JS listener rather than CSS pointer-events, deliberately:
+// `style` is in DOMPurify's DEFAULT ALLOWED_ATTR, which TABLE_SANITIZE_CONFIG
+// keeps (it has no ADD_ATTR of its own - see the note on that config), so
+// document content can carry an inline style. An inline `!important`
+// declaration outranks an author stylesheet's `!important` (same origin, inline
+// wins on specificity), and pointer-events is inherited, so a descendant could
+// re-enable itself. A capture listener cannot be outranked by anything the
+// document is able to express.
+//
+// preventDefault only - no stopPropagation, which would silently change dialog
+// behaviour for any ancestor handler - and unconditional rather than matched
+// against 'a, area'.
+//
+// THE ORIGINAL REASON GIVEN HERE WAS FALSE AND IS RETRACTED. It read: "because
+// an image map's click target is the <img>, not the <area>, so a selector-based
+// guard would miss it." MEASURED with a trusted CDP pointer click on a real
+// rendered image map (a synthetic dispatchEvent cannot drive native
+// hit-testing, so it could not have answered this): document.elementFromPoint
+// reports AREA as the topmost element across the image, the delivered event has
+// target=AREA with isTrusted=true, and closest('a, area') finds it. So a
+// selector-based guard would NOT have missed it.
+//
+// The decision to stay unconditional stands anyway, on a reason that is true:
+// the claim this guard makes is "nothing in this preview activates", and
+// 'a, area' is an enumeration of the activatable things I happened to think of.
+// A guard whose subject list is narrower than its claim is the recurring defect
+// class in this file - the same shape as an absence check that fails open. An
+// unconditional preventDefault cannot be outrun by an element type added later.
+//
+// Scope, stated honestly: this covers activation, not every possible gesture.
+// Dragging a link or image out of the preview is still possible; that hands a
+// URL to whatever the user drops it on, which is an explicit user action
+// outside this window, and suppressing dragstart would also break selecting
+// text out of the preview.
+if (tableInsertPreviewEl) {
+  const blockPreviewActivation = (e) => {
+    e.preventDefault();
+  };
+  // 'auxclick' as well as 'click': Chromium has fired auxclick rather than
+  // click for non-primary buttons since Chrome 55, so a middle-click would
+  // otherwise skip this guard entirely and reach the default open-in-new-window
+  // path. That lands on main.js's setWindowOpenHandler deny - contained, but by
+  // a different layer than the one this code claims to be.
+  for (const type of ['click', 'auxclick']) {
+    tableInsertPreviewEl.addEventListener(type, blockPreviewActivation, true);
+  }
+}
+
 function buildTableMarkdown(rows, cols, hasHeader) {
   const lines = [];
   // Header row
@@ -9076,7 +9403,7 @@ function updateTablePreview() {
   if (tableInsertMarkdownEl) tableInsertMarkdownEl.value = md;
   // HTML preview
   if (tableInsertPreviewEl) {
-    tableInsertPreviewEl.innerHTML = DOMPurify.sanitize(marked.parse(md));
+    tableInsertPreviewEl.innerHTML = sanitizeTableHtml(marked.parse(md));
   }
 }
 
@@ -9088,7 +9415,7 @@ function openTableInsertDialog(md = null, mode = 'insert') {
     // Pre-fill the markdown textarea and render preview directly
     if (tableInsertMarkdownEl) tableInsertMarkdownEl.value = md.trim();
     if (tableInsertPreviewEl) {
-      tableInsertPreviewEl.innerHTML = DOMPurify.sanitize(marked.parse(md.trim()));
+      tableInsertPreviewEl.innerHTML = sanitizeTableHtml(marked.parse(md.trim()));
     }
   } else {
     updateTablePreview();
@@ -9116,10 +9443,23 @@ function insertTableFromDialog() {
 
   // Validate: must parse to a proper <table> element
   const testDiv = document.createElement('div');
-  testDiv.innerHTML = DOMPurify.sanitize(marked.parse(md));
+  testDiv.innerHTML = sanitizeTableHtml(marked.parse(md));
   if (!testDiv.querySelector('table')) {
     if (tableInsertPreviewEl) {
-      tableInsertPreviewEl.innerHTML = '<div style="color:red;padding:10px;background:#ffe6e6;border-radius:4px;margin:8px 0;">⚠ Geçersiz tablo formatı. Markdown tablo sözdizimini kontrol edin (| ile ayrılmış sütunlar gerekli).</div>';
+      // Built as a node rather than assigned as markup. The string is a
+      // constant today, so this is not closing a live sink - it is making sure
+      // a later ${...} interpolation cannot quietly turn a static line into one
+      // in the very box SEC-30 hardened. role=alert because the preview sits
+      // ABOVE the textarea while the button is in the footer: the error is
+      // visible, but nothing announces it to assistive technology, and the
+      // node is freshly created each time, so each failure is eligible to be
+      // announced again rather than being a silent no-op on an existing live
+      // region (whether it IS announced is the screen reader's decision).
+      const err = document.createElement('div');
+      err.className = 'table-insert-error';
+      err.setAttribute('role', 'alert');
+      err.textContent = i18n('table.invalidFormat');
+      tableInsertPreviewEl.replaceChildren(err);
     }
     return;
   }
@@ -9217,7 +9557,7 @@ tableInsertHeaderEl && tableInsertHeaderEl.addEventListener('change', updateTabl
 tableInsertMarkdownEl && tableInsertMarkdownEl.addEventListener('input', () => {
   if (tableInsertPreviewEl) {
     const md = getCleanTableMarkdown();
-    tableInsertPreviewEl.innerHTML = DOMPurify.sanitize(marked.parse(md));
+    tableInsertPreviewEl.innerHTML = sanitizeTableHtml(marked.parse(md));
   }
 });
 tableInsertClose && tableInsertClose.addEventListener('click', closeTableInsertDialog);

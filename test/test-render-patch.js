@@ -30,7 +30,6 @@
 
 const { app, BrowserWindow } = require("electron");
 const fs = require("fs");
-const os = require("os");
 const path = require("path");
 
 // Isolate this suite's userData profile before main.js exists and before the
@@ -39,7 +38,7 @@ require("./test-userdata-isolation");
 
 require("../src/main.js");
 
-const dir = fs.mkdtempSync(path.join(os.tmpdir(), "mdv-patch-"));
+const dir = require("./test-visual-utils").tempDir("mdv-patch-");
 
 // Heading-rich and code-rich: headings are what triggers the wrapper
 // mismatch, and code blocks are the most expensive thing a needless replace
@@ -2313,8 +2312,19 @@ async function run(win) {
 
     // Handled in the MAIN process via webContents before-input-event, which is
     // fed by real OS input. A renderer-side dispatchEvent structurally cannot
-    // reach it, so these are named rather than measured - see main.js:607.
-    const MAIN_PROCESS = ["Ctrl+O", "F11"];
+    // reach it, so these are named rather than measured - see the
+    // `before-input-event` listener in createWindow() (cited by the event name
+    // rather than a line number, which this file has had rot on it before).
+    //
+    // F12 belongs here for the same structural reason - it is tested for in
+    // that same listener, beside F11 - but it differs from the other two in
+    // being CONDITIONAL, on devToolsAllowed(). That gate is deliberately not
+    // re-checked here: it is a main-process source property and is already
+    // pinned in test-packaging.js, which asserts both that toggleDevTools() is
+    // wrapped in `if (devToolsAllowed())` and that the function's own body
+    // consults app.isPackaged. Restating it here would be a second copy to
+    // keep in step, not a second measurement.
+    const MAIN_PROCESS = ["Ctrl+O", "F11", "F12"];
     // Bound to a specific element (a dialog overlay, the search box, the
     // editor textarea) rather than to `document`, so "did document's listener
     // chain cancel it" is the wrong question for them.
@@ -2604,7 +2614,7 @@ app.whenReady().then(async () => {
   console.log(summary);
   writeReport(summary);
   try {
-    fs.rmSync(dir, { recursive: true, force: true });
+    require("./test-visual-utils").releaseTempDir(dir);
   } catch (e) {}
   app.exit(passed === results.length ? 0 : 1);
 });

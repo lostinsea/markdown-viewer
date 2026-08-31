@@ -33,6 +33,7 @@ const { app, BrowserWindow, ipcMain } = require("electron");
 const { execSync } = require("child_process");
 const fs = require("fs");
 const path = require("path");
+const { stripJsComments } = require("./test-source-utils.js");
 
 const {
   GOLDEN_PATH,
@@ -1502,9 +1503,18 @@ app.whenReady().then(async () => {
     // autoloader cannot fetch one either). `block-comment` likewise appears in
     // no grammar, and neither does `bold` or `italic`. `function-name` is
     // emitted only by bash, and always with alias:function, so `.token.function`
-    // - declared later - always wins on the real element. Measured, not assumed:
-    // grepping the 16 files in libs/prismjs/components for each of these names
-    // finds only bash's function-name. All six therefore render nowhere in the
+    // - declared later - always wins on the real element. Measured, not assumed,
+    // and re-derived against the file that actually ships: loading
+    // libs/prismjs/prism-bundle.js (the ONE Prism file src/index.html loads) and
+    // walking every grammar it registers for token names and aliases finds
+    // `function-name` in bash alone, and none of the other five anywhere. The
+    // walker was positive-controlled on keyword/string/comment/function, since
+    // an absence check fails open. An earlier version of this note cited
+    // libs/prismjs/components instead - the wrong artifact twice over: nothing
+    // ever loaded it, and it could not have loaded (prism-clike.min.js was never
+    // vendored, so 8 of its 14 language components could not resolve). It has
+    // since been deleted.
+    // All six therefore render nowhere in the
     // fixture and the golden CANNOT cover them: their declarations could be
     // changed to anything at all and every assertion above would stay green.
     //
@@ -7035,97 +7045,14 @@ app.whenReady().then(async () => {
        The stripper treats a backtick as an ordinary quote and does NOT descend
        into an interpolation, so code inside one is scanned as if it were string
        content - which can only ever ADD subjects, never remove them. */
-    const stripJsComments = (src) => {
-      let out = "";
-      let quote = "";
-      /* REGEX LITERALS ARE A THIRD STATE, and leaving them out is not a
-         cosmetic gap. src/main.js contains .replace(/"/g, "&quot;"): with no
-         regex state the lone quote inside that literal opens phantom string
-         mode, and everything after it is scanned with a desynchronised quote -
-         measured at 83 of 464 comment lines surviving the strip. Today that
-         direction is safe (a surviving comment can only ADD a hit, and there
-         are none), but the same desync lets a // inside a real string be
-         stripped as a comment, which DELETES code from the sweep's view and
-         fails silently open. main.js already carries such shapes nearby
-         (/^file:\/\/(?!\/)/i). Deciding regex-vs-division needs the previous
-         significant token, which is what lastSig/lastWord carry. */
-      let lastSig = "";
-      let lastWord = "";
-      const REGEX_OK_AFTER = "(,=:[!&|?{};+-*%^~<>";
-      const REGEX_OK_WORDS = [
-        "return",
-        "typeof",
-        "instanceof",
-        "in",
-        "of",
-        "new",
-        "delete",
-        "void",
-        "throw",
-        "do",
-        "else",
-        "case",
-        "yield",
-        "await",
-      ];
-      for (let i = 0; i < src.length; i++) {
-        const ch = src[i];
-        if (quote) {
-          out += ch;
-          if (ch === "\\") out += src[++i] || "";
-          else if (ch === quote) quote = "";
-          continue;
-        }
-        if (ch === '"' || ch === "'" || ch === "`") {
-          quote = ch;
-          out += ch;
-          lastSig = ch;
-          lastWord = "";
-          continue;
-        }
-        if (ch === "/" && src[i + 1] === "/") {
-          while (i < src.length && src[i] !== "\n") i++;
-          out += "\n";
-          continue;
-        }
-        if (ch === "/" && src[i + 1] === "*") {
-          const close = src.indexOf("*/", i + 2);
-          i = close === -1 ? src.length : close + 1;
-          out += " ";
-          continue;
-        }
-        if (
-          ch === "/" &&
-          (lastSig === "" || REGEX_OK_AFTER.includes(lastSig) || REGEX_OK_WORDS.includes(lastWord))
-        ) {
-          out += ch;
-          let inClass = false;
-          let j = i + 1;
-          for (; j < src.length; j++) {
-            const c2 = src[j];
-            if (c2 === "\n") break;
-            out += c2;
-            if (c2 === "\\") {
-              out += src[++j] || "";
-              continue;
-            }
-            if (c2 === "[") inClass = true;
-            else if (c2 === "]") inClass = false;
-            else if (c2 === "/" && !inClass) break;
-          }
-          i = j;
-          lastSig = "/";
-          lastWord = "";
-          continue;
-        }
-        out += ch;
-        if (!/\s/.test(ch)) {
-          lastWord = /[A-Za-z0-9_$]/.test(ch) ? lastWord + ch : "";
-          lastSig = ch;
-        }
-      }
-      return out;
-    };
+    /* THE STRIPPER IS SHARED, NOT COPIED. test/test-packaging.js needs the
+       identical scanner for the Tabulator option oracle, and this file's own
+       plan records what a second copy costs: post-upstream-merge.sh checked
+       five overlay files twice with two different matchers, and the duplicate
+       reported all five as MISSING while its twin passed. The regex-literal
+       state below (the B6 fix) is exactly the kind of subtlety that would be
+       repaired in one copy and not the other.
+       See test/test-source-utils.js for the implementation and its rationale. */
     const schemeMentions = (text) => {
       const code = stripJsComments(text);
       const hits = [];
@@ -7228,10 +7155,16 @@ app.whenReady().then(async () => {
        next edit that adds an initialise call. */
     const initArgs = [];
     /* SCANNED WITH COMMENTS STRIPPED, and that is not incidental: renderer.js
-       has a comment at :2358 that spells mermaid.initialize() while explaining
+       has a comment at :3127 that spells mermaid.initialize() while explaining
        what the recording is for. Reading raw text found three sites and the
-       third had an empty argument list - a measurement of prose. The count
-       below is therefore also the control that the strip worked. */
+       third had an empty argument list - a measurement of prose.
+       THE COUNT IS A CONTROL THAT A STRIP HAPPENED, NOT THAT IT WAS CORRECT,
+       and the distinction was measured rather than assumed: raw source reads 3
+       here and both a healthy stripper and the desynchronising one proposed in
+       review read 2, because that particular line's fate depends on backtick
+       parity at its offset rather than on the scanner being sound. The
+       assertion that the strip was CORRECT is the surviving-comment sweep
+       directly below. */
     const rendererCode = stripJsComments(rendererSrc);
     const INIT_RE = /mermaid\.initialize\(/g;
     let initM;
@@ -7275,6 +7208,59 @@ app.whenReady().then(async () => {
         .map((a) => a.replace(/\s+/g, " ").slice(0, 60))
         .join(" | ")}${
         initFaults.length ? ` - unexpected argument(s): ${initFaults.join(" | ")}` : ""
+      }`,
+    );
+    /* THE SHIPPED-SOURCE WITNESS, AND IT REPLACES ONE THAT ROTTED.
+       R384 - the review-proposed "re-enter code mode at ${" change - used to be
+       caught twice: by the plant table above, and by the initialise sweep
+       reporting a phantom THIRD site because the desync left the commented-out
+       call at renderer.js:3127 standing. That second witness has RETIRED. It
+       was never a property of the transform; it was a property of the backtick
+       parity at one offset, and ordinary edits to renderer.js moved it. Under
+       the broken stripper that site now strips correctly by luck, so the
+       initialise sweep reads 2 and passes while the transform is as harmful as
+       it ever was.
+
+       THIS is the stable form of the same claim, and the difference is that it
+       is AGGREGATE. A desync that begins at the first interpolated template
+       (measured: renderer.js line 339) mis-scans roughly every other region
+       thereafter, so it cannot hide by parity - measured, healthy 0 surviving
+       against 1014 for the proposed remedy, out of 3177 raw comment lines.
+       A single-site witness could go quiet on any edit; this one cannot go
+       quiet without the stripper actually being correct.
+
+       WHY renderer.js ALONE. main.js legitimately leaves 39 comment lines
+       standing, and that is the stripper working as designed rather than a
+       defect: they live inside the popup HTML template literal (main.js
+       2152-2434), and the stripper deliberately does not descend into a
+       template - a comment inside one really is string content. Asserting zero
+       there would be false, and pinning 39 would pin the popup's prose.
+
+       THE FLOOR IS A VACUITY GUARD, NOT A PIN, and it is deliberately far
+       below the measured count so ordinary comment edits cannot false-fail it:
+       its only job is to prove the file was read and the matcher still
+       matches, because a scan that finds no subjects reports the same zero as
+       a scan that finds them all stripped - the recorded "an absence check
+       fails open" disease. The measured count PRINTS on every run so the
+       constant is never a number nobody has looked at. */
+    const COMMENT_LEAD_RE = /^[ \t]*\/\//;
+    const rawCommentLines = rendererSrc.split(/\r?\n/).filter((l) => COMMENT_LEAD_RE.test(l));
+    const survivingComments = rendererCode
+      .split(/\r?\n/)
+      .map((line, i) => [i + 1, line])
+      .filter(([, line]) => COMMENT_LEAD_RE.test(line));
+    check(
+      "10i: the shared comment stripper leaves no line comment standing in renderer.js (the scanner never desynchronises)",
+      rawCommentLines.length >= 100 && survivingComments.length === 0,
+      `${rawCommentLines.length} raw comment line(s) (floor 100), ${
+        survivingComments.length
+      } surviving${
+        survivingComments.length
+          ? `: ${survivingComments
+              .slice(0, 3)
+              .map(([n, l]) => `${n}:${l.trim().slice(0, 50)}`)
+              .join(" | ")}`
+          : ""
       }`,
     );
 

@@ -38,7 +38,7 @@ echo "=== Applying post-merge customizations ==="
 echo ""
 echo "1. Pinning Electron to ^43..."
 cd "$ROOT"
-npm pkg set devDependencies.electron="^43.2.0"
+npm pkg set devDependencies.electron="^43.4.1"
 echo "   ✓ package.json updated"
 
 # -----------------------------------------------------------------------------
@@ -66,8 +66,27 @@ check_line "$ROOT/src/index.html" 'custom-tabs.js'         '<script src="custom-
 check_line "$ROOT/src/index.html" 'custom-performance.js'  '<script src="custom-performance.js"></script>'
 check_line "$ROOT/src/index.html" 'custom-theme.js'        '<script src="custom-theme.js"></script>'
 check_line "$ROOT/src/index.html" 'tabsContainer'          '<div id="tabsContainer" ...> - must be just before <div class="main-content">'
-check_line "$ROOT/src/index.html" 'app-title'              '<span class="app-title">Folia</span> - inside #logoLink'
 check_line "$ROOT/src/index.html" '<title>Folia</title>'  '<title>Folia</title>'
+
+# There was an `app-title` check here, and it had rotted into the DIRECT
+# OPPOSITE of what the rest of the repo asserts. The header was deliberately
+# redesigned down to the hamburger alone (see the comment at the top of
+# index.html: "there is no logo, product name or file-path row any more"), and
+# three separate oracles now pin that ABSENCE - test-packaging.js checks that
+# neither `class="app-title"` nor a `.app-title` rule comes back, and
+# test-tab-refresh.js asserts appTitle === false and logoLink === false in the
+# live DOM. This script was still telling the maintainer to re-add a
+# `<span class="app-title">` inside a `#logoLink` that no longer exists either.
+# Following that instruction would have made the test suite fail immediately.
+#
+# Product NAMING is still pinned, so nothing was lost by deleting it: the
+# `<title>Folia</title>` check above covers the window title, and section 4
+# below covers the BrowserWindow title in main.js.
+#
+# The general defect - a check in this script that has quietly stopped
+# describing the tree - is now caught by test-packaging.js, which parses every
+# check_line/check_html_script/check_html_absent/check_build_file call here and
+# asserts each one still agrees with the file it names. See R514.
 
 if [ "$MISSING_REFS" -eq 1 ]; then
   echo ""
@@ -75,7 +94,6 @@ if [ "$MISSING_REFS" -eq 1 ]; then
   echo "     See docs/CUSTOMIZATIONS.md for where to add them."
   echo "     KEY POINTS:"
   echo "       - tabsContainer div must be added just before <div class=\"main-content\">"
-  echo "       - app-title span must be inside #logoLink (after logo img tags)"
   echo "       - <title> must say 'Folia' - a merge may reset it to the vendor name"
 fi
 

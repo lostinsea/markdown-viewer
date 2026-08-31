@@ -24,9 +24,8 @@
 //    screenshots/ every run as a debugging artifact; nothing asserts on it.
 const { app, BrowserWindow, ipcMain } = require("electron");
 const fs = require("fs");
-const os = require("os");
 const path = require("path");
-const { VISUAL_PROBE_SOURCE, inspectVisual, captureScreenshot, startErrorSentinel, proveSentinelAlive, LIVENESS_MUTE_REASON, trapExternalOpens, waitForExternalTrap } = require("./test-visual-utils");
+const { VISUAL_PROBE_SOURCE, inspectVisual, captureScreenshot, startErrorSentinel, proveSentinelAlive, LIVENESS_MUTE_REASON, trapExternalOpens, waitForExternalTrap, tempDir, releaseTempDir } = require("./test-visual-utils");
 
 // Isolate this suite's userData profile before main.js exists and before the
 // app is ready. See test-userdata-isolation.js.
@@ -34,7 +33,7 @@ require("./test-userdata-isolation");
 
 require("../src/main.js");
 
-const dir = fs.mkdtempSync(path.join(os.tmpdir(), "mdv-mermaid-"));
+const dir = tempDir("mdv-mermaid-");
 const fileM = path.join(dir, "diagrams.md");
 const jsM = JSON.stringify(fileM);
 // A deliberately diagram-free document. Section 6 needs a state where the
@@ -342,10 +341,35 @@ async function run(win) {
   // short name, so they are structurally low-fill and averaging them with
   // flowchart nodes hides a real regression in either direction.
   //
-  // Measured, mermaid defaults -> chosen config, on mermaid 11.16:
+  // Measured, mermaid defaults -> chosen config, on mermaid 11.16 WHEN WRITTEN:
   //   flowchart  15.8% -> 45.0%   floor 33%    discriminating
   //   sequence    9.0% ->  9.3%   floor 7.5%   NOT discriminating
   //   class      36.5% -> 37.6%   floor 30%    NOT discriminating
+  //
+  // CORRECTED 11.17.0 BUMP - THE TUNED COLUMN ABOVE IS STALE. Re-measured on
+  // the current tree: flowchart 36.0%, sequence 10.2%, class 37.7%. The class
+  // figure still matches; flowchart and sequence do not. The drift is NOT the
+  // mermaid bump - proven by a controlled A/B with the SAME probe and the SAME
+  // fixture, installing 11.16.0, re-vendoring (bytes back to 3565102 /
+  // 74D7C46D) and re-running:
+  //
+  //   11.16.0  flowchart 0.360  sequence 0.102  class 0.377
+  //   11.17.0  flowchart 0.360  sequence 0.102  class 0.377   <- identical
+  //
+  // So the two versions are geometrically indistinguishable here and the whole
+  // delta predates the bump. These are ratios over laid-out text, so they move
+  // with anything that moves text metrics - and several such things have landed
+  // since (marked 9 -> 18, the theme/token rewrite, and the display scaling
+  // going 150% -> 125%, which is what broke the theme border goldens). NOT
+  // chased further: every floor still clears, and attributing it is a separate
+  // question from taking this bump.
+  //
+  // THE FLOORS ARE DELIBERATELY NOT RE-FITTED to these numbers. Re-baselining a
+  // detector onto the population it currently sees is how it decays into a
+  // description of the status quo. Flowchart now clears by 3 points rather than
+  // 12, but that headroom is against measurement drift, not against the defect
+  // the floor guards: reverting the tuning takes it to ~15.8%, less than half
+  // the floor. NOT re-confirmed in this pass - that claim is inherited.
   //
   // Only the flowchart floor (and the font-size assertion above) actually fails
   // when the tuning is reverted - confirmed by reverting mermaid-config.js to
@@ -357,20 +381,55 @@ async function run(win) {
   // Keyed by mermaid's own aria-roledescription rather than document order, so
   // reordering the fixture cannot silently make each floor check a different
   // diagram than its name claims.
+  //
+  // The id is mermaid's REGISTERED DIAGRAM ID, written into the attribute by
+  // its own setA11yDiagramInfo(), so it is an upstream contract that can move
+  // under a bump - and it did: 11.16.0 emitted "class" for a class diagram,
+  // 11.17.0 emits "classDiagram". MEASURED, not assumed: the same fixture on
+  // the same suite reported role "classDiagram" the moment mermaid changed,
+  // and the vendored bundle registers "classDiagram" while no diagram declares
+  // a bare "class" roledescription any more.
+  //
+  // Each floor therefore accepts a LIST of ids rather than a single string.
+  // Deliberately not relaxed to "any diagram": the whole point of keying on the
+  // role is that the floor named "class" measures the class diagram. An
+  // unrecognised id still fails loudly with `missing: true` plus the ids it
+  // saw, which is exactly how this rename surfaced.
   const FLOORS = [
-    ["flowchart", "flowchart-v2", 0.33],
-    ["sequence", "sequence", 0.075],
-    ["class", "class", 0.3],
+    ["flowchart", ["flowchart-v2"], 0.33],
+    ["sequence", ["sequence"], 0.075],
+    ["class", ["class", "classDiagram"], 0.3],
   ];
-  FLOORS.forEach(([name, role, floor]) => {
-    const d = geo.perDiagram.find((x) => x.role === role);
+  FLOORS.forEach(([name, roles, floor]) => {
+    const d = geo.perDiagram.find((x) => roles.indexOf(x.role) !== -1);
     check(
       `${name} node boxes are reasonably filled by their labels`,
       !!d && d.shapes > 0 && d.fill >= floor,
-      JSON.stringify(d || { role, missing: true, saw: geo.perDiagram.map((x) => x.role) }) +
+      JSON.stringify(d || { roles, missing: true, saw: geo.perDiagram.map((x) => x.role) }) +
         ` floor=${floor}`,
     );
   });
+
+  // A floor that passes silently is a floor nobody has read. check() discards
+  // evidence on PASS, so these three cleared their bars for a long time without
+  // ever printing the numbers - the same magic-number disease as the licence
+  // guard's `> 200` against a real 220. Printed permanently, so a bump that
+  // degrades a fill while still clearing its floor is visible in the log rather
+  // than only when it finally crosses. Not a check(): it must not move the
+  // assertion count, which name-set reconciliation depends on.
+  console.log(
+    "note: mermaid geometry " +
+      JSON.stringify({
+        mermaid: vendored.mermaid,
+        perDiagram: geo.perDiagram.map((d) => ({
+          role: d.role,
+          shapes: d.shapes,
+          fill: Number(d.fill.toFixed(3)),
+          overflows: d.overflows,
+        })),
+        minFont: geo.minFont,
+      }),
+  );
 
   check("no label overflows its node box", geo.overflows === 0, JSON.stringify(geo));
 
@@ -1862,13 +1921,80 @@ async function run(win) {
         }
         await new Promise(r => setTimeout(r, 600));
         const blocks = [...document.querySelectorAll('#viewer .mermaid')];
-        return {
+        const box = document.querySelector('#viewer .mermaid .mermaid-error');
+        const strong = box ? box.querySelector('strong') : null;
+        const out = {
           blocks: blocks.length,
           injected: !!document.getElementById('mermaid-banner-probe'),
           // The reader must still see the diagnostic, markup and all, as text.
           textShown: blocks.some(b => b.textContent.includes('mermaid-banner-probe')),
-          labelled: blocks.some(b => /Mermaid Rendering Error/.test(b.textContent))
+          labelled: blocks.some(b => /Mermaid Rendering Error/.test(b.textContent)),
+          // N13. The banner is built from nodes and styled from a class - the
+          // five box.style.* assignments it replaces were a fixed red on a
+          // fixed light pink, unreadable on the three dark themes.
+          box: !!box,
+          // It REPLACED the diagram's contents rather than being appended
+          // beside the source text mermaid failed to draw.
+          parentIsMermaid: box ? box.parentElement.classList.contains('mermaid') : null,
+          parentNodes: box ? box.parentElement.childNodes.length : -1,
+          role: box ? box.getAttribute('role') : null,
+          label: strong ? strong.textContent : null,
+          // Exactly <strong> and <br>. Anything the message spelled would show
+          // up here as a third element.
+          boxChildren: box ? box.children.length : -1,
+          elementsFromMessage: box ? box.querySelectorAll('i, img, script').length : -1,
+          // Nothing is left on the style attribute. This is the conjunct the
+          // CSSOM assignments would fail; every other one above is equally
+          // satisfied by the old hardcoded version.
+          inlineStyle: box ? box.getAttribute('style') : 'NO-ELEMENT'
         };
+
+        // Theming, read under two schemes. try/finally rather than straight
+        // line: a throw in a read would otherwise leave data-theme on
+        // 'clarity' for every scenario appended after this one.
+        const themeBefore = document.body.getAttribute('data-theme');
+        const readColours = () => {
+          if (!box) return null;
+          const cs = getComputedStyle(box);
+          return {
+            fg: cs.color,
+            // Non-vacuity control: a misspelt var() is invalid at
+            // computed-value time and the element INHERITS, and the inherited
+            // colour also differs between themes - so "fg differs across
+            // themes" alone would still pass. The parent <pre class="mermaid">
+            // is also the surface whose --surface-raised background this
+            // banner's contrast was measured against.
+            inherited: getComputedStyle(box.parentElement).color,
+            // No fill, deliberately and measurably: a tinted fill was swept on
+            // THIS backdrop and A=0 is the maximum (see the rule's comment in
+            // styles.css). Nothing else observes the absence.
+            bg: cs.backgroundColor,
+            // The panel the banner is pasted onto. The old pink was an opaque
+            // #ffe6e6 and measured 11.6-13.8 against this on the dark themes.
+            panel: getComputedStyle(box.parentElement).backgroundColor,
+            // Width and style, never border-top-COLOR: its initial value is
+            // currentcolor, so a deleted border declaration still reports the
+            // element's own colour and the conjunct could only fail once the
+            // colour check already had. Width is device-snapped, so it is only
+            // pinned non-zero.
+            borderW: parseFloat(cs.borderTopWidth),
+            borderS: cs.borderTopStyle
+          };
+        };
+        try {
+          document.body.setAttribute('data-theme', 'abyss');
+          out.abyss = readColours();
+          document.body.setAttribute('data-theme', 'clarity');
+          out.clarity = readColours();
+        } finally {
+          if (themeBefore === null) {
+            document.body.removeAttribute('data-theme');
+          } else {
+            document.body.setAttribute('data-theme', themeBefore);
+          }
+        }
+        out.themeRestored = document.body.getAttribute('data-theme') === themeBefore;
+        return out;
       })()
     `);
     await exec(`
@@ -1893,6 +2019,47 @@ async function run(win) {
   check(
     "the error banner renders a hostile message as text, not as markup",
     banner.injected === false && banner.textShown === true,
+    JSON.stringify(banner),
+  );
+  // N13. The five box.style.* assignments this replaces satisfied every
+  // conjunct above - the escaping half was already done. What they could not
+  // satisfy is inlineStyle === null, which is why it is here.
+  check(
+    "N13 the mermaid failure banner replaces the diagram, built from nodes and styled from a class",
+    banner.box === true &&
+      banner.parentIsMermaid === true &&
+      banner.parentNodes === 1 &&
+      banner.role === "alert" &&
+      banner.label === "Mermaid Rendering Error:" &&
+      banner.boxChildren === 2 &&
+      banner.elementsFromMessage === 0 &&
+      banner.inlineStyle === null,
+    JSON.stringify(banner),
+  );
+  // The defect itself. `red` on `#ffe6e6` measured a flat 3.37 in every theme
+  // - opaque, so backdrop-independent - against 3.66/3.60/5.03/5.55/6.19/5.57
+  // for --danger-fg on the --surface-raised panel this banner is pasted onto.
+  // The pink measured 11.6-13.8 against that panel on the three dark themes.
+  //
+  // `fg !== inherited` is the load-bearing conjunct: a misspelt var() is
+  // invalid at computed-value time, so the element would INHERIT, and the
+  // inherited colour differs per theme too - "the two themes disagree" alone
+  // would still pass.
+  check(
+    "N13 the mermaid failure banner is themed, and tracks the active theme",
+    !!banner.abyss &&
+      !!banner.clarity &&
+      banner.abyss.fg !== "rgb(255, 0, 0)" &&
+      banner.clarity.fg !== "rgb(255, 0, 0)" &&
+      banner.abyss.fg !== banner.abyss.inherited &&
+      banner.clarity.fg !== banner.clarity.inherited &&
+      banner.abyss.fg !== banner.clarity.fg &&
+      banner.abyss.bg === "rgba(0, 0, 0, 0)" &&
+      banner.clarity.bg === "rgba(0, 0, 0, 0)" &&
+      banner.abyss.panel !== banner.clarity.panel &&
+      banner.abyss.borderW > 0 &&
+      banner.abyss.borderS === "solid" &&
+      banner.themeRestored === true,
     JSON.stringify(banner),
   );
 
@@ -2568,7 +2735,7 @@ app.whenReady().then(async () => {
   console.log(summary);
   writeReport(summary);
   try {
-    fs.rmSync(dir, { recursive: true, force: true });
+    releaseTempDir(dir);
   } catch (e) {}
   app.exit(passed === results.length ? 0 : 1);
 });

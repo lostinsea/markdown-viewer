@@ -1629,6 +1629,13 @@ app's config, then the config without the app's hooks. **The sanitiser is
 is measuring something else.** Recorded because the mistake was not obvious
 either time.
 
+Amended in wave 2: there are now **two** sanitiser entry points, not one.
+SEC-29 found five table call sites using a bare `DOMPurify.sanitize()` and gave
+them `sanitizeTableHtml()`, which applies `TABLE_SANITIZE_CONFIG` — a narrower
+config that shares `sanitizeHtml()`'s two deny-lists BY REFERENCE. So a probe
+must reach whichever of the two the path under test actually uses; going
+straight to `DOMPurify.sanitize()` is still measuring something else.
+
 A dedicated probe did confirm DOMPurify strips `srcdoc` even though it is in
 `ADD_ATTR`, along with `javascript:`, `data:`, `file:` and `onload` on frames.
 

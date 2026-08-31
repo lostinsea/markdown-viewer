@@ -1,0 +1,77 @@
+# Continuous integration for Folia.
+#
+# WHY THIS EXISTS: until it did, this repository had no CI on ordinary pushes
+# at all. `release.yml` triggers only on a `v*` tag push or a manual dispatch,
+# and the single test step it runs is `npm run test:packaging` - one of the
+# three suites that execute under plain node. The ten windowed suites (tabs,
+# security, popups, mermaid, visual, startup, search, patch, tables, theme)
+# had therefore NEVER run anywhere but on the maintainer's machine, on the
+# maintainer's memory. Roughly 1,850 assertions, including every
+# render-security regression test, were guarded by a habit.
+#
+# test-packaging.js asserts that some workflow here still runs a suite that
+# invokes `electron`, so this file cannot quietly regress to node-only checks.
+# See R518.
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+# A superseded run tells you nothing you want to wait for. Pushes to main land
+# in bursts here, and the full chain is not cheap.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    # Windows only, deliberately. Folia is a Windows-only fork - the packaging
+    # suite pins the build targets and the docs say so - and the windowed suites
+    # drive real BrowserWindows. Running them on ubuntu would need xvfb to say
+    # anything at all, and would be testing a platform this fork does not ship.
+    runs-on: windows-latest
+    timeout-minutes: 45
+
+    steps:
+      # Pinned to full commit SHAs for the same reason release.yml is: a tag is
+      # a mutable pointer controlled by someone else. The trailing comment
+      # records the human-readable version, and .github/dependabot.yml keeps
+      # these moving.
+      - name: Check out Git repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install Node.js
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          # .nvmrc rather than a literal, so CI cannot drift from the version
+          # the project is developed against. package.json declares
+          # engines.node >= 22.12.0 and .npmrc sets engine-strict=true, so a
+          # drift here fails at install time rather than confusingly later.
+          node-version-file: '.nvmrc'
+          cache: 'npm'
+
+      - name: Install dependencies
+        # `npm ci`, not `npm install`: it installs exactly what the lockfile
+        # pins and fails if the lockfile and package.json disagree.
+        run: npm ci
+
+      # The whole chain - all 13 suites, the 10 windowed ones included. Electron
+      # does not ship its binary on npm; the first `electron` invocation lazily
+      # fetches a ~100MB build from GitHub's CDN, which is why this step can be
+      # slow on a cold cache and why the timeout above is generous.
+      - name: Run the full test suite
+        run: npm test
+
+      # Read-only and about a second, but it is the check that catches a revert
+      # record whose anchor text has been edited out from under it - the failure
+      # mode that makes the 460-odd recorded defects silently unprovable.
+      - name: Verify every revert anchor still resolves
+        run: node scripts/prove-table-fixes.js --anchors

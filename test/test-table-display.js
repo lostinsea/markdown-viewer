@@ -5627,9 +5627,83 @@ async function run(win) {
     JSON.stringify(zoomAnchor.clamp),
   );
 
-  // Without this the sentinel reporting nothing and the sentinel having quietly
-  // stopped watching are indistinguishable - the vacuity this harness exists to
-  // rule out. Both channels are proven because they fail independently.
+  // --- SEC-31 end-to-end, from a real DOCUMENT ---------------------------
+  // test:popups drives ipcMain "open-table-popup" directly with a hand-written
+  // payload, so it measures the BOUNDARY and nothing else. That leaves the
+  // producer unproven: if extractTableData() started emitting a differently
+  // shaped column - a nested `columns` array, a `titleHtml` key, a title the
+  // boundary never sees - the boundary assertions would still pass while a
+  // real document reached Tabulator unescaped. This is the only assertion in
+  // the project that exercises markdown -> extractTableData -> IPC ->
+  // normaliseTablePayload -> Tabulator as one path.
+  // THE FIXTURE USES ENTITIES ON PURPOSE, and the first attempt at it is worth
+  // recording. Written as literal `<img src=x onerror=...>` markdown, this
+  // measured elements:0, imgs:0, pwned:null but paintsRaw:FALSE - and the error
+  // sentinel caught two broken images. That is the document path defending
+  // itself twice over: DOMPurify keeps <img> but strips onerror, and then
+  // extractTableData() reads the header's textContent, which drops the element
+  // entirely. So literal markup can never reach a column title from a document,
+  // and a fixture written that way proves nothing about the boundary.
+  //
+  // Entities survive both layers as TEXT, so textContent yields the characters
+  // `<img src=x onerror=...>` verbatim - which is exactly the payload SEC-31 is
+  // about, now arriving through the real producer instead of a hand-written
+  // IPC message.
+  const HOSTILE_HEADER =
+    "| Name&lt;img src=x onerror=&quot;window.__pwned=1&quot;&gt; | B |\n" +
+    "| --- | --- |\n" +
+    "| one | two |\n";
+  await exec(
+    `(async () => {
+      renderMarkdown(${JSON.stringify(HOSTILE_HEADER)}, "full");
+      await new Promise(r => setTimeout(r, 1200));
+      const c = document.querySelector('#viewer .table-container');
+      const b = c && c.querySelector('.table-maximize-btn');
+      if (b) b.click();
+      return 1;
+    })()`,
+  );
+  let tablePopup = null;
+  for (let i = 0; i < 40 && !tablePopup; i++) {
+    await sleep(250);
+    tablePopup = BrowserWindow.getAllWindows().find((w) => w !== win && !w.isDestroyed()) || null;
+  }
+  if (tablePopup) {
+    await sleep(2500);
+    const e2e = JSON.parse(
+      await tablePopup.webContents.executeJavaScript(
+        `(() => {
+          const t = document.querySelector('.tabulator-col-title');
+          return JSON.stringify({
+            found: !!t,
+            // The header must be TEXT, so it has no element children...
+            elements: t ? t.querySelectorAll('*').length : -1,
+            // ...and it must still carry the document's own characters, which
+            // is what separates "escaped" from "silently dropped".
+            paintsRaw: t ? t.textContent.indexOf('<img') !== -1 : false,
+            imgs: document.body.querySelectorAll('img').length,
+            pwned: typeof window.__pwned === 'undefined' ? null : window.__pwned,
+          });
+        })()`,
+        true,
+      ),
+    );
+    check(
+      "SEC-31 a hostile header in a real DOCUMENT reaches the popup as text",
+      e2e.found === true &&
+        e2e.elements === 0 &&
+        e2e.paintsRaw === true &&
+        e2e.imgs === 0 &&
+        e2e.pwned === null,
+      JSON.stringify(e2e),
+    );
+    tablePopup.destroy();
+    await sleep(400);
+  } else {
+    check("SEC-31 a hostile header in a real DOCUMENT reaches the popup as text", false, "no popup window appeared");
+  }
+
+
   const alive = await proveSentinelAlive(win, sentinel);
   check(
     "the error sentinel was demonstrably watching both channels",

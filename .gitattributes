@@ -35,12 +35,26 @@ assets/logo.svg text eol=lf
 
 # Third-party licence texts, copied VERBATIM from their upstream sources
 # (assets/fonts/LICENSE-FiraCode.txt is the SIL OFL as published; the Tabulator
-# licence comes out of `npm pack tabulator-tables@6.2.5`). Their provenance is
-# established by byte-for-byte comparison against the upstream artifact, so an
-# end-of-line rewrite on checkout would break that verification and, for the
-# OFL, alter the file that clause 2 requires to travel with the font binaries.
-# Reproducing someone else's licence is the one place where "git will normalise
-# it" is the wrong answer.
+# licence comes out of `npm pack tabulator-tables`, at the version the vendored
+# bundle's own banner declares). Their provenance is established by byte-for-byte
+# comparison against the upstream artifact, so an end-of-line rewrite on checkout
+# would break that verification and, for the OFL, alter the file that clause 2
+# requires to travel with the font binaries. Reproducing someone else's licence
+# is the one place where "git will normalise it" is the wrong answer.
+#
+# NO TABULATOR VERSION IS NAMED HERE, DELIBERATELY. This comment used to pin one
+# - the then-current 6.2.5 - and it went stale when the bundle was bumped, which
+# is worse than it sounds: 6.2.5's LICENSE reads `Copyright (c) 2015-2024` and
+# 6.5.2's reads `2015-2026`, so the comment was citing an artifact whose
+# copyright notice is NOT the one that ships - and under MIT the notice is the
+# whole of the obligation. A version written down beside a file drifts from it;
+# the version the artifact reports about itself cannot. Same reasoning, and the
+# same wording, as scripts/generate-notices.js. test/test-packaging.js pins both
+# halves: that no version is named here, and that the vendored LICENSE and the
+# vendored bundle still come from one tarball. (That first check reads this
+# whole file, so it is deliberately not satisfied by moving a pinned version
+# from the citation into a comment about the citation - which is exactly what
+# an earlier draft of this paragraph did, and it failed loudly.)
 assets/fonts/LICENSE-FiraCode.txt text eol=lf
 libs/tabulator/LICENSE text eol=lf
 

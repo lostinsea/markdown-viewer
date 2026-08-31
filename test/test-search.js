@@ -17,9 +17,8 @@
 
 const { app, BrowserWindow } = require("electron");
 const fs = require("fs");
-const os = require("os");
 const path = require("path");
-const { inspectVisual, captureScreenshot, startErrorSentinel, proveSentinelAlive, trapExternalOpens } = require("./test-visual-utils");
+const { inspectVisual, captureScreenshot, startErrorSentinel, proveSentinelAlive, trapExternalOpens, tempDir, releaseTempDir } = require("./test-visual-utils");
 
 // Isolate this suite's userData profile before main.js exists and before the
 // app is ready. See test-userdata-isolation.js.
@@ -27,7 +26,7 @@ require("./test-userdata-isolation");
 
 require("../src/main.js");
 
-const dir = fs.mkdtempSync(path.join(os.tmpdir(), "mdv-search-"));
+const dir = tempDir("mdv-search-");
 const file = path.join(dir, "searchable.md");
 const js = JSON.stringify(file);
 
@@ -582,7 +581,7 @@ app.whenReady().then(async () => {
   if (fatal) console.log(fatal.stack);
   writeReport(summary);
   try {
-    fs.rmSync(dir, { recursive: true, force: true });
+    releaseTempDir(dir);
   } catch (_) {
     /* temp dir cleanup is best-effort */
   }

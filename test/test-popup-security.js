@@ -14,7 +14,7 @@ const { app, BrowserWindow, ipcMain, session } = require("electron");
 const fs = require("fs");
 const os = require("os");
 const path = require("path");
-const { startErrorSentinel, captureScreenshot, trapExternalOpens } = require("./test-visual-utils");
+const { startErrorSentinel, captureScreenshot, trapExternalOpens, tempDir, releaseTempDir } = require("./test-visual-utils");
 
 // One watcher per popup window, collected as they are opened and drained at the
 // end of the run. Keyed by window id so a section that deliberately provokes an
@@ -154,9 +154,50 @@ async function popupEval(popup, expr) {
   }
 }
 
+// FAIL CLOSED. This used to map an eval failure to `null` - the SAME value as
+// "the payload did not run" - so a destroyed window, a failed load or a
+// detached webContents PASSED every `__pwned` check in this file. Every one of
+// those checks is a negative (`pwned(...) === null`), so the fail-open value
+// was indistinguishable from the finding they exist to detect. Returning a
+// non-null sentinel makes "could not look" fail, and carries the reason so the
+// failure names itself instead of reading as a silent absence.
 async function pwned(popup) {
   const v = await popupEval(popup, "window.__pwned || null");
-  return v && v.__evalError ? null : v;
+  if (v && v.__evalError) return `__pwned unreadable: ${v.__evalError}`;
+  return v;
+}
+
+// POSITIVE CONTROL for a `pwned(...) === null` assertion. An absence check
+// fails open, and nothing here proved the read channel was even observable: if
+// executeJavaScript silently stopped returning window globals, the negatives
+// would pass while measuring nothing at all.
+//
+// SCOPE, measured rather than claimed: this used to say "every `pwned(...)`
+// assertion in this file". It is not - the control runs once per popup it is
+// called on, and window globals do not survive a new BrowserWindow. Call it in
+// each popup that carries a pwned negative; the two table popups do.
+//
+// Two readings, because the negatives depend on the reader DISTINGUISHING two
+// states, not merely on it returning something: a global that IS set must come
+// back with its value, and one that is NOT set must come back null.
+//
+// Deliberately reads a DIFFERENT property from the real checks. Writing
+// window.__pwned here would overwrite a genuine hit and mask the exact finding
+// these assertions exist for; what needs proving is "a global set inside the
+// popup is readable from this process", and the property name is not the part
+// that can break.
+//
+// This does NOT prove the CSP refused anything. executeJavaScript runs in the
+// main world and bypasses page CSP, so using it to show a script was blocked
+// would be circular. It proves observability - the conjunct the negatives
+// silently assume.
+async function pwnedChannelLive(popup) {
+  const marker = "control-" + Date.now();
+  await popupEval(popup, `window.__pwnedControl = ${JSON.stringify(marker)};`);
+  const set = await popupEval(popup, "window.__pwnedControl || null");
+  const unset = await popupEval(popup, "window.__pwnedNeverSet || null");
+  await popupEval(popup, "delete window.__pwnedControl;");
+  return { set, unset, ok: set === marker && unset === null };
 }
 
 function prefsOf(popup) {
@@ -482,7 +523,15 @@ async function run() {
     {
       tableData: {
         data: [{ a: "</script><script>window.__pwned='table'</script>" }],
-        columns: [{ title: "A", field: "a" }],
+        // formatter: "html" ON PURPOSE. The boundary's allow-list drops it, and
+        // without it here nothing in the suite measured that. formatters.html
+        // is literally `function(e,t,i){return e.getValue()}` - it returns the
+        // cell value RAW and resolves with no console warning - so if
+        // `formatter` ever reached Tabulator again, this cell's payload would
+        // be written as markup, the </script> would terminate the popup's
+        // script element and the injectedScripts oracle below would fail. It
+        // costs nothing while the allow-list holds.
+        columns: [{ title: "A", field: "a", formatter: "html" }],
       },
       isDarkMode: false,
     },
@@ -492,6 +541,16 @@ async function run() {
     check(
       "SEC-06 table popup opens for hostile cell content",
       true,
+    );
+    // Run the channel control on THIS popup. window globals do not survive a
+    // new BrowserWindow, so a control run elsewhere says nothing here - the
+    // earlier negatives at the top of this suite are on different windows and
+    // are covered by their own sibling conjuncts, not by this.
+    const chan = await pwnedChannelLive(popup);
+    check(
+      "SEC-06 the __pwned read channel is observable, so its absence checks mean something",
+      chan.ok === true,
+      JSON.stringify(chan),
     );
     // Two independent controls are in play here, so assert both. The CSP alone
     // stops the injected <script> from running - but the cell can still
@@ -532,6 +591,406 @@ async function run() {
     );
   } else {
     check("SEC-06 table popup opens for hostile cell content", false, "no window");
+  }
+  await closeAll();
+
+  // ==========================================================================
+  // SEC-31 hostile column TITLES in the table popup. SEC-06 above covers cell
+  // DATA, and cells are safe for a reason that does not extend to titles:
+  // Tabulator's Format module defaults an unset `formatter` to `plaintext`
+  // (lookupTypeFormatter -> lookupFormatter, `default:` branch), which runs the
+  // value through sanitizeHTML. An unset `titleFormatter` takes a different
+  // path - formatHeader returns the title UNCHANGED, and
+  // _formatColumnHeaderTitle's `default:` branch does `el.innerHTML = contents`.
+  // So cells default to escaped and titles default to RAW, from the same
+  // document-controlled markdown. Verified by reading the vendored bundle
+  // itself - libs/tabulator/tabulator.min.js, banner "Tabulator v6.5.2",
+  // 445,987 bytes - at the byte offsets named beside each claim below. It is
+  // the MINIFIED build, so it is not comparable to the tarball's unminified
+  // dist/js/tabulator.js; the corresponding upstream artifact is
+  // dist/js/tabulator.min.js, and tabulator-tables is not in node_modules, so
+  // the vendored bytes are the only in-tree source of truth.
+  //
+  // The CSP is a real but PARTIAL mitigation, which is why this block asserts
+  // three separate things rather than only "nothing executed":
+  //   - script: `script-src 'nonce-...'` refuses the injected <img onerror>,
+  //     so `pwned` stays null with or without the fix. That conjunct is a
+  //     control, not the finding.
+  //   - markup: an element built from the title is not stopped by any
+  //     directive. `titleElements` is the conjunct only the fix satisfies.
+  //   - CSS: `style-src 'unsafe-inline'` means an injected <style> APPLIES.
+  //     The outline probe is a live, CSP-unmitigated consequence, and it is
+  //     deliberately non-destructive so a failure reports one named cause
+  //     rather than collapsing the whole document and taking the feature
+  //     control down with it.
+  //
+  // The payload is driven through the real IPC channel with a synthetic
+  // tableData on purpose: `open-table-popup` is the trust boundary, and it
+  // already treats this payload as hostile (toJsonLiteral). Escaping in the
+  // renderer's extractTableData() instead would fix one producer and leave the
+  // boundary trusting its input - and it would also put &lt; into the popup's
+  // own CSV/JSON export, which reads the column title verbatim.
+  // ==========================================================================
+  // THE FIXTURE IS WIDE, AND THAT IS LOAD-BEARING. `columnDefaults` guards the
+  // rendered HEADER, but `definition.title` has more than one reader in 6.5.2
+  // and the others only become reachable once columns are hidden or hovered:
+  //   - responsiveLayout: "collapse" (set by this popup) builds a panel from
+  //     the RAW definition - generateCollapsedRowData pushes
+  //     `title: o.definition.title`, then formatCollapsedData runs
+  //     `r.innerHTML = t || e.title`. No title formatter is consulted at all.
+  //   - headerTooltip: true resurrects the raw title through loadTooltip's
+  //     `s.innerHTML = i`, with the attacker supplying no markup beyond the
+  //     title itself. A BOOLEAN is enough, so no amount of value-scrubbing can
+  //     close it - only refusing the key can.
+  //   - a per-column titleFormatter WINS over columnDefaults: mapDefinitions
+  //     fills only keys left `undefined`, and formatHeader tests truthiness.
+  //     Measured in the bundle: formatters.html is `return e.getValue()`, i.e.
+  //     raw, and it resolves without a console warning.
+  // The one-column fixture this block started with could not reach any of
+  // them, which is the whole reason they survived a review that was looking
+  // directly at the title sink.
+  //
+  // 80 columns: measured at the shipped popup size (1400x900), collapse begins
+  // at 34 columns at DPR 1.25 and around 42 at DPR 1.0. The count sits far
+  // above both, because a fixture whose trigger depends on display scaling
+  // gives intermittent verdicts and a revert record cannot be anchored to one.
+  // Hostile titles sit at BOTH ends deliberately: the leading columns stay
+  // visible (header, formatter-override and tooltip sinks) and the trailing
+  // one is hidden (collapse-panel sink).
+  const SEC31_TITLE =
+    'Name<img src="x" onerror="window.__pwned=\'title\'">' +
+    "<style>#data-table{outline:7px solid rgb(1,2,3)}</style>";
+  const SEC31_COLS = 80;
+  const sec31Columns = [
+    { title: SEC31_TITLE, field: "col0" },
+    { title: SEC31_TITLE, field: "col1", titleFormatter: "html" },
+    { title: SEC31_TITLE, field: "col2", headerTooltip: true },
+  ];
+  for (let i = sec31Columns.length; i < SEC31_COLS - 1; i++) {
+    sec31Columns.push({ title: "C" + i, field: "col" + i });
+  }
+  sec31Columns.push({ title: SEC31_TITLE, field: "col" + (SEC31_COLS - 1) });
+  const sec31Row = {};
+  for (let i = 0; i < SEC31_COLS; i++) sec31Row["col" + i] = "cell" + i;
+  popup = await openPopup(
+    "open-table-popup",
+    {
+      tableData: { data: [sec31Row], columns: sec31Columns },
+      isDarkMode: false,
+    },
+    2200,
+  );
+  if (popup) {
+    check("SEC-31 table popup opens for a hostile column title", true);
+    const title = await popupEval(
+      popup,
+      `(() => {
+         const holder = document.querySelector('.tabulator-col-title');
+         const host = document.getElementById('data-table');
+         const read = () => {
+           const cs = getComputedStyle(host);
+           return { w: cs.outlineWidth, c: cs.outlineColor };
+         };
+         const hostile = host ? read() : null;
+         // Positive control. The table popup's CSP is
+         // style-src 'unsafe-inline', so an injected <style> that really
+         // reaches the document DOES apply - which is the whole reason the
+         // hostile reading above is meaningful. Prove that here rather than
+         // assuming it: without this, "the payload's colour is absent" would
+         // also be satisfied by a probe that cannot observe an outline at all,
+         // by a missing #data-table, or by a CSP that silently refused every
+         // style. Deliberately a DIFFERENT colour from the payload so the two
+         // readings can never be confused with one another.
+         //
+         // Appended to BODY, not HEAD, and that is load-bearing. Both this rule
+         // and a hostile one are '#data-table', i.e. identical specificity, so
+         // DOCUMENT ORDER decides - and the payload's <style> lives inside the
+         // column title, in the body, after the head. A head-appended control
+         // is therefore OUTRANKED by the very injection it exists to detect,
+         // which makes the assertion fail on BOTH conjuncts at once and turns
+         // its verdict into a disjunction: "the payload applied" and "the
+         // control could not be observed" become indistinguishable. Measured
+         // under R503 before this was changed - the control read rgb(1, 2, 3),
+         // the payload's own colour. Appending last makes the control win
+         // whenever the channel works at all, so exactly one conjunct can fail
+         // and the failure names the finding.
+         let control = null;
+         if (host) {
+           const s = document.createElement('style');
+           // !important, and that is not belt-and-braces. Document order only
+           // decides between rules of EQUAL priority: a payload written as
+           // '#data-table{outline:...!important}' would outrank a later plain
+           // rule and collapse this control back into the disjunction the
+           // paragraph above says it fixes. A later !important beats an
+           // earlier one, so appending last AND raising priority makes the
+           // control win unconditionally, for any payload.
+           s.textContent = '#data-table{outline:7px solid rgb(9,8,7) !important}';
+           document.body.appendChild(s);
+           control = read();
+           s.remove();
+         }
+         return {
+           found: !!holder,
+           titleElements: holder ? holder.querySelectorAll('*').length : -1,
+           titleText: holder ? holder.textContent : null,
+           hostileOutline: hostile,
+           controlOutline: control,
+           rows: document.querySelectorAll('.tabulator-row').length,
+           tabulatorLoaded: typeof window.Tabulator !== 'undefined',
+         };
+       })()`,
+    );
+    // Non-vacuity: without `found` and `titleText`, a header that never
+    // rendered at all would satisfy "no element children" for the worst
+    // possible reason. The literal-text conjunct is what proves the markup was
+    // PAINTED AS TEXT rather than swallowed.
+    check(
+      "SEC-31 a hostile column title renders as text, not markup",
+      title &&
+        title.found === true &&
+        title.titleElements === 0 &&
+        typeof title.titleText === "string" &&
+        title.titleText.includes("<img") &&
+        title.titleText.includes("<style>"),
+      JSON.stringify(title),
+    );
+    // The oracle names the PAYLOAD's own colour rather than asserting a bare
+    // "0px". Measured: #data-table carries an unrelated resting outline
+    // (2.4px rgb(31,50,68) at DPR 1.25), so "no outline at all" was an
+    // assumption and a wrong one. The control conjunct is what stops the
+    // negative reading failing open.
+    check(
+      "SEC-31 a column title cannot inject CSS past style-src 'unsafe-inline'",
+      title &&
+        title.hostileOutline &&
+        title.hostileOutline.c !== "rgb(1, 2, 3)" &&
+        title.controlOutline &&
+        title.controlOutline.c === "rgb(9, 8, 7)",
+      JSON.stringify(title && {
+        hostile: title.hostileOutline,
+        control: title.controlOutline,
+      }),
+    );
+    const pwnedTitle = await pwned(popup);
+    // This popup's OWN channel control. The one in the SEC-06 block is on a
+    // different BrowserWindow and window globals do not cross windows, so
+    // without this the negative below is an absence failing open.
+    const titleChan = await pwnedChannelLive(popup);
+    check(
+      "SEC-31 the __pwned read channel is observable in the title popup too",
+      titleChan.ok === true,
+      JSON.stringify(titleChan),
+    );
+    check(
+      "SEC-31 the popup CSP still refuses an inline handler in a column title",
+      pwnedTitle === null,
+      JSON.stringify(pwnedTitle),
+    );
+    // ========================================================================
+    // THE DOCUMENT-WIDE SWEEP. Everything above reads
+    // `.tabulator-col-title` - and that selector is exactly why two further
+    // live title sinks sat undetected while this block was being written and
+    // reviewed. An oracle scoped to the one place a fix is known to work
+    // cannot report the places it does not. This sweep is deliberately
+    // scoped to the whole document instead, so the next sink is caught
+    // without anyone having to think of it first.
+    //
+    // Each needle has a MEASURED zero baseline rather than an assumed one:
+    //   - img/iframe/object/embed/link: the popup markup contains none.
+    //   - style: the only legitimate <style> is the inlined Tabulator CSS,
+    //     and it lives in <head>, so a body-scoped count starts at zero.
+    //   - script:not([nonce]): the one legitimate script carries the nonce.
+    //   - svg is counted INSIDE #data-table only, because the toolbar has
+    //     three legitimate inline <svg> icons in the body. Counting those as
+    //     injections would have made this assertion wrong by construction.
+    // ========================================================================
+    const sweep = await popupEval(
+      popup,
+      `(async () => {
+         const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+         // HOVER. The tooltip sink is only built on column-mousemove, and
+         // nothing in this suite has ever generated one - which is the sole
+         // reason loadTooltip's innerHTML went untested. tooltipDelay is
+         // Tabulator's default 300ms, so wait past it.
+         const cols = document.querySelectorAll('.tabulator-col');
+         const hoverTarget = cols[2] || null;
+         const hover = (el) => {
+           if (!el) return;
+           el.dispatchEvent(
+             new MouseEvent('mousemove', { bubbles: true, clientX: 20, clientY: 20 }),
+           );
+         };
+         hover(hoverTarget);
+         await sleep(600);
+         const tip = document.querySelector('.tabulator-tooltip');
+         // MEASURED: Tooltip.initializeColumn is
+         //   e.definition.headerTooltip && !this.headerSubscriber && (subscribe
+         //   "column-mousemove" ...)
+         // so with headerTooltip dropped by the allow-list the mousemove
+         // subscriber is NEVER created and "no tooltip appeared" is a
+         // structural certainty, not a measurement. On its own that is an
+         // absence failing open: it would read identically if the hover
+         // dispatch were wrong, the class were renamed, or the wait were short.
+         //
+         // So force the sink LIVE and prove the escaping holds there too.
+         // updateDefinition merges into the existing definition and re-runs
+         // column-init, which is what re-arms the subscriber. This is the only
+         // place loadTooltip's innerHTML assignment of definition.title is
+         // ever exercised.
+         let forcedTipFound = false;
+         let forcedTipElements = -1;
+         let forcedTipText = '';
+         let forcedOk = false;
+         try {
+           // The identifier "table" is a top-level const in the popup's classic
+           // script, so it lives in the global LEXICAL environment and is NOT a
+           // property of window. Reach it as a bare identifier, guarded by
+           // typeof so a rename surfaces as forcedOk:false rather than a thrown
+           // sweep.
+           const tbl = typeof table !== 'undefined' ? table : null;
+           const col2 = tbl && tbl.getColumn('col2');
+           if (col2) {
+             await col2.updateDefinition({ headerTooltip: true });
+             forcedOk = true;
+             await sleep(100);
+             const again = tbl.getColumn('col2');
+             hover(again && again.getElement());
+             await sleep(700);
+             const ftip = document.querySelector('.tabulator-tooltip');
+             forcedTipFound = !!ftip;
+             forcedTipElements = ftip ? ftip.querySelectorAll('*').length : -1;
+             forcedTipText = ftip ? ftip.textContent : '';
+           }
+         } catch (e) {
+           forcedOk = false;
+         }
+         const panel = document.querySelector('.tabulator-responsive-collapse');
+         const host = document.getElementById('data-table');
+         const countHandlerAttrs = () =>
+           Array.prototype.filter.call(document.querySelectorAll('*'), (el) =>
+             el.getAttributeNames().some((a) => a.slice(0, 2) === 'on'),
+           ).length;
+         const handlerProbe = document.createElement('b');
+         handlerProbe.setAttribute('onerror', 'void 0');
+         document.body.appendChild(handlerProbe);
+         const probedHandlerAttrs = countHandlerAttrs();
+         handlerProbe.remove();
+         return {
+           visibleCols: cols.length,
+           // Proves the collapse panel is actually POPULATED. Without this the
+           // "no injected elements in the panel" reading would be satisfied by
+           // a panel that never had any columns to show.
+           panelStrongs: panel ? panel.querySelectorAll('strong').length : -1,
+           // Every element descendant of every collapse-panel <strong>. The
+           // tag-name needle list below is a fixed set; this is not, so a
+           // payload built from <b>, <a>, <div> or <table> is still counted.
+           panelTitleElements: panel
+             ? Array.prototype.reduce.call(
+                 panel.querySelectorAll('strong'),
+                 (n, s) => n + s.querySelectorAll('*').length,
+                 0,
+               )
+             : -1,
+           panelText: panel ? panel.textContent : '',
+           tipFound: !!tip,
+           tipElements: tip ? tip.querySelectorAll('*').length : -1,
+           forcedOk: forcedOk,
+           forcedTipFound: forcedTipFound,
+           forcedTipElements: forcedTipElements,
+           forcedTipHasRawText: forcedTipText.indexOf('<img') !== -1,
+           bodyInjected: document.body.querySelectorAll(
+             'img,style,iframe,object,embed,link,script:not([nonce])',
+           ).length,
+           tableSvgs: host ? host.querySelectorAll('svg').length : -1,
+           // MEASURED ORACLE CORRECTION. This was
+           // document.body.innerHTML.includes('onerror='), which cannot tell
+           // an ATTRIBUTE from TEXT: once the title is escaped it renders as a
+           // text node, and serialising that node back through innerHTML
+           // re-emits the literal characters onerror= - so the FIXED tree
+           // failed its own test (bodyInjected 0, tableSvgs 0, onerror true).
+           // Attributes are now asked for structurally, which text cannot
+           // satisfy. handlerProbed is the positive control: an absence check
+           // fails open, so the detector is required to detect a planted
+           // handler in the same sweep that reports none in the product.
+           handlerAttrs: countHandlerAttrs(),
+           handlerProbed: probedHandlerAttrs,
+         };
+       })()`,
+    );
+    // Non-vacuity for the whole sweep. `panelStrongs` is the exact count of
+    // columns the responsive layout hid AND rendered into the collapse panel,
+    // so a value between zero and the column count proves both that collapse
+    // fired and that it did not swallow everything - the preconditions without
+    // which the injection readings below would be absences for the wrong
+    // reason.
+    //
+    // MEASURED CORRECTION: `.tabulator-col` is NOT a count of visible columns.
+    // A hidden column keeps its header element in the DOM and is merely
+    // display:none, so that selector returned all 80 with 47 hidden. It is
+    // kept as evidence only; asserting on it was an oracle bug, not a finding.
+    check(
+      "SEC-31 the wide fixture really does collapse columns into a panel",
+      sweep && sweep.panelStrongs > 0 && sweep.panelStrongs < SEC31_COLS,
+      JSON.stringify(sweep && {
+        panelStrongs: sweep.panelStrongs,
+        of: SEC31_COLS,
+        colElements: sweep.visibleCols,
+      }),
+    );
+    check(
+      "SEC-31 no hostile column title builds an element ANYWHERE in the popup",
+      sweep &&
+        sweep.bodyInjected === 0 &&
+        sweep.tableSvgs === 0 &&
+        sweep.panelTitleElements === 0 &&
+        sweep.handlerAttrs === 0 &&
+        sweep.handlerProbed === 1,
+      JSON.stringify(sweep && {
+        bodyInjected: sweep.bodyInjected,
+        tableSvgs: sweep.tableSvgs,
+        panelTitleElements: sweep.panelTitleElements,
+        handlerAttrs: sweep.handlerAttrs,
+        handlerProbed: sweep.handlerProbed,
+      }),
+    );
+    // The paint-as-text conjunct for the collapse panel. The counts above are
+    // absences; this is the positive reading that the hostile title arrived
+    // there and was rendered as CHARACTERS.
+    check(
+      "SEC-31 the collapse panel paints the hostile title as text",
+      sweep && sweep.panelText.indexOf("<img") !== -1,
+      JSON.stringify(sweep && { panelTextHasRaw: sweep.panelText.indexOf("<img") !== -1 }),
+    );
+    // Split from the old single assertion, which was a disjunction: it passed
+    // if EITHER no tooltip existed OR a tooltip existed with no elements, and
+    // post-fix the first leg is a structural certainty. Leg 1 is the
+    // allow-list; leg 2 is the escaping.
+    check(
+      "SEC-31 the allow-list drops headerTooltip, so no tooltip is wired at all",
+      sweep && sweep.tipFound === false,
+      JSON.stringify(sweep && { tipFound: sweep.tipFound, tipElements: sweep.tipElements }),
+    );
+    check(
+      "SEC-31 even a FORCED tooltip renders the column title as text, not markup",
+      sweep &&
+        sweep.forcedOk === true &&
+        sweep.forcedTipFound === true &&
+        sweep.forcedTipElements === 0 &&
+        sweep.forcedTipHasRawText === true,
+      JSON.stringify(sweep && {
+        forcedOk: sweep.forcedOk,
+        forcedTipFound: sweep.forcedTipFound,
+        forcedTipElements: sweep.forcedTipElements,
+        forcedTipHasRawText: sweep.forcedTipHasRawText,
+      }),
+    );
+    check(
+      "FEATURE table popup still builds the table under a hostile title",
+      title && title.tabulatorLoaded === true && title.rows > 0,
+      JSON.stringify(title && { rows: title.rows, t: title.tabulatorLoaded }),
+    );
+  } else {
+    check("SEC-31 table popup opens for a hostile column title", false, "no window");
   }
   await closeAll();
 
@@ -769,7 +1228,15 @@ async function run() {
       tableData: {
         data: [{ a: "1", b: "x" }],
         columns: [
-          { title: "A", field: "a" },
+          // Special characters ON PURPOSE. titleDownload is the entire
+          // justification for storing HTML-ESCAPED text in `title`: the claim
+          // is that processColumnGroup prefers definition.titleDownload, so
+          // exports keep the document's original characters while every
+          // RENDERED copy stays inert. With plain "A"/"B" titles that claim was
+          // untested - a misspelled key, an unregistered option, or an upstream
+          // change to colVisPropAttach would put &amp;/&lt; into every export
+          // and the whole suite would still pass.
+          { title: 'R&D <x> "q"', field: "a" },
           { title: "B", field: "b" },
         ],
       },
@@ -779,9 +1246,31 @@ async function run() {
   );
   if (popup) {
     const started = [];
+    const finished = [];
+    const dlDir = tempDir("mdv-dl-");
     const onWillDownload = (_e, item) => {
       started.push(item.getFilename());
-      item.cancel();
+      // Completed to a temp path rather than cancelled. Cancelling made these
+      // two assertions pass on a tree where SEC-30's will-download guard denied
+      // the export outright: will-download still FIRES for a denied download -
+      // that is the point at which it is denied - so the filename was still
+      // readable and "the export starts" was true of a broken build. Running it
+      // to 'completed' is the only thing that distinguishes allowed from
+      // denied, and the export is a few bytes of CSV/JSON to a temp dir.
+      try {
+        item.setSavePath(path.join(dlDir, item.getFilename()));
+      } catch (e) {
+        // Already cancelled by the app's guard - 'done' still reports below.
+      }
+      item.once("done", (_ev, state) => {
+        let text = null;
+        try {
+          text = fs.readFileSync(path.join(dlDir, item.getFilename()), "utf8");
+        } catch (e) {
+          // Denied or cancelled - `state` below reports it.
+        }
+        finished.push({ name: item.getFilename(), state, text });
+      });
     };
     popup.webContents.session.on("will-download", onWillDownload);
 
@@ -792,6 +1281,33 @@ async function run() {
       started.some((n) => /\.csv$/i.test(n)),
       JSON.stringify(started),
     );
+    check(
+      "FEATURE table popup CSV export completes, so SEC-30's guard admits it",
+      finished.some((f) => /\.csv$/i.test(f.name) && f.state === "completed"),
+      JSON.stringify(finished.map((f) => ({ name: f.name, state: f.state }))),
+    );
+    // The titleDownload premise, measured rather than assumed. `title` holds
+    // HTML-ESCAPED text so that every innerHTML reader in Tabulator is inert;
+    // the ONLY thing that keeps exports faithful to the document is that
+    // processColumnGroup prefers definition.titleDownload. If that preference
+    // ever stops holding, this is the assertion that says so - the export
+    // would carry "R&amp;D &lt;x&gt;" instead of the original characters.
+    //
+    // The expected cell is MEASURED from the bundle's own CSV writer, not
+    // guessed: header cells are emitted as
+    //   '"' + String(value).split('"').join('""') + '"'
+    // so the doubled inner quotes below are CSV quoting, not escaping.
+    const csv = finished.find((f) => /\.csv$/i.test(f.name) && f.text);
+    check(
+      "SEC-31 the CSV export carries the RAW column title, not the escaped one",
+      !!csv &&
+        csv.text.includes('"R&D <x> ""q"""') &&
+        !csv.text.includes("&amp;") &&
+        !csv.text.includes("&lt;"),
+      JSON.stringify({
+        header: csv ? csv.text.split(/\r?\n/)[0] : null,
+      }),
+    );
 
     await popupEval(popup, `(() => { exportJSON(); return 1; })()`);
     await new Promise((r) => setTimeout(r, 1500));
@@ -799,6 +1315,11 @@ async function run() {
       "FEATURE table popup JSON export still starts a download under CSP",
       started.some((n) => /\.json$/i.test(n)),
       JSON.stringify(started),
+    );
+    check(
+      "FEATURE table popup JSON export completes, so SEC-30's guard admits it",
+      finished.some((f) => /\.json$/i.test(f.name) && f.state === "completed"),
+      JSON.stringify(finished),
     );
 
     popup.webContents.session.removeListener("will-download", onWillDownload);
@@ -985,7 +1506,7 @@ async function run() {
   );
   // A pre-existing path must be refused rather than written through, which is
   // what makes the symlink swap fail instead of succeeding quietly.
-  const squatDir = fs.mkdtempSync(path.join(tmpRoot, "mdv-squat-"));
+  const squatDir = tempDir("mdv-squat-");
   const squatFile = path.join(squatDir, "taken.html");
   fs.writeFileSync(squatFile, "original", "utf8");
   let squatRefused = false;
@@ -999,7 +1520,7 @@ async function run() {
     squatRefused === true && fs.readFileSync(squatFile, "utf8") === "original",
     JSON.stringify({ squatRefused, content: fs.readFileSync(squatFile, "utf8") }),
   );
-  fs.rmSync(squatDir, { recursive: true, force: true });
+  releaseTempDir(squatDir);
 
   // Closing one must not disturb the other, and must take its own directory
   // with it rather than leaking one per popup.
@@ -1252,6 +1773,50 @@ async function run() {
     );
   }
   await closeAll();
+
+  // ==========================================================================
+  // SEC-30 - the download policy in the main process
+  //
+  // A download is not a navigation, so the will-navigate / will-redirect /
+  // will-frame-navigate / setWindowOpenHandler denies asserted above cannot see
+  // one, and CSP has no directive that governs it. main.js therefore denies at
+  // will-download on the default session, which is the complete surface: the
+  // app creates no partitions and passes no custom session to any of its four
+  // BrowserWindow sites.
+  //
+  // Two separate claims, because either alone fails open. The predicate proves
+  // the RULE is right; a listener that exists with an inverted or deleted rule
+  // would still satisfy the wiring check. The wiring check proves the rule is
+  // actually CONNECTED; a correct predicate nothing calls protects nothing.
+  const { isDownloadAllowed } = require("../src/main.js");
+  const dlPolicy = {
+    blob: isDownloadAllowed("blob:file:///6ebb68e1-51ec-4e8b-9572-116dea3fdbf9"),
+    http: isDownloadAllowed("http://127.0.0.1:1/x"),
+    https: isDownloadAllowed("https://probe.invalid/x"),
+    file: isDownloadAllowed("file:///C:/Windows/System32/drivers/etc/hosts"),
+    data: isDownloadAllowed("data:text/plain,x"),
+    // Substring-not-prefix would let a remote URL carrying the token through.
+    sneaky: isDownloadAllowed("https://probe.invalid/blob:file:///x"),
+    nonString: isDownloadAllowed(undefined),
+  };
+  check(
+    "SEC-30 the download policy admits the app's blob: exports and nothing else",
+    dlPolicy.blob === true &&
+      dlPolicy.http === false &&
+      dlPolicy.https === false &&
+      dlPolicy.file === false &&
+      dlPolicy.data === false &&
+      dlPolicy.sneaky === false &&
+      dlPolicy.nonString === false,
+    JSON.stringify(dlPolicy),
+  );
+  check(
+    "SEC-30 the download policy is wired to the default session",
+    session.defaultSession.listenerCount("will-download") > 0,
+    JSON.stringify({
+      listeners: session.defaultSession.listenerCount("will-download"),
+    }),
+  );
 
   // Every popup this suite opened was watched for console errors and for
   // errors that only ever appear on screen. The count assertion is what keeps

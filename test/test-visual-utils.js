@@ -29,6 +29,7 @@
  */
 
 const fs = require("fs");
+const os = require("os");
 const path = require("path");
 
 // Must come before any window exists: this relocates the suite's userData off
@@ -1051,10 +1052,180 @@ async function waitForExternalTrap(win, timeoutMs = 5000) {
   }
 }
 
+// ---------------------------------------------------------------------------
+// Temp directories that are removed however the suite ends.
+//
+// THE DEFECT THIS FIXES IS NOT "the suites are untidy". Every suite except
+// test-popup-security's download probe already called fs.rmSync on its temp
+// dir - but on the NORMAL COMPLETION PATH ONLY. Read test-tab-refresh.js's
+// tail: the rmSync sits between the summary line and the final app.exit, so
+// the 180s watchdog's app.exit(1), the "no BrowserWindow was created" bail and
+// any throw that escapes all skip it. The runs that leak are therefore exactly
+// the runs that already went wrong, which is the worst possible correlation:
+// a timeout leaves debris, and the debris makes the next run worse.
+//
+// MEASURED on this machine before writing any of this - stale dirs by prefix:
+//   mdv-dl-   34   test-popup-security.js:1250, never cleaned at all
+//   mdv-e2e-  13   test-tab-refresh.js:25, cleaned only on the happy path
+//   mdv-sec- / mdv-search- / mdv-patch- / mdv-mermaid-   ZERO
+// The zeros are the control: those four suites had been ending normally, so
+// their existing cleanup ran. Same code shape, different outcome, and the
+// difference is entirely which exit path was taken.
+//
+// A LEAKED TEMP DIR IS NOT INERT, which is what makes this worth structural
+// work rather than a manual sweep. The hermeticity investigation found 43
+// orphaned mdv-e2e-* dirs of which exactly ONE still held guard-big.md - the
+// 260 KB fixture that, once persisted into the then-shared Electron session,
+// raised a main-process modal on startup and blocked EVERY subsequent suite
+// behind a dialog no in-process watchdog could clear.
+//
+// WHY process.on("exit") IS THE RIGHT HOOK, and it was measured rather than
+// assumed - the concern is real, because app.exit() is documented to terminate
+// immediately and does NOT emit will-quit or quit:
+//   probe A (npx electron): app.exit(0) after whenReady
+//                           -> seen: ["process:exit"]   will-quit/quit ABSENT
+//   probe B: three nested dirs (subdirs + a 64 KB file) removed with a
+//            recursive rmSync inside that same handler
+//                           -> removed 3, failed [], goneAfter [t,t,t],
+//                              0 stragglers left on disk
+//   probe C: a try/finally wrapped directly around that same app.exit(0)
+//                           -> seen: ["process:exit"] ONLY - neither the
+//                              statement after app.exit() nor the `finally`
+//                              block ran at all
+// So the handler runs and a recursive removal COMPLETES inside it, which is
+// the claim that actually matters - a half-executed sweep during teardown
+// would look identical from the outside.
+//
+// PROBE C IS WHY THIS REGISTRY EXISTS AT ALL, and it is what splits the two
+// tiers of suite. app.exit() terminates mid-stack and unwinds nothing, so a
+// try/finally CANNOT clean up an Electron suite - which is exactly the shape
+// of the leak: the rmSync sits on the normal-completion path and is skipped by
+// the watchdog app.exit(1), the no-window bail and any escaping throw. The
+// plain-node suites have the opposite property (no app, so `finally` always
+// runs) and already use it: test-packaging.js cleans all three of its temp
+// dirs in finally blocks, and its prefixes measure ZERO stale dirs against
+// mdv-dl-'s 34. They are deliberately NOT wired into this registry - their own
+// tier's idiom is proven to work and importing an Electron harness seam into a
+// plain-node suite would buy nothing.
+//
+// RESIDUAL, stated rather than implied: a SIGKILL or a killed console still
+// leaks, because no in-process hook can survive that. That is strictly better
+// than today and is why the removal is also idempotent - a stale dir from a
+// killed run is simply removed by force on a later sweep.
+const REGISTERED_TEMP_DIRS = new Set();
+
+/**
+ * Create a temp directory that is removed when this process exits, whatever
+ * exit path it takes. Drop-in for fs.mkdtempSync(path.join(os.tmpdir(), p)).
+ */
+function tempDir(prefix) {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), prefix));
+  REGISTERED_TEMP_DIRS.add(dir);
+  return dir;
+}
+
+/**
+ * Remove a registered temp dir early. Suites that already clean up on their
+ * happy path keep doing so - removing debris sooner is strictly better - and
+ * this de-registers it so the exit sweep does not report work it did not do.
+ */
+function releaseTempDir(dir) {
+  REGISTERED_TEMP_DIRS.delete(dir);
+  try {
+    fs.rmSync(dir, { recursive: true, force: true });
+  } catch (e) {
+    /* a later sweep or a manual clean will get it */
+  }
+}
+
+// Reported so the sweep is observable rather than a silent side effect: an
+// assertion that "no temp dirs remain" is an ABSENCE check and fails open, so
+// the selfcheck needs a positive signal that the sweep actually ran and how
+// much it removed.
+const TEMP_SWEEP = { swept: 0, failed: [], ran: false };
+
+function sweepTempDirs() {
+  TEMP_SWEEP.ran = true;
+  for (const dir of REGISTERED_TEMP_DIRS) {
+    try {
+      fs.rmSync(dir, { recursive: true, force: true });
+      TEMP_SWEEP.swept++;
+    } catch (e) {
+      // Never throw from an exit handler: under Electron an uncaught
+      // exception becomes a modal dialog, i.e. the exact hang the EPIPE guard
+      // above exists to prevent, and it would arrive after the summary line
+      // where nobody would connect it to cleanup.
+      TEMP_SWEEP.failed.push(dir + ": " + (e && e.code ? e.code : e));
+    }
+  }
+  REGISTERED_TEMP_DIRS.clear();
+}
+
+process.on("exit", sweepTempDirs);
+
+// AND THE HOOK ALONE DOES NOT COVER THE PATH THAT MATTERS MOST. Probe A above
+// was recorded as proving "app.exit() runs process.on('exit')". That is only
+// CONDITIONALLY true, and probe A hid the condition by reaching app.exit from
+// a setTimeout. Re-measured, five contexts, all inside whenReady().then(...):
+//   app.exit(0) called synchronously in the then callback  handler DID NOT run
+//   queueMicrotask(() => app.exit(0))                      handler DID NOT run
+//   Promise.resolve().then(() => app.exit(0))              handler DID NOT run
+//   setImmediate(() => app.exit(0))                        handler ran
+//   setTimeout(() => app.exit(0), 0)                       handler ran
+// and four realistic suite shapes:
+//   await Promise.resolve(); app.exit(0)                   handler DID NOT run
+//   await sleep(0) / await sleep(50); app.exit(0)          handler ran
+//   new BrowserWindow(); await win.loadURL(u); app.exit(0) handler ran
+// Repeated 5x per shape with the full child payload: the microtask exit wrote
+// its report 0/5 times, the setImmediate exit 5/5.
+//
+// THE AXIS IS WHETHER app.exit() IS REACHED WHILE STILL INSIDE THE READY
+// EVENT'S OWN NATIVE DISPATCH - within the microtask checkpoint that drains at
+// the end of it. Any macrotask boundary (a timer, a window load, real IPC)
+// moves the call out of that dispatch and the handlers run normally. Every
+// windowed suite loads a window, so the hook does cover today's tails - but an
+// early bail-out ("no BrowserWindow was created") is exactly the shape that
+// exits inside that first dispatch, and it is also exactly the run that has
+// already gone wrong, which is the correlation this whole section exists for.
+//
+// So the sweep ALSO runs from app.exit itself, synchronously, before
+// delegating. That is deterministic whichever dispatch the call is reached
+// from, and process.on("exit") stays as the backstop for every other exit path
+// (a natural return, process.exit, plain-node use). app.on("will-quit") is NOT
+// an option: app.exit() does not emit it (probe A). The two are idempotent
+// together - sweepTempDirs clears the registry, so the second call finds
+// nothing and the counter cannot double-count.
+try {
+  const electron = require("electron");
+  const app = electron && typeof electron === "object" ? electron.app : null;
+  if (app && typeof app.exit === "function" && !app.__foliaTempSweepWrapped) {
+    const realExit = app.exit.bind(app);
+    app.exit = function (...args) {
+      try {
+        sweepTempDirs();
+      } catch (e) {
+        // Cleanup must never stop a suite from terminating, and a throw here
+        // would become a modal dialog - the hang the EPIPE guard exists for.
+      }
+      return realExit(...args);
+    };
+    app.__foliaTempSweepWrapped = true;
+  }
+} catch {
+  // Required from plain Node - that tier is covered by the hook above.
+}
+
 module.exports = {
   VISUAL_PROBE_SOURCE,
   inspectVisual,
   captureScreenshot,
+  tempDir,
+  releaseTempDir,
+  // Exported for the selfcheck: see TEMP_SWEEP above - the natural assertion
+  // here is an absence, so the sweep has to be able to report that it ran.
+  TEMP_SWEEP,
+  sweepTempDirs,
+  REGISTERED_TEMP_DIRS,
   startErrorSentinel,
   trapExternalOpens,
   readExternalOpens,

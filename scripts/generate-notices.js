@@ -108,9 +108,12 @@ function authorOf(pj) {
 
 // The version a vendored file reports about itself is better evidence than a
 // number written down beside it, which can only ever drift. Tabulator's bundle
-// opens with `/* Tabulator v6.2.5 (c) Oliver Folkerd 2024 */`, so the version
-// is read back out of the artifact that actually ships. If that banner ever
-// stops matching, this throws rather than quietly reporting a stale version.
+// opens with a banner of the form `/* Tabulator v<x.y.z> (c) Oliver Folkerd
+// <year> */`, so the version is read back out of the artifact that actually
+// ships - deliberately not quoted with a version here, because a comment
+// naming one is the very drift this function exists to avoid. If that banner
+// ever stops matching, this throws rather than quietly reporting a stale
+// version.
 function vendoredTabulatorVersion() {
   const file = path.join(ROOT, "libs", "tabulator", "tabulator.min.js");
   const head = fs.readFileSync(file, "utf8").slice(0, 200);
@@ -663,7 +666,7 @@ function render(components) {
   lines.push("# Third-party notices");
   lines.push("");
   lines.push(
-    "Folia is distributed under the MIT licence (see `LICENSE`). It also " +
+    "Folia is distributed under the MIT licence (see `LICENSE.txt`). It also " +
       "redistributes the components listed below, each under its own terms.",
   );
   lines.push("");

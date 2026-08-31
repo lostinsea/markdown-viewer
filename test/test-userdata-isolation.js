@@ -86,7 +86,7 @@ try {
   electron = null;
 }
 
-// Under plain `node` (test-packaging.js, test-userdata-migration.js) requiring
+// Under plain `node` (test-packaging.js, test-dev-profile.js) requiring
 // "electron" yields the path to the binary, not the module. Those suites own no
 // profile, so there is nothing to isolate.
 const app = electron && typeof electron === "object" ? electron.app : null;

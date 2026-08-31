@@ -11,6 +11,29 @@ const { execFileSync } = require("child_process");
 const fs = require("fs");
 const path = require("path");
 
+// THIS FILE SELF-EXECUTES AT REQUIRE TIME, and that is a loaded gun pointed at
+// the working tree. There is no exported API and no main() to call: everything
+// below runs at module scope, which means a `require()` issued merely to
+// INTROSPECT the revert list immediately starts writing mutations into
+// src/renderer.js, src/main.js, src/styles.css and the test files.
+//
+// That is not hypothetical. It happened, the run was interrupted partway, and
+// R49's payload - `table-layout: auto -> fixed` in src/styles.css, the original
+// user-reported table bug - was left applied in the product tree and very
+// nearly committed. The grep that "verified" the cleanup afterwards checked
+// four remembered payload strings and so was narrower than the claim it was
+// supporting. `--anchors` found it in about a second.
+//
+// So refuse the import outright rather than trusting the next reader to
+// remember. To inspect the reverts, run `--anchors` (fast, read-only, proves
+// every `from` still resolves) or read the source; never require() it.
+if (require.main !== module) {
+  throw new Error(
+    "prove-table-fixes.js self-executes and APPLIES REVERTS to the working tree at require() time. " +
+      "Do not require() it. Run it (`node scripts/prove-table-fixes.js --anchors`) or read it instead.",
+  );
+}
+
 const ROOT = path.join(__dirname, "..");
 const SRC = path.join(ROOT, "src");
 const CSS = path.join(SRC, "styles.css");
@@ -20,6 +43,8 @@ const COLLAPSE = path.join(SRC, "custom-collapse.js");
 const MAIN = path.join(SRC, "main.js");
 const VISUAL = path.join(ROOT, "test", "test-visual-utils.js");
 const RELEASE = path.join(ROOT, "scripts", "release.js");
+const MERGE_SH = path.join(ROOT, "scripts", "post-upstream-merge.sh");
+const CI_YML = path.join(ROOT, ".github", "workflows", "ci.yml");
 const PKG = path.join(ROOT, "package.json");
 const NOTICES = path.join(ROOT, "THIRD-PARTY-NOTICES.md");
 const LICENSE_TXT = path.join(ROOT, "LICENSE.txt");
@@ -31,11 +56,27 @@ const CUSTOM_CSS = path.join(SRC, "custom-styles.css");
 const CENSUS = path.join(ROOT, "test", "theme-census.js");
 const GOLDEN = path.join(ROOT, "test", "fixtures", "theme-golden.json");
 const THEME_TEST = path.join(ROOT, "test", "test-theme.js");
+// The hardened comment stripper lives here now rather than being copied into
+// each suite that needs it. R384 anchors into it - see that record for why the
+// "improvement" it applies is measurably harmful.
+const SOURCE_UTILS = path.join(ROOT, "test", "test-source-utils.js");
 const TABLE_TEST = path.join(ROOT, "test", "test-table-display.js");
+const POPUPS = path.join(ROOT, "test", "test-popup-security.js");
+const MERMAID_TEST = path.join(ROOT, "test", "test-mermaid-render.js");
 const THEME_FIXTURE = path.join(ROOT, "test", "fixtures", "syntax-census.md");
 const THEME_JS = path.join(SRC, "custom-theme.js");
 const PKG_TEST = path.join(ROOT, "test", "test-packaging.js");
 const MERMAID_CFG = path.join(SRC, "mermaid-config.js");
+// The two vendoring OUTPUTS. Both are gitignored derived artifacts rather than
+// tracked source, which is exactly why they need reverts: nothing in git can
+// notice them drifting, so the only guard is the packaging suite's freshness
+// oracle, and the only proof that oracle works is to break each half here.
+// The harness restores from its own pre-run snapshot, not from git, so a
+// gitignored file is as recoverable as a tracked one.
+const VENDOR_MARKED = path.join(ROOT, "libs", "vendor", "marked.min.js");
+const TABULATOR_JS = path.join(ROOT, "libs", "tabulator", "tabulator.min.js");
+const VENDOR_VERSIONS = path.join(ROOT, "libs", "vendor", "VERSIONS.json");
+const BUILD_DOC = path.join(ROOT, "docs", "BUILD.md");
 
 const REVERTS = [
   {
@@ -1194,49 +1235,6 @@ const REVERTS = [
     mustPass: [/collects this version's files/],
   },
   {
-    // A plain recursive copy writes the destination incrementally, so an
-    // interruption leaves a TRUNCATED file; the next launch sees it exists,
-    // force:false skips it, and the sentinel blesses the corrupt profile
-    // permanently.
-    id: "R121",
-    suite: "test:migration",
-    what: "copy the legacy profile straight into the target instead of staging it",
-    file: MAIN,
-    from: "    moveTreeNoClobber(staging, target);",
-    to: "    fs.cpSync(legacy, target, { recursive: true, force: false, errorOnExist: false });",
-    expect: [/reaches the profile by an atomic rename/],
-  },
-  {
-    id: "R122",
-    suite: "test:migration",
-    what: "stage, but copy into place instead of renaming (truncation window returns)",
-    file: MAIN,
-    from: "      fs.renameSync(src, dst);",
-    to: "      fs.copyFileSync(src, dst);",
-    expect: [
-      /reaches the profile by an atomic rename/,
-      /non-atomic copy/,
-    ],
-  },
-  {
-    id: "R123",
-    suite: "test:migration",
-    what: "merge stale staging debris from a dead run into the profile",
-    file: MAIN,
-    from: "    fs.rmSync(staging, { recursive: true, force: true });\n    fs.cpSync(legacy, staging,",
-    to: "    fs.cpSync(legacy, staging,",
-    expect: [/wiped rather than merged/],
-  },
-  {
-    id: "R124",
-    suite: "test:migration",
-    what: "leave the staging area behind after a successful migration",
-    file: MAIN,
-    from: "    moveTreeNoClobber(staging, target);\n    fs.rmSync(staging, { recursive: true, force: true });",
-    to: "    moveTreeNoClobber(staging, target);",
-    expect: [/staging area does not survive/],
-  },
-  {
     // The user's report: with the table of contents open there was no way to
     // scroll the document. The scroller and its 16px gutter are unchanged -
     // the absolutely positioned drawer simply PAINTS over the scrollbar, which
@@ -1851,6 +1849,2728 @@ const REVERTS = [
     expect: [/every relative README link points at a file that ships beside it/],
   },
   {
+    id: "R447",
+    // SEC-28, the full render path. Restores the protect/restore dance
+    // that used to bracket sanitizeHtml(): data: image URIs were swapped
+    // for a fixed placeholder, sanitized, then put back with
+    // String.replace(<string>, uri) - which rewrites only the FIRST
+    // occurrence of a predictable literal. A document that plants a decoy
+    // copy of that literal in a code span consumes the restore with it and
+    // has its own unsanitized markup spliced into already-sanitized HTML.
+    //
+    // Deliberately one revert per render path: a single entry could not
+    // say which of the two went back to splicing.
+    what: "restore the data-URI protect/restore dance around the full path's sanitize",
+    file: RENDERER,
+    from:
+      "  // Pinned by \"FEATURE base64 data-image survives SAFE_FOR_XML ...\" in\n" +
+      "  // test/test-render-security.js.\n" +
+      "  html = sanitizeHtml(html);",
+    to:
+    "  const dataUriStore = [];\n" +
+    "  html = html.replace(/<img([^>]*?)src\\s*=\\s*\"(data:image\\/[^\"]+)\"([^>]*?)>/gi, (match, before, dataUri, after) => {\n" +
+    "    const idx = dataUriStore.length;\n" +
+    "    dataUriStore.push(dataUri);\n" +
+    "    return `<img${before}src=\"https://data-uri-placeholder.local/${idx}\"${after}>`;\n" +
+    "  });\n" +
+    "  html = sanitizeHtml(html);\n" +
+    "  dataUriStore.forEach((uri, idx) => {\n" +
+    "    html = html.replace(`https://data-uri-placeholder.local/${idx}`, uri);\n" +
+    "  });",
+    suite: "test:security",
+    expect: [
+      /^SEC-28 a decoy placeholder cannot splice markup past the sanitizer \(full path\)$/,
+      // Restoring the dance also un-does the SAFE_FOR_XML trade it was
+      // accidentally hiding: the raw/entity/DTD data URIs get swapped out
+      // before the parse again, so they keep their src and withSrc goes back
+      // to 4. Measured, not assumed - this entry was added after the harness
+      // reported it as an unlisted failure. It is the cleanest proof that the
+      // behaviour change documented at the fix site is real.
+      /^FEATURE base64 data-image survives SAFE_FOR_XML where raw\/entity\/DTD forms do not$/,
+    ],
+    mustPass: [
+      /^SEC-28 a decoy placeholder cannot splice markup past the sanitizer \(light-format path\)$/,
+      /^FEATURE data-URI images survive the sanitize step$/,
+      /^FEATURE data-URI images survive the sanitize step \(light-format path\)$/,
+    ],
+  },
+  {
+    id: "R448",
+    // The light-format half of R447. Both render paths carried the dance,
+    // so both need proving; the light path is the one a plain text edit
+    // takes, which is the commonest render in this app.
+    what: "restore the data-URI protect/restore dance around the light path's sanitize",
+    file: RENDERER,
+    from:
+    "  // Sanitize last; nothing may be spliced in after this line. See the note on\n" +
+    "  // the same call in renderMarkdownFull() for why data: image URIs need no\n" +
+    "  // protect/restore dance here (SEC-28).\n" +
+    "  html = sanitizeHtml(html);",
+    to:
+    "  const dataUriStore = [];\n" +
+    "  html = html.replace(/<img([^>]*?)src\\s*=\\s*\"(data:image\\/[^\"]+)\"([^>]*?)>/gi, (match, before, dataUri, after) => {\n" +
+    "    const idx = dataUriStore.length;\n" +
+    "    dataUriStore.push(dataUri);\n" +
+    "    return `<img${before}src=\"https://data-uri-placeholder.local/${idx}\"${after}>`;\n" +
+    "  });\n" +
+    "  html = sanitizeHtml(html);\n" +
+    "  dataUriStore.forEach((uri, idx) => {\n" +
+    "    html = html.replace(`https://data-uri-placeholder.local/${idx}`, uri);\n" +
+    "  });",
+    suite: "test:security",
+    expect: [
+      /^SEC-28 a decoy placeholder cannot splice markup past the sanitizer \(light-format path\)$/,
+    ],
+    mustPass: [
+      /^SEC-28 a decoy placeholder cannot splice markup past the sanitizer \(full path\)$/,
+      /^FEATURE data-URI images survive the sanitize step$/,
+      /^FEATURE data-URI images survive the sanitize step \(light-format path\)$/,
+      // Unlike R447 this one must NOT move: the SAFE_FOR_XML document renders
+      // through the full path, so restoring only the light path's dance leaves
+      // it alone. Listing it here locks that asymmetry in.
+      /^FEATURE base64 data-image survives SAFE_FOR_XML where raw\/entity\/DTD forms do not$/,
+    ],
+  },
+  {
+    id: "R449",
+    // SEC-29. Puts the table paths back on a bare DOMPurify.sanitize(), which
+    // is what all five of them used before: the global hooks still applied, so
+    // image handling stayed correct and only the CONFIG went missing - which is
+    // precisely why nobody noticed the <form> control was absent there.
+    //
+    // MEASURED against the vendored build's own allowlists: what the bare call
+    // loses is both of SANITIZE_CONFIG's deny-lists, not just FORBID_TAGS. Both
+    // `form` and `action` are in DOMPurify's defaults, so reverting restores the
+    // <form> AND its action attribute. (`formaction` is not in the defaults at
+    // all, so that entry is forward-defence and its loss is unobservable.) An
+    // earlier version of this comment claimed only FORBID_TAGS went missing;
+    // that was wrong, and the actionAttrs assertion below is what disproves it.
+    //
+    // Perturbing the shared helper rather than the five call sites is
+    // deliberate: one edit reproduces the flaw everywhere it existed, and the
+    // assertions below cover the two sinks that are actually reachable (the
+    // live viewer via the context menu, and the dialog's live preview).
+    //
+    // Amended for SEC-30: `download` was later added to that same shared
+    // FORBID_ATTR, and it IS in DOMPurify's defaults, so the bare call restores
+    // it too and a third assertion fails here. Listed rather than left as an
+    // unlisted failure because it is the same finding as the other two - one
+    // config omission, three controls lost - not collateral.
+    what: "put the table sanitize paths back on a bare DOMPurify.sanitize()",
+    file: RENDERER,
+    from: "  return DOMPurify.sanitize(html, TABLE_SANITIZE_CONFIG);",
+    to: "  return DOMPurify.sanitize(html);",
+    suite: "test:security",
+    expect: [
+      /^SEC-29 a <form> nested in a table cell is stripped on the context-menu table path$/,
+      /^SEC-29 a <form> nested in a table cell is stripped in the table dialog preview$/,
+      /^SEC-30 the download attribute is stripped in the table dialog preview$/,
+    ],
+    mustPass: [
+      // The document pipeline has its own config and must be untouched by this
+      // revert - that asymmetry is the whole point of the finding.
+      /^SEC-11 <form action> and formaction are stripped, their content is not$/,
+    ],
+  },
+  {
+    id: "R451",
+    // SEC-30. Drops `download` from the shared deny-list, which is the state
+    // the app shipped in: `download` is in DOMPurify 3.4.12's default
+    // ALLOWED_ATTR (measured - 118 entries, `download` and `href` in, `target`
+    // and `ping` out), so removing the entry is enough to restore it.
+    //
+    // Reverting this is the half that matters most, because it is the layer
+    // that prevents the REQUEST. The will-download guard in main.js only fires
+    // once a response has begun, so with the attribute back the beacon has
+    // already left the machine before anything in the main process can object.
+    // Measured on the unfixed tree: a download anchor in #tableInsertPreview
+    // produced a live hit on a loopback server, while a plain anchor in the
+    // same click batch was blocked by will-navigate.
+    //
+    // The preview click guard stays in mustPass: it is a separate control on a
+    // separate layer, and it must keep passing while the strip is gone -
+    // otherwise the two would be one control wearing two names.
+    what: "drop `download` from the shared FORBID_ATTR deny-list",
+    file: RENDERER,
+    from: "  FORBID_ATTR: Object.freeze(['action', 'formaction', 'download'])",
+    to: "  FORBID_ATTR: Object.freeze(['action', 'formaction'])",
+    suite: "test:security",
+    expect: [
+      /^SEC-30 the download attribute is stripped from document content in the viewer$/,
+      /^SEC-30 the download attribute is stripped in the table dialog preview$/,
+      // The alias check reads the list's contents, so it names the drift too.
+      // Listed rather than left as an unexpected failure because it is the
+      // whole point of that assertion: the table path inherits this by
+      // reference, so one edit moves both.
+      /^SEC-29 the table config shares SANITIZE_CONFIG's deny-lists by reference, frozen$/,
+    ],
+    mustPass: [
+      /^SEC-30 clicks in the table dialog preview are inert$/,
+      /^SEC-11 <form action> and formaction are stripped, their content is not$/,
+    ],
+  },
+  {
+    id: "R452",
+    // SEC-30. Removes the capture-phase guard that makes the table dialog's
+    // preview non-interactive, leaving the element as it shipped: rendered
+    // document content, outside #viewer, with no click policy attached.
+    //
+    // Deliberately perturbs the handler BODY rather than deleting the
+    // addEventListener call, so the listener still exists and the revert cannot
+    // be caught by anything that merely counts listeners - only by an assertion
+    // that observes defaultPrevented on a real dispatched click.
+    //
+    // Behaviourally this revert is invisible to the attribute-strip assertions,
+    // which is why they are in mustPass: with `download` still stripped, a
+    // click here just becomes an ordinary navigation that main.js denies. That
+    // is the honest scope of this layer - it stops the preview being a
+    // clickable surface at all, it is not what stops the download.
+    what: "make the table preview click guard a no-op",
+    file: RENDERER,
+    from:
+      "  const blockPreviewActivation = (e) => {\n" +
+      "    e.preventDefault();\n" +
+      "  };",
+    to:
+      "  const blockPreviewActivation = (e) => {\n" +
+      "    void e;\n" +
+      "  };",
+    suite: "test:security",
+    expect: [/^SEC-30 clicks in the table dialog preview are inert$/],
+    mustPass: [
+      /^SEC-30 the download attribute is stripped from document content in the viewer$/,
+      /^SEC-30 the download attribute is stripped in the table dialog preview$/,
+    ],
+  },
+  {
+    id: "R453",
+    // SEC-30, half one of a complementary pair with R454. Keeps the
+    // will-download listener wired exactly as it is and breaks only the RULE it
+    // consults, which is the shape a careless "downloads are broken, just let
+    // them through" edit would take.
+    //
+    // The wiring assertion is in mustPass to prove the pair are independent: a
+    // check that only confirms a listener exists cannot see a policy that has
+    // been opened wide, so on its own it would report this tree as protected.
+    what: "make the download policy allow everything",
+    file: MAIN,
+    from: '  return typeof url === "string" && url.startsWith("blob:");',
+    to: "  return true;",
+    suite: "test:popups",
+    expect: [
+      /^SEC-30 the download policy admits the app's blob: exports and nothing else$/,
+    ],
+    mustPass: [/^SEC-30 the download policy is wired to the default session$/],
+  },
+  {
+    id: "R454",
+    // SEC-30, half two. Leaves the policy function correct and unhooks it,
+    // which is the other realistic accident: the rule survives review because
+    // it reads correctly, while nothing calls it.
+    //
+    // The predicate assertion is in mustPass and keeps passing on this tree -
+    // that is the finding this pair encodes. A correct rule that is not
+    // connected protects nothing, and only the wiring check can tell.
+    what: "unhook the will-download guard from the default session",
+    file: MAIN,
+    from:
+      '    session.defaultSession.on("will-download", (event, item) => {\n' +
+      "      const url = item.getURL();\n" +
+      "      if (!isDownloadAllowed(url)) {\n" +
+      '        console.warn("Blocked download from document content:", url);\n' +
+      "        event.preventDefault();\n" +
+      "      }\n" +
+      "    });",
+    to: "    // will-download guard removed",
+    suite: "test:popups",
+    expect: [/^SEC-30 the download policy is wired to the default session$/],
+    mustPass: [
+      /^SEC-30 the download policy admits the app's blob: exports and nothing else$/,
+    ],
+  },
+  {
+    id: "R455",
+    // SEC-30, and the reason the export FEATURE checks were rewritten. Denies
+    // everything, which is the shape of a careless tightening of the download
+    // policy - the blanket `will-download` deny that was the obvious first fix
+    // for this finding, and which would have silently broken CSV/JSON export.
+    //
+    // This is the revert that justifies the "completes" assertions existing.
+    // The two "still starts a download" checks are in mustPass and KEEP PASSING
+    // here: will-download fires for a denied download - that is where it is
+    // denied - so the filename is readable and the export looks fine to any
+    // assertion that only observes the start. Only running the item through to
+    // state 'completed' can tell an admitted download from a blocked one.
+    what: "make the download policy deny everything, including the app's own exports",
+    file: MAIN,
+    from: '  return typeof url === "string" && url.startsWith("blob:");',
+    to: "  return false;",
+    suite: "test:popups",
+    expect: [
+      /^FEATURE table popup CSV export completes, so SEC-30's guard admits it$/,
+      /^FEATURE table popup JSON export completes, so SEC-30's guard admits it$/,
+      // The predicate check names the same breakage from the other direction:
+      // blob: must be admitted, and here it is not.
+      /^SEC-30 the download policy admits the app's blob: exports and nothing else$/,
+    ],
+    mustPass: [
+      /^FEATURE table popup CSV export still starts a download under CSP$/,
+      /^FEATURE table popup JSON export still starts a download under CSP$/,
+      /^SEC-30 the download policy is wired to the default session$/,
+    ],
+  },
+  {
+    id: "R456",
+    // N10. Restores the line as it was inherited: the Turkish string, spliced
+    // in with innerHTML, wearing its hardcoded pink. Behaviourally identical to
+    // the original rather than byte-identical - the glyph is written as a
+    // \u26A0 escape, which the single-quoted JS string then evaluates to the
+    // same character.
+    //
+    // Both N10 checks are expected to fail, and for different reasons. The
+    // first sees the Turkish text and the inline style; the second cannot find
+    // a .table-insert-error element at all, so it has no colours to read. That
+    // second failure is the reason R457 exists as well - a revert that takes
+    // the element away cannot distinguish "themed" from "present".
+    what: "restore the Turkish innerHTML validation error",
+    file: RENDERER,
+    from:
+      "      const err = document.createElement('div');\n" +
+      "      err.className = 'table-insert-error';\n" +
+      "      err.setAttribute('role', 'alert');\n" +
+      "      err.textContent = i18n('table.invalidFormat');\n" +
+      "      tableInsertPreviewEl.replaceChildren(err);",
+    to:
+      "      tableInsertPreviewEl.innerHTML = '<div style=\"color:red;padding:10px;" +
+      "background:#ffe6e6;border-radius:4px;margin:8px 0;\">\\u26A0 Geçersiz tablo " +
+      "formatı. Markdown tablo sözdizimini kontrol edin (| ile ayrılmış sütunlar " +
+      "gerekli).</div>';",
+    suite: "test:security",
+    expect: [
+      /^N10 the table validation error is an English text node, not Turkish markup$/,
+      /^N10 the validation error is themed, and tracks the active theme$/,
+    ],
+    mustPass: [
+      // The surface this error is painted into is SEC-30's. Reverting the
+      // message must not disturb the guard on the box that holds it.
+      /^SEC-30 the download attribute is stripped in the table dialog preview$/,
+      /^SEC-30 clicks in the table dialog preview are inert$/,
+    ],
+  },
+  {
+    id: "R457",
+    // N10, the theming half. Leaves the message English and node-built and
+    // restores the old hardcoded colour treatment IN FULL - fixed red ink,
+    // fixed pink fill, fixed pink border - which is the accident that actually
+    // happened upstream: text written once, against whatever theme the author
+    // had open. The fill line is load-bearing rather than decorative: the
+    // theming assertion reads backgroundColor as well as color, so the "no
+    // tinted fill, deliberately" half of the CSS comment is defended by this
+    // revert and not merely stated.
+    //
+    // The structural check is in mustPass and KEEPS PASSING here - an element
+    // with the right class and the right text, that is simply invisible on
+    // three of the five themes. Only reading the resolved colours under two
+    // themes can tell the difference.
+    what: "freeze the validation error's colours at the hardcoded pink",
+    file: CSS,
+    from:
+      "  color: var(--danger-fg);\n" +
+      "  border: 1px solid var(--danger-fg);",
+    to:
+      "  color: red;\n" +
+      "  background: #ffe6e6;\n" +
+      "  border: 1px solid #ffe6e6;",
+    suite: "test:security",
+    expect: [
+      /^N10 the validation error is themed, and tracks the active theme$/,
+      // WIDENED WHEN N12 LANDED, and the extra failure is an HONEST CONSEQUENCE
+      // rather than something to dodge. The rule this revert edits is now
+      // SHARED - `.table-insert-error, .render-error` - so restoring the
+      // hardcoded pink freezes the markdown render-failure banner too. That is
+      // the sharing working exactly as intended: one treatment, one place to
+      // get wrong, and a revert that says so on both surfaces at once. Naming
+      // only the N10 half would have understated what this edit really does.
+      /^N12 the render-failure banner is themed, and tracks the active theme$/,
+      // NOT WIDENED AGAIN WHEN N13 LANDED, and the reason is a structural limit
+      // of the harness rather than a judgement. `.mermaid-error` joined this
+      // same shared selector, so this edit really does freeze a THIRD surface -
+      // but a revert scores against ONE suite, and the assertion that would see
+      // it lives in test:mermaid. Naming it here would name a failure this run
+      // cannot observe. R481 is the mermaid-side proof of the same property,
+      // scored where it can be measured.
+    ],
+    mustPass: [
+      /^N10 the table validation error is an English text node, not Turkish markup$/,
+      // Both structural checks survive: the elements are still built from
+      // nodes and still carry no inline style attribute. Only the resolved
+      // colours moved.
+      /^N12 a render failure reports as an escaped text node, not interpolated markup$/,
+    ],
+  },
+  {
+    id: "R458",
+    // N10, the accessibility half. The one property in this fix with no VISUAL
+    // signal: delete it and the app looks identical and behaves identically to
+    // a sighted user, so nothing but an assistive technology or an assertion
+    // can notice. R456 would also fail the structural check, but only by
+    // removing the element entirely - that proves the check runs, not that
+    // this conjunct is load-bearing. This isolates it.
+    what: "drop the validation error's role=alert",
+    file: RENDERER,
+    from: "      err.setAttribute('role', 'alert');\n",
+    to: "",
+    suite: "test:security",
+    expect: [
+      /^N10 the table validation error is an English text node, not Turkish markup$/,
+    ],
+    mustPass: [
+      /^N10 the validation error is themed, and tracks the active theme$/,
+    ],
+  },
+  {
+    id: "R459",
+    // N10 in test:packaging, half one of a complementary pair with R460.
+    // Reintroduces Turkish WITHOUT reintroducing innerHTML - the string stays
+    // node-built, only its text changes - so exactly one of the two new
+    // packaging oracles may fire.
+    //
+    // Block 8c3's stated discipline is that each leftover oracle is shown to
+    // be independent rather than a second spelling of its neighbour, and the
+    // Turkish sweep arrived without one: R456 does write Turkish into
+    // renderer.js, but its suite is test:security, so test:packaging is never
+    // run against it and the sweep was never observed failing.
+    what: "reintroduce Turkish text without reintroducing innerHTML",
+    file: RENDERER,
+    from:
+      "  'table.invalidFormat': '\\u26A0 Invalid table format. Check the markdown" +
+      " table syntax (columns separated by | are required).',",
+    to: "  'table.invalidFormat': '\\u26A0 Geçersiz tablo formatı.',",
+    suite: "test:packaging",
+    expect: [/^no Turkish-specific letter survives in any shipped script$/],
+    mustPass: [
+      // Still node-built, so the source oracle is untouched - that is the
+      // independence this pair exists to demonstrate.
+      /^the table dialog's validation error is built as a node, not assigned as markup$/,
+      /^the Turkish sweep's own character class actually matches Turkish$/,
+      /^the language switcher is gone from every shipped script$/,
+    ],
+  },
+  {
+    id: "R460",
+    // N10 in test:packaging, half two. The mirror: reintroduces the innerHTML
+    // assignment while keeping the text ENGLISH, so the Turkish sweep stays
+    // green and only the source oracle can object.
+    //
+    // The replacement is deliberately the WORST case rather than the historical
+    // one - correct class, correct role, correct English text, no surrounding
+    // whitespace - so that it satisfies every DOM-level conjunct in
+    // test:security's N10 checks: one child node, error first, no element
+    // children, no inline style, role=alert, right text, right glyph.
+    //
+    // That claim is MEASURED, not reasoned. A revert scores against one suite
+    // (`runSuite(r.suite)`), so this record alone cannot establish it. It was
+    // established separately: this exact replacement was applied to renderer.js
+    // by hand and `npm run test:security` run against it, which came back
+    // 145/145 - the DOM assertions cannot tell the two apart. That is the
+    // point. "Built as a node" is not observable from the DOM, and this revert
+    // is what proves the static oracle is the only thing that sees it.
+    what: "assign the validation error as markup again, in English",
+    file: RENDERER,
+    from:
+      "      const err = document.createElement('div');\n" +
+      "      err.className = 'table-insert-error';\n" +
+      "      err.setAttribute('role', 'alert');\n" +
+      "      err.textContent = i18n('table.invalidFormat');\n" +
+      "      tableInsertPreviewEl.replaceChildren(err);",
+    to:
+      "      tableInsertPreviewEl.innerHTML = '<div class=\"table-insert-error\"" +
+      " role=\"alert\">' + i18n('table.invalidFormat') + '</div>';",
+    suite: "test:packaging",
+    expect: [
+      /^the table dialog's validation error is built as a node, not assigned as markup$/,
+    ],
+    mustPass: [
+      /^no Turkish-specific letter survives in any shipped script$/,
+      /^the insertTableFromDialog body was located in full, so the check below reads the whole function$/,
+    ],
+  },
+  {
+    id: "R461",
+    // N11, the totality half. Restores the guard exactly as it was inherited:
+    // a prefix test on the raw href attribute rather than an anchored scheme
+    // match. The hole it reopens is shaped like a filename - `httpd.md` and
+    // `https-notes.txt` begin with "http", so this arm skips them, and they
+    // resolve to `file:` so the http(s) arm above skips them too.
+    //
+    // Both surviving observations are EMPTY when this is applied, which is the
+    // signature worth naming: no openPath, no ipc, no notification, no
+    // filesystem probe. Nothing calls preventDefault, so Chromium follows the
+    // link natively and main.js's will-navigate deny swallows it in another
+    // process. The user sees a link that does nothing, in silence.
+    //
+    // Two failures expected, one per file type, because the two arms of the
+    // local-file policy they land in are different (shell.openPath for .txt,
+    // an in-app ipc send for .md) and a revert that only broke one of them
+    // would leave the other unproven.
+    what: "restore the startsWith('http') guard that made the click delegation non-total",
+    file: RENDERER,
+    // The `hrefAttr &&` conjunct the inherited line carried is deliberately NOT
+    // restored. The empty-href early return above made it dead, and dropping it
+    // was part of the fix; keeping it here would mean this revert perturbed two
+    // things at once and its verdict would name neither. R462 covers that half.
+    from: "    if (!hrefAttr.startsWith('#') && !ABSOLUTE_WEB_URL.test(hrefAttr)) {",
+    to: "    if (!hrefAttr.startsWith('#') && !hrefAttr.startsWith('http')) {",
+    suite: "test:security",
+    expect: [
+      /^N11 a local file whose name begins with http is opened, not silently ignored$/,
+      /^N11 a markdown file whose name begins with http opens in the app$/,
+      // MEASURED, not predicted. Nothing calls preventDefault for either
+      // carrier, so Chromium starts a main-frame navigation that main.js's
+      // will-navigate deny then cancels - the frame survives and `href` is
+      // unchanged, so the two assertions above are the only ones that would
+      // otherwise notice. The witness reports the real targets
+      // (file:///.../https-notes.txt and file:///.../httpd.md), which makes
+      // this an HONEST CONSEQUENCE of the revert rather than collateral: the
+      // aggregate is named here for that reason, never narrowed to dodge it.
+      /^N11 no link click anywhere in this section started a main-frame navigation$/,
+    ],
+    mustPass: [
+      // The external arm is untouched by this guard and must stay green, or the
+      // failures above could be read as "link handling broke" generally. Both
+      // halves are named because the single assertion this list used to name
+      // was later split in two - "was it opened" and "was it stat'd" are
+      // different claims and a revert that broke only one of them would
+      // otherwise still look fully guarded.
+      /^N11 an absolute http URL is still routed externally$/,
+      /^N11 an absolute http URL is never treated as a local path$/,
+      /^N11 a placeholder link with an empty href is a deliberate no-op, not a fall-through$/,
+      /^N11 a whitespace-only href is a silent no-op, never a path lookup$/,
+      // The recovered links go UNHANDLED under this revert, so Chromium acts on
+      // them - but a `file:` URL parses, so main.js's will-navigate deny fires
+      // and the document survives. Named to keep the failure bounded to "the
+      // link is dead" rather than "the app tore itself down".
+      /^N11 an unhandled link click never navigates the top frame out of the app$/,
+      // The local-file policy itself is what the recovered links are handed to.
+      /^FEATURE an inert document \(\.txt\) still opens without a prompt$/,
+      /^FEATURE a markdown link still opens inside the app, never via the shell$/,
+    ],
+  },
+  {
+    id: "R462",
+    // N11, the placeholder half. Deletes the early return for an empty href.
+    //
+    // This one is worth having because the fix looks like dead code: markdown's
+    // `[text]()` produces an anchor the sanitizer KEEPS (measured), whose
+    // href resolves to index.html, and every arm below requires a non-empty
+    // attribute - so the click fell through to a top-frame navigation onto the
+    // app's own page. Only a deny in the main process stopped that reload from
+    // discarding every open tab. Removing these four lines restores the
+    // dependency on another process, and the assertion notices.
+    what: "drop the empty-href early return, so a placeholder link falls through again",
+    file: RENDERER,
+    from:
+      "    if (!hrefAttr || URL_BLANK.test(hrefAttr)) {\n" +
+      "      e.preventDefault();\n" +
+      "      return;\n" +
+      "    }",
+    to: "    // (empty-href early return removed)",
+    suite: "test:security",
+    expect: [
+      /^N11 a placeholder link with an empty href is a deliberate no-op, not a fall-through$/,
+      // The second failure is an HONEST CONSEQUENCE and is named rather than
+      // left unlisted. The sanitizer empties a whitespace-only href to "" -
+      // measured, and pinned by the assertion in mustPass below - so the nbsp
+      // and BOM carriers arrive here indistinguishable from `[text]()` and fall
+      // into the same catch-all, stat included.
+      /^N11 a whitespace-only href is a silent no-op, never a path lookup$/,
+    ],
+    mustPass: [
+      /^N11 a local file whose name begins with http is opened, not silently ignored$/,
+      /^N11 a markdown file whose name begins with http opens in the app$/,
+      /^N11 an absolute http URL is still routed externally$/,
+      /^N11 an absolute http URL is never treated as a local path$/,
+      // This is a claim about DOMPurify, not about the handler, so removing the
+      // handler's guard must not move it. If it does, the two expected failures
+      // above are being produced by something other than the missing return.
+      /^N11 the sanitizer neutralises every whitespace-only href, so URL_BLANK and trim\(\) cannot disagree in the DOM$/,
+      // The placeholder resolves to index.html, which parses, so the
+      // will-navigate deny catches the fall-through and the document survives.
+      // The reader loses the link, not the session.
+      /^N11 an unhandled link click never navigates the top frame out of the app$/,
+      // MEASURED: this revert produced ZERO unlisted failures, i.e. the
+      // aggregate really does keep passing. That is not luck - with the early
+      // return gone the catch-all CLAIMS the placeholder and the whitespace
+      // carriers as paths and calls preventDefault on them, so no navigation is
+      // ever started. Naming it here turns that measurement into a guard: if a
+      // future edit makes this revert start a navigation, the verdict becomes
+      // COLLATERAL rather than silently widening what R462 is taken to prove.
+      /^N11 no link click anywhere in this section started a main-frame navigation$/,
+    ],
+  },
+  {
+    id: "R463",
+    // N11, the ordering half - the only revert here that defends the FIX rather
+    // than the bug.
+    //
+    // Making the local-file arm a catch-all is only safe while the arm above it
+    // claims absolute http(s) URLs first. Delete that arm and the URL is
+    // handled by nothing at all: the catch-all's own `^https?://` guard rejects
+    // it in turn, so it falls through to Chromium exactly as `httpd.md` used
+    // to. The measured evidence says so - external, openPath, ipc and exists
+    // are ALL empty when this is applied.
+    //
+    // That is worth stating plainly because the first draft of this comment
+    // claimed the opposite: that the catch-all would swallow the URL and stat
+    // it. It does not, and the harness output is what corrected the claim. The
+    // mutation that DOES produce a stat needs both edits, and is R464.
+    //
+    // CORRECTION, MEASURED: "all four empty" is true of the LOWERCASE carrier
+    // and false of the uppercase one, and the difference is the finding this
+    // revert now also defends. Falling through to Chromium with
+    // `HTTPS://api.example.invalid:PORT/v1` does not merely do nothing - the
+    // parser rejects the URL and Chromium commits its OWN `about:blank#blocked`
+    // page OVER the app's document, destroying every open tab and every unsaved
+    // edit. No cancellable Electron event fires for it (will-navigate,
+    // will-redirect and will-frame-navigate were all measured silent), so the
+    // renderer's totality is the only layer standing. That is why the reload
+    // assertion is named below rather than left to read as collateral: it is
+    // the most severe consequence of this revert, not a side effect of it.
+    //
+    // FIVE failures are named, not one, because this arm is the ONLY exit to
+    // the browser and four separate carriers reach it: a plain lowercase URL,
+    // an unparseable uppercase one, and both SVG anchor spellings. An <area> is
+    // the fifth - an image map is a hyperlink and is routed through this same
+    // arm - and deleting the arm is supposed to break it. Left unlisted they
+    // would all read as collateral.
+    what: "delete the external-link arm, so http(s) URLs reach nothing at all",
+    file: RENDERER,
+    from:
+      "    if (ABSOLUTE_WEB_URL.test(url)) {\n" +
+      "      e.preventDefault();\n" +
+      "      // openExternal returns a promise that REJECTS when the OS has no handler\n" +
+      "      // for the URL. Unhandled, that surfaces as an unhandledrejection in a\n" +
+      "      // Node-privileged renderer and is caught by the test suites' error\n" +
+      "      // sentinel; the reader gets nothing either way, so say something.\n" +
+      "      Promise.resolve(shell.openExternal(url)).catch(() => {\n" +
+      "        showNotification(i18n('notif.sectionNotFound') + url, 3000);\n" +
+      "      });\n" +
+      "      return;\n" +
+      "    }",
+    to: "    // (external-link arm removed)",
+    suite: "test:security",
+    expect: [
+      // Every route OUT of the app fails; every route INTO the filesystem is
+      // untouched. That asymmetry is the whole point of splitting this from
+      // R464, and it is why the "never treated as a local path" half sits in
+      // mustPass rather than here.
+      /^N11 an absolute http URL is still routed externally$/,
+      /^N11 an uppercase unparseable http URL is routed externally, not stat'd as a path$/,
+      // The uppercase carrier does not merely go unhandled - Chromium replaces
+      // the app's own document with about:blank#blocked. Named here because it
+      // is the SEVEREST consequence of this revert, and an unlisted failure
+      // would read as noise.
+      /^N11 an unhandled link click never navigates the top frame out of the app$/,
+      /^N11 an SVG anchor using href is routed externally instead of throwing$/,
+      /^N11 an SVG anchor using xlink:href is routed externally instead of silently ignored$/,
+      // MEASURED, and the aggregate is an HONEST CONSEQUENCE rather than
+      // collateral: with the external arm gone the uppercase carrier is claimed
+      // by nothing, so the click reaches Chromium and really does start a
+      // main-frame navigation. It is the same event the reload assertion above
+      // reports, seen from the section-wide witness instead of one carrier.
+      /^N11 no link click anywhere in this section started a main-frame navigation$/,
+      // WAS UNREACHABLE, AND THAT WAS A DEFECT IN THE TEST, NOT HERE - but the
+      // first diagnosis of WHY was wrong, and the correction is recorded rather
+      // than quietly replaced.
+      //
+      // WRONG (twice, both times by reading rather than running): "this revert
+      // leaves the top frame at about:blank#blocked after its LAST carrier
+      // click, so the section's terminal restore exec ran against a dead
+      // document and threw". Measured: the frame dies on the `caps` carrier,
+      // which is second of four, and n11Click re-establishes the document
+      // before each later click - so the teardown's own assertion PASSES under
+      // this revert. Adding an n11EnsureAlive guard there was inert, and the
+      // abort survived it.
+      //
+      // ACTUAL CAUSE, measured by hand-applying this revert and reading the
+      // suite's own PASS/FAIL stream: the recovery reload rebuilds the
+      // document and reinstalls the SECTION's globals, but `window.__e2eErrors`
+      // is installed once BEFORE run() and was not among them. The suite
+      // aborted in SEC-13, twenty lines past the N11 block, on
+      // `window.__e2eErrors.length = 0`. Fixed by hoisting that install into a
+      // shared E2E_SENTINEL the recovery replays too.
+      //
+      // Either way the lesson is the same and it is why this entry is listed:
+      // AN ABORTED SUITE IS INDISTINGUISHABLE FROM A PASSING ONE for
+      // everything after the abort point, so `missing=` reads identically to a
+      // wrong guard. With the sentinel restored the suite runs all 161
+      // assertions under this revert and this one fails on its own merits -
+      // `externalCalls:[]`, the <area> claimed by no arm.
+      /^SEC-11 an <area href> is routed through the link policy, not Chromium$/,
+    ],
+    mustPass: [
+      // The SVG PREMISE, in mustPass for every revert whose proof depends on
+      // SVG behaviour. Both behaviour assertions read a fixture that only
+      // exists if DOMPurify kept the SVG anchors and Chromium still hands back
+      // an SVGAnimatedString; if that premise broke, the behaviour assertions
+      // would fail for a reason having nothing to do with the reverted code
+      // and the harness would report the revert PROVEN on a coincidence.
+      /^N11 both SVG anchor spellings survive sanitization as SVGAElements the delegation can see$/,
+
+      // THE DISCRIMINATOR. R464 fails this; R463 must not. Without it the two
+      // reverts would be indistinguishable from their verdicts alone.
+      /^N11 an absolute http URL is never treated as a local path$/,
+      /^N11 a local file whose name begins with http is opened, not silently ignored$/,
+      /^N11 a markdown file whose name begins with http opens in the app$/,
+      /^N11 a placeholder link with an empty href is a deliberate no-op, not a fall-through$/,
+      /^N11 a whitespace-only href is a silent no-op, never a path lookup$/,
+    ],
+  },
+  {
+    id: "R464",
+    // N11. The two-edit mutation that R463 was wrongly described as being:
+    // remove the external arm AND widen the catch-all's guard, so an absolute
+    // http(s) URL really is resolved as a path and handed to fs.existsSync.
+    //
+    // This is the only thing that defends the `exists.length === 0` conjunct.
+    // R463 fails the same assertion, but on external.length alone - it cannot
+    // tell "the URL was not opened" apart from "the URL was treated as a file",
+    // and only the second leaks the document's own directory layout into a stat
+    // call. Under this revert the evidence JSON names the resolved path, which
+    // is the shape a reviewer needs to see.
+    //
+    // Not a hypothetical accident: "the local arm is a catch-all now, so the
+    // scheme test in it is redundant" is exactly the tidy-up someone would make
+    // reading the fixed code without the arm above it in view.
+    what: "widen the catch-all and delete the external arm, so http(s) URLs are stat'd as paths",
+    file: RENDERER,
+    from:
+      "    if (ABSOLUTE_WEB_URL.test(url)) {\n" +
+      "      e.preventDefault();\n" +
+      "      // openExternal returns a promise that REJECTS when the OS has no handler\n" +
+      "      // for the URL. Unhandled, that surfaces as an unhandledrejection in a\n" +
+      "      // Node-privileged renderer and is caught by the test suites' error\n" +
+      "      // sentinel; the reader gets nothing either way, so say something.\n" +
+      "      Promise.resolve(shell.openExternal(url)).catch(() => {\n" +
+      "        showNotification(i18n('notif.sectionNotFound') + url, 3000);\n" +
+      "      });\n" +
+      "      return;\n" +
+      "    }",
+    to: "    // (external-link arm removed)",
+    also: {
+      from: "    if (!hrefAttr.startsWith('#') && !ABSOLUTE_WEB_URL.test(hrefAttr)) {",
+      to: "    if (!hrefAttr.startsWith('#')) {",
+    },
+    suite: "test:security",
+    expect: [
+      /^N11 an absolute http URL is still routed externally$/,
+      // THE DISCRIMINATOR against R463: only this mutation reaches
+      // fs.existsSync with a URL, and the evidence JSON names the resolved
+      // path, which is the shape a reviewer needs to see.
+      /^N11 an absolute http URL is never treated as a local path$/,
+      /^N11 an uppercase unparseable http URL is routed externally, not stat'd as a path$/,
+      /^N11 an SVG anchor using href is routed externally instead of throwing$/,
+      /^N11 an SVG anchor using xlink:href is routed externally instead of silently ignored$/,
+      /^SEC-11 an <area href> is routed through the link policy, not Chromium$/,
+    ],
+    mustPass: [
+      // The SVG PREMISE, in mustPass for every revert whose proof depends on
+      // SVG behaviour. Both behaviour assertions read a fixture that only
+      // exists if DOMPurify kept the SVG anchors and Chromium still hands back
+      // an SVGAnimatedString; if that premise broke, the behaviour assertions
+      // would fail for a reason having nothing to do with the reverted code
+      // and the harness would report the revert PROVEN on a coincidence.
+      /^N11 both SVG anchor spellings survive sanitization as SVGAElements the delegation can see$/,
+
+      /^N11 a local file whose name begins with http is opened, not silently ignored$/,
+      /^N11 a markdown file whose name begins with http opens in the app$/,
+      // A SECOND DISCRIMINATOR against R463, and it runs the opposite way to
+      // the one above. Widening the catch-all means the uppercase carrier IS
+      // handled - badly, as a path - so the frame survives. R463 leaves it
+      // unhandled and Chromium destroys the document. Measured: under R464 the
+      // caps evidence is full (`notes: ["File not found: v1"]`); under R463 it
+      // is truncated because there is no context left to read it from.
+      /^N11 an unhandled link click never navigates the top frame out of the app$/,
+      // The blank early return is untouched by both edits, so a blank href must
+      // never reach the widened catch-all - which it otherwise would, since
+      // "".startsWith('#') is false.
+      /^N11 a placeholder link with an empty href is a deliberate no-op, not a fall-through$/,
+      /^N11 a whitespace-only href is a silent no-op, never a path lookup$/,
+      // MEASURED: ZERO unlisted failures under this revert, i.e. the aggregate
+      // keeps passing, and for the same reason as the reload assertion above -
+      // the widened catch-all CLAIMS every carrier and calls preventDefault, so
+      // no click reaches Chromium at all. Named here so the third of the three
+      // reverts that leave the frame intact (R462, R464, R467) states it rather
+      // than leaving it as an unmeasured assumption.
+      /^N11 no link click anywhere in this section started a main-frame navigation$/,
+    ],
+  },
+  {
+    id: "R465",
+    // N11, the case half - and the one the fix's own comment is about.
+    //
+    // Chromium lowercases a scheme only when it can PARSE the URL. When parsing
+    // fails, `.href` hands back the attribute verbatim, so
+    // `HTTPS://api.example.invalid:PORT/v1` arrives here still uppercase
+    // (measured). Under the inherited spelling it matched neither arm: not this
+    // one, which tested lowercase prefixes, and not the local-file arm, whose
+    // own scheme test IS case-insensitive and refused it. Silent no-op again,
+    // in exactly the shape N11 fixed for `httpd.md`.
+    //
+    // Deliberately narrow in its edit, but NOT in its consequence, and the
+    // difference was measured rather than reasoned about. This revert replaces
+    // the external arm's CALL SITE, not the ABSOLUTE_WEB_URL constant - so the
+    // catch-all below still consults the case-INSENSITIVE regex and still
+    // refuses the uppercase attribute. The carrier therefore matches no arm at
+    // all and is left UNHANDLED, exactly as under R463, which means Chromium
+    // replaces the document with about:blank#blocked.
+    //
+    // The first draft of this record claimed the opposite - that the local arm
+    // "no longer refuses it, because the constant it consults is the one this
+    // revert narrows" - and put the reload assertion in mustPass on that basis.
+    // The harness reported COLLATERAL and the claim was wrong: one call site is
+    // not the constant. THE REAL DISCRIMINATOR AGAINST R463 IS THE LOWERCASE
+    // `web` CARRIER, which R463 breaks and this revert leaves working; it is
+    // already named in mustPass below.
+    what: "make the external arm case-sensitive again, losing unparseable uppercase URLs",
+    file: RENDERER,
+    from: "    if (ABSOLUTE_WEB_URL.test(url)) {",
+    to: "    if (url.startsWith('http://') || url.startsWith('https://')) {",
+    suite: "test:security",
+    expect: [
+      /^N11 an uppercase unparseable http URL is routed externally, not stat'd as a path$/,
+      // Named because it is a CONSEQUENCE of the same unhandled carrier, not a
+      // second defect: an href Chromium cannot parse fires no cancellable
+      // navigation event, so main.js's deny never sees it.
+      /^N11 an unhandled link click never navigates the top frame out of the app$/,
+      // MEASURED, and an HONEST CONSEQUENCE of the same unhandled carrier seen
+      // from the section-wide witness. Widened rather than narrowed: the click
+      // really does reach Chromium, so an aggregate claiming otherwise SHOULD
+      // fail here.
+      /^N11 no link click anywhere in this section started a main-frame navigation$/,
+    ],
+    mustPass: [
+      // THE DISCRIMINATOR against R463: the lowercase carrier still routes
+      // here, because a parseable URL is lowercased by the URL machinery and
+      // survives even a case-sensitive prefix test. R463 deletes the arm
+      // outright and breaks this one too.
+      /^N11 an absolute http URL is still routed externally$/,
+      /^N11 an absolute http URL is never treated as a local path$/,
+      /^N11 an SVG anchor using href is routed externally instead of throwing$/,
+      /^N11 an SVG anchor using xlink:href is routed externally instead of silently ignored$/,
+      // WAS SATISFIED VACUOUSLY, and the harness could not have said so. Under
+      // this revert the suite ABORTED before reaching this assertion, so it
+      // never ran - and an assertion that never runs cannot appear in the
+      // failure list, which is exactly how mustPass reads "satisfied". A
+      // mustPass entry is an ABSENCE check, and an absence check fails open.
+      //
+      // THE RECORDED CAUSE WAS WRONG AND IS CORRECTED HERE: it said "this
+      // revert kills the document on its last carrier click and the terminal
+      // restore exec threw". Measured, the frame dies on `caps` and the
+      // teardown's own assertion passes; the abort was in SEC-13, on the
+      // suite-level `window.__e2eErrors` that the recovery reload destroyed
+      // and did not reinstall. See R463 and E2E_SENTINEL. It is a real guard
+      // again only because the recovery now replays that install.
+      /^SEC-11 an <area href> is routed through the link policy, not Chromium$/,
+    ],
+  },
+  {
+    id: "R466",
+    // N11, the SVG-shape half. An <a> inside inline SVG is an SVGAElement and
+    // its `href` is an SVGAnimatedString OBJECT, not a string.
+    //
+    // The failure is quieter than the original defect and that is worth
+    // recording. Before N11 the handler called `link.href.startsWith(...)` and
+    // THREW; with the anchored regex it no longer throws - `.test()` coerces
+    // the object to "[object SVGAnimatedString]", which simply does not match -
+    // so the external arm silently declines, the local-file arm's own scheme
+    // test refuses the http attribute, and nothing calls preventDefault. Both
+    // SVG anchors become unrouted, which the two assertions see as an empty
+    // `external` and `prevented: false`.
+    //
+    // So this pins the NORMALISATION rather than the crash: an edit that
+    // "simplifies" the ternary away leaves no exception behind to notice.
+    what: "read link.href directly, so an SVG anchor's href object never becomes a URL string",
+    file: RENDERER,
+    from:
+      "    const url = typeof link.href === 'string' ? link.href : String(link.href.baseVal ?? '');",
+    to: "    const url = link.href;",
+    suite: "test:security",
+    expect: [
+      /^N11 an SVG anchor using href is routed externally instead of throwing$/,
+      /^N11 an SVG anchor using xlink:href is routed externally instead of silently ignored$/,
+      // MEASURED, and an HONEST CONSEQUENCE. Both SVG carriers become unrouted,
+      // so nothing calls preventDefault and Chromium starts a main-frame
+      // navigation for each - which main.js's will-navigate deny then CANCELS,
+      // because both hrefs parse. That is why this revert trips the aggregate
+      // while leaving `an unhandled link click never navigates the top frame
+      // out of the app` passing: the frame survives, but a navigation was still
+      // started. The two assertions are not redundant - one reports the
+      // OUTCOME, this one reports the ATTEMPT, and only the second can see a
+      // fall-through that the main process happens to catch.
+      /^N11 no link click anywhere in this section started a main-frame navigation$/,
+    ],
+    mustPass: [
+      // The SVG PREMISE, in mustPass for every revert whose proof depends on
+      // SVG behaviour. Both behaviour assertions read a fixture that only
+      // exists if DOMPurify kept the SVG anchors and Chromium still hands back
+      // an SVGAnimatedString; if that premise broke, the behaviour assertions
+      // would fail for a reason having nothing to do with the reverted code
+      // and the harness would report the revert PROVEN on a coincidence.
+      /^N11 both SVG anchor spellings survive sanitization as SVGAElements the delegation can see$/,
+
+      // HTML anchors carry a string href, so nothing else may move.
+      /^N11 an absolute http URL is still routed externally$/,
+      /^N11 an absolute http URL is never treated as a local path$/,
+      /^N11 an uppercase unparseable http URL is routed externally, not stat'd as a path$/,
+      // MEASURED, and it refutes the collateral this revert was predicted to
+      // cause. Both SVG carriers go unhandled here, so Chromium is left to act
+      // on them - but their hrefs PARSE, so main.js's will-navigate deny fires
+      // and the context survives. Only an UNPARSEABLE absolute URL slips past
+      // that layer (R463), which is precisely why the reload assertion is a
+      // separate subject from "the click was routed".
+      /^N11 an unhandled link click never navigates the top frame out of the app$/,
+      /^N11 a placeholder link with an empty href is a deliberate no-op, not a fall-through$/,
+      /^N11 a whitespace-only href is a silent no-op, never a path lookup$/,
+    ],
+  },
+  {
+    id: "R467",
+    // N11, the SVG-spelling half, and deliberately separate from R466 because
+    // the two failures have different SHAPES.
+    //
+    // SVG spells the same link two ways. For the legacy `xlink:href` form,
+    // getAttribute('href') is null while href.baseVal IS populated (measured).
+    // Drop the fallback and `hrefAttr` is null, so the blank early return above
+    // claims the click: preventDefault still runs, the reader sees nothing
+    // happen, and `external` is empty. That is a SILENT no-op, where R466's is
+    // an UNHANDLED click. Only the xlink anchor is affected - the plain `href`
+    // spelling still resolves - so exactly one assertion fails.
+    what: "drop the xlink:href fallback, so the legacy SVG link spelling is a silent no-op",
+    file: RENDERER,
+    from:
+      "    const hrefAttr = link.getAttribute('href') ?? link.getAttribute('xlink:href');",
+    to: "    const hrefAttr = link.getAttribute('href');",
+    suite: "test:security",
+    expect: [
+      /^N11 an SVG anchor using xlink:href is routed externally instead of silently ignored$/,
+    ],
+    mustPass: [
+      // The SVG PREMISE, in mustPass for every revert whose proof depends on
+      // SVG behaviour. Both behaviour assertions read a fixture that only
+      // exists if DOMPurify kept the SVG anchors and Chromium still hands back
+      // an SVGAnimatedString; if that premise broke, the behaviour assertions
+      // would fail for a reason having nothing to do with the reverted code
+      // and the harness would report the revert PROVEN on a coincidence.
+      /^N11 both SVG anchor spellings survive sanitization as SVGAElements the delegation can see$/,
+
+      /^N11 an SVG anchor using href is routed externally instead of throwing$/,
+      /^N11 an absolute http URL is still routed externally$/,
+      /^N11 an absolute http URL is never treated as a local path$/,
+      // The xlink carrier is CLAIMED by the blank early return here, so
+      // preventDefault still runs and nothing reaches Chromium at all. This
+      // revert's failure is a SILENT no-op, not an unhandled one - which is
+      // exactly what separates it from R466.
+      /^N11 an unhandled link click never navigates the top frame out of the app$/,
+      /^N11 a placeholder link with an empty href is a deliberate no-op, not a fall-through$/,
+      /^N11 a whitespace-only href is a silent no-op, never a path lookup$/,
+      // MEASURED: ZERO unlisted failures under this revert. The aggregate is
+      // the sharper of the two navigation claims - it reports the ATTEMPT, not
+      // the outcome - so its passing is the positive evidence that the blank
+      // early return really did CLAIM the xlink carrier. Without it, "silent
+      // no-op" rests on the reload assertion alone, which is equally satisfied
+      // by a fall-through that main.js happens to cancel (exactly what R466
+      // produces). Naming it here is what makes the R466/R467 distinction
+      // measurable rather than narrative.
+      /^N11 no link click anywhere in this section started a main-frame navigation$/,
+    ],
+  },
+  {
+    id: "R468",
+    // WITHDRAWN AS A PROOF, KEPT AS A RECORD - same disposition as R419, and
+    // for the same reason: the rationale below was falsified by measurement
+    // AFTER the revert was designed, and this project treats a wrong record as
+    // worse than no record.
+    //
+    // IT IS VACUOUS BY CONSTRUCTION, and the construction belongs to a
+    // DEPENDENCY. URL_BLANK and trim() really do disagree in both directions -
+    // trim() calls \u00A0, \u2003 and \uFEFF blank where URL_BLANK does not,
+    // and URL_BLANK calls \u0001-\u0008 and \u000E-\u001F blank where trim()
+    // does not - but neither direction is reachable through the render path,
+    // and THE TWO DIRECTIONS ARE UNREACHABLE FOR DIFFERENT REASONS. Measured
+    // stage by stage rather than reasoned about, and read out of the vendored
+    // dompurify rather than assumed:
+    //
+    //   trim()-broader direction (\u00A0, \u2003, \uFEFF): marked passes
+    //     `<a href="&#160;">` through verbatim; the HTML parser decodes it to
+    //     U+00A0 (char codes [160] off a scratch div); and DOMPurify's
+    //     `stringTrim(initValue)` (purify.js:1917) empties it, after which the
+    //     validity chain's final `else if (value) return false`
+    //     (purify.js:1805-1806) KEEPS the now-empty attribute. hrefAttr === "".
+    //   URL_BLANK-broader direction (\u0001-\u0008, \u000E-\u001F): these
+    //     SURVIVE trim(), so they reach IS_ALLOWED_URI, fail it, and DOMPurify
+    //     REMOVES THE ATTRIBUTE ENTIRELY. `link.href` is then "" and the
+    //     handler's outer guard declines the anchor before either predicate is
+    //     evaluated - a stronger exclusion than the first, not the same one.
+    //
+    // An earlier draft of this comment credited ATTR_WHITESPACE for all of it.
+    // That was wrong twice over: \uFEFF is not even in ATTR_WHITESPACE
+    // (purify.js:332), and ATTR_WHITESPACE is only used to normalise the value
+    // for the IS_ALLOWED_URI *test*, never to rewrite what is stored. The
+    // filter that does the work is native String.trim() - which is to say, the
+    // very predicate this revert proposes swapping IN. A \uFEFF carrier was
+    // added specifically because it was expected to survive and did not; a
+    // \u0001 carrier was added expecting the same emptying and instead revealed
+    // the attribute-removal path, which is how the mechanism above got
+    // corrected.
+    //
+    // So there is no document that makes this edit observable, and a proof that
+    // cannot bite must not be counted as one.
+    //
+    // Left written rather than deleted because the equivalence rests on the
+    // sanitizer's behaviour, not on the product's, and that premise is pinned
+    // by the two mustPass assertions below.
+    //
+    // BUT BE PRECISE ABOUT WHAT REVIVES IT, because an earlier draft of this
+    // paragraph promised something the harness cannot deliver: a `skip`ped
+    // revert never runs its suite, so THESE mustPass entries are not evaluated
+    // by this record. What actually fires on a dompurify regression is the
+    // ASSERTION ITSELF, which runs on every ordinary `test:security` run
+    // regardless of this record. The mustPass list here is documentation of the
+    // dependency, and the trigger to delete the `skip:` line by hand once the
+    // premise assertion goes red - not an automatic reactivation.
+    skip: "vacuous by construction: DOMPurify's own trim() empties the trimmable carriers and deletes the attribute for the rest, so the handler can never see the disputed class",
+    // THE FALSIFIED RATIONALE (retained, do not act on it):
+    // trim() is broader than the URL spec, so an href of a single \u00A0
+    // resolves to a distinct URL (`.../%C2%A0`) and swapping the predicate
+    // would swallow a link that really does point somewhere, reporting nothing.
+    what: "swap URL_BLANK for trim(), widening 'blank' past the class the URL parser strips",
+    file: RENDERER,
+    from: "    if (!hrefAttr || URL_BLANK.test(hrefAttr)) {",
+    to: "    if (!hrefAttr || hrefAttr.trim() === '') {",
+    suite: "test:security",
+    expect: [
+      /^N11 a whitespace-only href is a silent no-op, never a path lookup$/,
+    ],
+    mustPass: [
+      /^N11 the sanitizer neutralises every whitespace-only href, so URL_BLANK and trim\(\) cannot disagree in the DOM$/,
+      // The other half of the premise, and the half that carries the direction
+      // in which URL_BLANK is the BROADER predicate. Without it the record
+      // would document one mechanism (trim to empty) and claim the whole class.
+      /^N11 a C0-control href is stripped by the sanitizer, so the anchor never reaches the link policy at all$/,
+    ],
+  },
+  {
+    id: "R469",
+    // THE GUARD THAT KEEPS THE HARNESS ISOLATED, proven against the unit that
+    // decides it. devProfileDecision() must decline when something has already
+    // moved the profile, because "the profile is not where Electron would have
+    // put it" is exactly the state test/test-userdata-isolation.js creates for
+    // all nine windowed suites - and the branch this neutralises is the one
+    // that OVERWRITES.
+    //
+    // Deliberately `if (false)` rather than deleting the block: the realistic
+    // accident is the condition being weakened, not the return disappearing,
+    // and short-circuiting keeps the function syntactically intact so the
+    // failure is a wrong ANSWER rather than a parse error.
+    what: "drop the already-relocated guard from the dev-profile decision",
+    file: MAIN,
+    from: '  if (path.resolve(app.getPath("userData")) !== path.resolve(standard)) {',
+    to: "  if (false) {",
+    suite: "test:profile",
+    expect: [
+      /^an already-relocated profile is left exactly where it was$/,
+      // Same guard, different input: a path differing only in case is still a
+      // relocation, so it fails here too. Named rather than left unlisted.
+      /^a userData path differing only in case is treated as a relocation, not as the default$/,
+    ],
+    mustPass: [
+      /^a development run is redirected to a profile of its own$/,
+      /^a packaged build is never redirected$/,
+    ],
+  },
+  {
+    id: "R470",
+    // THE SAME EDIT, SCORED AGAINST THE LIVE CONSEQUENCE. R469 proves the
+    // decision is wrong; this proves what that costs a real Electron boot. A
+    // revert scores against ONE suite, so the two halves cannot be one record -
+    // and they are not redundant: R469 answers "what does the function decide",
+    // this answers "where does main.js actually put the profile".
+    //
+    // Without the guard every windowed suite lands in <appData>/Electron-dev
+    // (getName() is "Electron" when a suite is launched as an explicit script
+    // file), re-creating the one shared profile whose poisoning cost this
+    // project a whole day - and doing it silently, because nothing downstream
+    // checks whose profile it received.
+    what: "drop the already-relocated guard and let main.js relocate an isolated test profile",
+    file: MAIN,
+    from: '  if (path.resolve(app.getPath("userData")) !== path.resolve(standard)) {',
+    to: "  if (false) {",
+    suite: "test:startup",
+    expect: [
+      /^main\.js's dev-profile redirect declined an already-relocated userData directory$/,
+      // The CONSEQUENCE, beside the CAUSE. This one reports only that the
+      // profile is not the one isolation chose; it never says why, which is
+      // precisely the reason the assertion above was added.
+      /^the suite runs against an isolated userData directory$/,
+    ],
+    mustPass: [
+      // Still not the developer's real profile - "Electron-dev" is a third
+      // directory. That is what makes this failure so quiet without the
+      // cause assertion: the obvious safety check keeps passing.
+      /^the suite is not using the developer's real profile$/,
+    ],
+  },
+  {
+    id: "R471",
+    // ORDERING, and it is an ABSENCE CHECK - the recurring disease in this
+    // project. app.setPath("userData", ...) is silently IGNORED once the app is
+    // ready, so a redirect that has drifted below its readers keeps returning
+    // normally and simply stops taking effect. Nothing throws, nothing logs,
+    // and the only symptom is that a development run quietly shares the
+    // installed app's profile again.
+    //
+    // The move lands it below WINDOW_STATE_FILE but still above logFilePath, so
+    // exactly ONE of the two ordering assertions fails. That is the point: the
+    // record proves the oracle discriminates per reader rather than collapsing
+    // to "something moved".
+    what: "move the dev-profile redirect below WINDOW_STATE_FILE",
+    file: MAIN,
+    from: "\napplyDevProfile();\n",
+    to: "\n",
+    also: {
+      file: MAIN,
+      from: "const logFilePath = path.join(",
+      to: "applyDevProfile();\nconst logFilePath = path.join(",
+    },
+    suite: "test:packaging",
+    expect: [
+      /^the dev-profile redirect runs before WINDOW_STATE_FILE reads the profile path$/,
+    ],
+    mustPass: [
+      /^main\.js applies the dev-profile redirect at module scope$/,
+      /^the dev-profile redirect runs before the debug log path reads the profile path$/,
+    ],
+  },
+  {
+    id: "R472",
+    // THE CALL ITSELF, disabled IN PLACE rather than deleted. Precedent R222:
+    // deletion is the easy case any substring check catches; a statement
+    // commented out is the likelier accident and is what separates a real
+    // oracle from a grep.
+    //
+    // This has to be scored against test:packaging because the redirect's
+    // POSITIVE half is unobservable from every behavioural suite - all nine
+    // windowed suites relocate userData first, so the decision correctly
+    // declines there and removing the call changes nothing they can see.
+    // test:profile drives devProfileDecision() directly out of the source,
+    // so it does not see the call site either. A static oracle is the only
+    // thing that can fail.
+    what: "comment out the dev-profile redirect so it never runs",
+    file: MAIN,
+    from: "\napplyDevProfile();\n",
+    to: "\n// applyDevProfile();\n",
+    suite: "test:packaging",
+    // All three, and the two ordering legs are HONEST CONSEQUENCES rather than
+    // a widened net: each of them requires the call to be FOUND
+    // (devCall !== -1 && at !== -1 && devCall < at), precisely so that a
+    // missing call fails loudly instead of satisfying a `<` comparison against
+    // -1. Commenting the call out removes the subject of all three assertions,
+    // so all three must fail. Naming only the first would understate the revert.
+    expect: [
+      /^main\.js applies the dev-profile redirect at module scope$/,
+      /^the dev-profile redirect runs before WINDOW_STATE_FILE reads the profile path$/,
+      /^the dev-profile redirect runs before the debug log path reads the profile path$/,
+    ],
+  },
+  {
+    id: "R474",
+    // CASE SENSITIVITY, and the direction of the error is what matters.
+    // Lowercasing here reads like harmless defensiveness on Windows. It is
+    // not: on a case-sensitive filesystem it reports two genuinely DIFFERENT
+    // directories as the same one, and "the same" is the branch that decides
+    // nothing has relocated the profile - i.e. the branch that overwrites.
+    // Erring toward "already relocated, do nothing" is the safe direction, so
+    // the comparison is exact on purpose.
+    what: "lowercase the profile comparison, so a case-differing relocation reads as the default",
+    file: MAIN,
+    from: '  if (path.resolve(app.getPath("userData")) !== path.resolve(standard)) {',
+    to:
+      '  if (path.resolve(app.getPath("userData")).toLowerCase() !== ' +
+      "path.resolve(standard).toLowerCase()) {",
+    suite: "test:profile",
+    expect: [
+      /^a userData path differing only in case is treated as a relocation, not as the default$/,
+    ],
+    mustPass: [
+      // The ordinary relocation is unaffected, which is what makes this a proof
+      // about CASE rather than about the guard - R469 already covers the guard.
+      /^an already-relocated profile is left exactly where it was$/,
+      /^a development run is redirected to a profile of its own$/,
+    ],
+  },
+  {
+    id: "R475",
+    // The suffix is appended to app.getName() rather than to a literal so the
+    // two profiles stay SIBLINGS across a product rename. Hardcoding looks
+    // harmless while the product is called Folia and is exactly the kind of
+    // thing a rename leaves behind: the dev profile would strand itself beside
+    // a name nothing uses, and the installed build - which is packaged, so it
+    // never reaches this line - would give no hint that anything had happened.
+    what: "hardcode the dev profile name instead of deriving it from the app name",
+    file: MAIN,
+    from: "    target: path.join(appData, name + DEV_PROFILE_SUFFIX),",
+    to: '    target: path.join(appData, "Folia" + DEV_PROFILE_SUFFIX),',
+    suite: "test:profile",
+    expect: [
+      /^the development profile name is derived from the app name, not hardcoded$/,
+    ],
+    mustPass: [
+      // Under the product's own name the hardcoded literal happens to agree, so
+      // these keep passing - which is the whole reason the renamed-app leg
+      // exists. Without it this defect is invisible.
+      /^a development run is redirected to a profile of its own$/,
+      /^the development profile is a SIBLING of the standard one, not inside it$/,
+    ],
+  },
+  {
+    id: "R476",
+    // N12, the escaping half. The render-failure banner interpolated
+    // ${error.message} into viewer.innerHTML, and marked and DOMPurify both
+    // quote the offending document back inside their error messages - so one
+    // malformed document could inject markup into the Node-privileged renderer
+    // that failed to render it.
+    //
+    // The revert is deliberately NOT the original one-liner. It is the smaller,
+    // likelier accident: keep the div, keep the class, keep role=alert, and
+    // build only the MESSAGE subtree from a string - "wrap the message in a
+    // span so it can be styled". Everything the theming assertion reads still
+    // resolves, so that assertion is in mustPass and keeps passing; only the
+    // structural check moves. That split is the point of having two assertions
+    // instead of one, and it is what R477 exists to exercise from the other end.
+    //
+    // It fails on three independent conjuncts, which is worth recording because
+    // any one of them alone would be a weaker proof: box.children goes 2 -> 3,
+    // the img/b/script sweep starts finding elements, and the raw message text
+    // stops being present as text at all.
+    what: "build the render-failure message subtree from a markup string",
+    file: RENDERER,
+    from:
+      "    box.appendChild(\n" +
+      "      document.createTextNode(errorText(error, i18n('render.unknownError')))\n" +
+      "    );",
+    to:
+      "    const msg = document.createElement('span');\n" +
+      "    msg.innerHTML = errorText(error, i18n('render.unknownError'));\n" +
+      "    box.appendChild(msg);",
+    suite: "test:security",
+    expect: [
+      /^N12 a render failure reports as an escaped text node, not interpolated markup$/,
+    ],
+    mustPass: [
+      // The element is still there, still classed, still themed - which is
+      // exactly why the theming half cannot be proven by this revert and needs
+      // R477. An injected banner that LOOKS right is the whole hazard.
+      /^N12 the render-failure banner is themed, and tracks the active theme$/,
+      /^N12 the injected failure is removed and the pipeline renders normally again$/,
+      /^N12 the deliberate render failure really reached the console \(the mute is not vacuous\)$/,
+    ],
+  },
+  {
+    id: "R477",
+    // N12, the theming half, and the complement of R476: R476 leaves the
+    // element perfectly themed while it injects markup, this one leaves it
+    // perfectly escaped while it is unreadable on three of the six schemes.
+    // Neither revert can stand in for the other, which is the reason the N12
+    // block asserts structure and theming separately rather than as one
+    // conjunction.
+    //
+    // Deliberately an OVERRIDE on .render-error rather than an edit to the
+    // shared .table-insert-error/.render-error rule. Two reasons, both
+    // load-bearing: it isolates the markdown banner from N10's table validation
+    // error (the shared rule is what R457 edits, and that revert legitimately
+    // trips BOTH), and a later same-specificity rule is precisely how a
+    // hardcoded colour creeps back in - somebody styles the new surface in
+    // isolation without noticing it already inherits a themed treatment.
+    //
+    // The colour is `red` rather than an arbitrary hex on purpose: it is the
+    // literal value this fix removed, so the revert reproduces the historical
+    // defect rather than an invented one.
+    what: "override the render-failure banner's ink with the hardcoded red it used to use",
+    file: CSS,
+    from: ".render-error {\n  padding: 20px;\n}",
+    to: ".render-error {\n  padding: 20px;\n  color: red;\n}",
+    suite: "test:security",
+    expect: [
+      /^N12 the render-failure banner is themed, and tracks the active theme$/,
+    ],
+    mustPass: [
+      // No inline style attribute is added and no node building changes, so
+      // every structural conjunct still holds. A CSS-only defect is invisible
+      // to the DOM-shape assertion by construction - which is the argument for
+      // reading resolved colours under two themes rather than trusting the
+      // class name.
+      /^N12 a render failure reports as an escaped text node, not interpolated markup$/,
+      /^N12 the injected failure is removed and the pipeline renders normally again$/,
+    ],
+  },
+  {
+    id: "R478",
+    // N12 in test:packaging, and the reason the static source oracle exists at
+    // all. This is the ORIGINAL defect restored in full: the whole banner
+    // assigned to viewer.innerHTML from a template.
+    //
+    // Scored against test:packaging because that is where the source oracle
+    // lives, not because the behavioural suite is blind to this particular
+    // edit - the message really is document-controlled, so test:security would
+    // catch this one too. What the oracle adds is that it fails on the SHAPE
+    // rather than on the payload: it equally catches the version of this edit
+    // whose interpolated text happens to be harmless today, which is exactly
+    // the case N10 recorded as unobservable from the DOM.
+    //
+    // The revert leaves the vacuity guard's two markers alone on purpose -
+    // "Error rendering markdown:" and the hideLoadingScreenFor tail - so the
+    // oracle fails on its BAN, naming the defect, rather than on its guard,
+    // which would only name the instrument.
+    what: "assign the whole render-failure banner as an innerHTML template",
+    file: RENDERER,
+    from:
+      "    const box = document.createElement('div');\n" +
+      "    box.className = 'render-error';\n" +
+      "    box.setAttribute('role', 'alert');\n" +
+      "    const label = document.createElement('strong');\n" +
+      "    label.textContent = i18n('render.failed');\n" +
+      "    box.appendChild(label);\n" +
+      "    box.appendChild(document.createElement('br'));\n" +
+      "    box.appendChild(\n" +
+      "      document.createTextNode(errorText(error, i18n('render.unknownError')))\n" +
+      "    );\n" +
+      "    viewer.replaceChildren(box);",
+    to:
+      "    viewer.innerHTML =\n" +
+      "      '<div class=\"render-error\" role=\"alert\"><strong>' +\n" +
+      "      i18n('render.failed') +\n" +
+      "      '</strong><br>' +\n" +
+      "      errorText(error, i18n('render.unknownError')) +\n" +
+      "      '</div>';",
+    suite: "test:packaging",
+    expect: [
+      /^the markdown render-failure banner is built as nodes, not assigned as markup$/,
+    ],
+    mustPass: [
+      // The slice still locates the whole handler, so the ban is what bit.
+      /^the renderMarkdownFull catch block was located in full, so the check below reads the whole handler$/,
+    ],
+  },
+  {
+    id: "R479",
+    // N12, the accessibility half, and the same isolation argument as R458 one
+    // surface over: role=alert is the only property of this banner with NO
+    // visual signal, so deleting it leaves the app looking and behaving
+    // identically to a sighted reader. Nothing but an assistive technology or
+    // an assertion can notice.
+    //
+    // R476 and R478 both fail the same structural assertion, but each does so
+    // while destroying something else as well; this one changes exactly one
+    // attribute, which is what makes it a proof about that conjunct rather than
+    // a proof that the check runs. It matters more here than it did for the
+    // table dialog: a render failure is announced with no other cue at all -
+    // the document the reader was looking at simply vanishes.
+    what: "drop the render-failure banner's role=alert",
+    file: RENDERER,
+    from:
+      "    box.className = 'render-error';\n" +
+      "    box.setAttribute('role', 'alert');",
+    to: "    box.className = 'render-error';",
+    suite: "test:security",
+    expect: [
+      /^N12 a render failure reports as an escaped text node, not interpolated markup$/,
+    ],
+    mustPass: [
+      /^N12 the render-failure banner is themed, and tracks the active theme$/,
+      /^N12 the injected failure is removed and the pipeline renders normally again$/,
+      /^N12 the deliberate render failure really reached the console \(the mute is not vacuous\)$/,
+    ],
+  },
+  {
+    id: "R480",
+    // N13, the structural half, and the third and last of the hardcoded-colour
+    // error banners. Restores the five box.style.* CSSOM assignments verbatim -
+    // fixed red ink, fixed pink fill, fixed pink border - which is precisely
+    // what this banner shipped with for years.
+    //
+    // It fails BOTH N13 assertions and that is honest rather than sloppy: an
+    // element styled entirely from box.style.* has no class to key a rule off
+    // and no way to leave getAttribute('style') null. The two failures are
+    // separated by R481 and R482, which each move exactly one thing.
+    //
+    // Note the escaping half is untouched here - the message still routes
+    // through errorText() - so "renders a hostile message as text, not as
+    // markup" stays in mustPass and keeps passing. That is deliberate: it
+    // proves this revert is about COLOUR, not about the sink that R105/R105b
+    // already cover from the call sites.
+    what: "restore the mermaid banner's hardcoded inline red-on-pink",
+    file: RENDERER,
+    from:
+      "  box.className = 'mermaid-error';\n" +
+      "  box.setAttribute('role', 'alert');",
+    to:
+      "  box.style.color = 'red';\n" +
+      "  box.style.padding = '20px';\n" +
+      "  box.style.background = '#ffe6e6';\n" +
+      "  box.style.border = '1px solid #ff0000';\n" +
+      "  box.style.borderRadius = '4px';",
+    suite: "test:mermaid",
+    expect: [
+      /^N13 the mermaid failure banner replaces the diagram, built from nodes and styled from a class$/,
+      /^N13 the mermaid failure banner is themed, and tracks the active theme$/,
+    ],
+    mustPass: [
+      /^the error banner renders a hostile message as text, not as markup$/,
+      /^13b2 the forced throw really reached the error banner$/,
+    ],
+  },
+  {
+    id: "R481",
+    // N13, the theming half, isolated - and it exists because of a STRUCTURAL
+    // LIMIT rather than a preference. R457 restores the hardcoded pink on the
+    // rule this banner now SHARES, so that one edit really does freeze all
+    // three surfaces; but a revert scores against ONE suite, and R457's is
+    // test:security, where no assertion can see a mermaid diagram. Widening
+    // R457's expect would therefore name a failure it structurally cannot
+    // observe. This revert is the mermaid-side proof of the same property,
+    // scored where it can actually be measured.
+    //
+    // The edit lands on the SEPARATE .mermaid-error padding rule rather than on
+    // the shared one, for the same reason R477 does one surface over: both
+    // selectors are (0,1,0), the padding rule comes later, so appending here
+    // wins the tie and leaves the shared rule - and R457's anchor - alone.
+    //
+    // The structural check is in mustPass and KEEPS PASSING: the element still
+    // carries its class, its role and no style attribute. It is simply a
+    // screaming light-pink slab on a dark diagram panel again - measured at
+    // 11.62 / 13.81 / 13.06 against the three dark themes' --surface-raised.
+    what: "freeze the mermaid banner's colours at the hardcoded pink",
+    file: CSS,
+    from: ".mermaid-error {\n  padding: 20px;\n}",
+    to:
+      ".mermaid-error {\n" +
+      "  padding: 20px;\n" +
+      "  color: red;\n" +
+      "  background: #ffe6e6;\n" +
+      "  border: 1px solid #ffe6e6;\n" +
+      "}",
+    suite: "test:mermaid",
+    expect: [
+      /^N13 the mermaid failure banner is themed, and tracks the active theme$/,
+    ],
+    mustPass: [
+      /^N13 the mermaid failure banner replaces the diagram, built from nodes and styled from a class$/,
+      /^the error banner renders a hostile message as text, not as markup$/,
+    ],
+  },
+  {
+    id: "R482",
+    // N13, the accessibility half - the same isolation argument as R458 and
+    // R479, now on the third surface. role=alert has no visual signal at all,
+    // so only an assistive technology or an assertion can notice its absence.
+    //
+    // R480 fails the same structural assertion, but only while also destroying
+    // the class and the theming; this changes exactly one attribute. It is the
+    // sharpest of the three announcements to lose: a diagram the reader was
+    // reading is replaced in place, with no dialog, no focus change and no
+    // sound.
+    what: "drop the mermaid failure banner's role=alert",
+    file: RENDERER,
+    from:
+      "  box.className = 'mermaid-error';\n" +
+      "  box.setAttribute('role', 'alert');",
+    to: "  box.className = 'mermaid-error';",
+    suite: "test:mermaid",
+    expect: [
+      /^N13 the mermaid failure banner replaces the diagram, built from nodes and styled from a class$/,
+    ],
+    mustPass: [
+      /^N13 the mermaid failure banner is themed, and tracks the active theme$/,
+      /^the error banner renders a hostile message as text, not as markup$/,
+    ],
+  },
+  {
+    id: "R483",
+    // The BYTE half of the vendored-freshness oracle, and it reproduces the
+    // real defect rather than an imagined one: a bump left libs/vendor on
+    // marked 18.0.9 while node_modules, package.json, the lockfile and
+    // `npm audit` all said 18.0.10, and every assertion in the suite stayed
+    // green because they ask whether the vendored files are DOCUMENTED and
+    // PACKAGED, never whether they are CURRENT.
+    //
+    // The edit is one token inside the bundle's own banner comment, chosen
+    // because `18.0.10` occurs EXACTLY ONCE in the whole 43 KB file - so the
+    // anchor cannot be ambiguous, and the payload cannot change what the
+    // library does. That matters: this must fail the freshness assertion
+    // WITHOUT breaking marked, or the verdict would be indistinguishable from
+    // a broken parser taking the suite down with it.
+    //
+    // DELIBERATELY LEAVES VERSIONS.json ALONE, so it fails the byte assertion
+    // and NOT the version one. R484 is the exact complement. Joined into one
+    // revert the two would produce an identical verdict and neither half would
+    // be pinned - the same reasoning as the R463/R464 and R459/R460 pairs.
+    what: "leave a stale vendored marked bundle in libs/vendor while node_modules holds the new one",
+    file: VENDOR_MARKED,
+    from: "marked v18.0.10",
+    to: "marked v18.0.9",
+    suite: "test:packaging",
+    expect: [
+      /^every vendored library is the byte-for-byte copy of the version installed in node_modules$/,
+    ],
+    mustPass: [
+      /^libs\/vendor\/VERSIONS\.json names the versions installed in node_modules$/,
+      /^the vendored-freshness oracle read every entry in the LIBS table$/,
+      /^every library vendored into libs\/ has a notice$/,
+    ],
+  },
+  {
+    id: "R484",
+    // The VERSION half, and the reason it cannot be folded into R483: the two
+    // assertions fail under DIFFERENT accidents. Bytes copied by hand without
+    // rewriting VERSIONS.json leave the bundle correct and its record wrong -
+    // and so does the subtler case where two releases happen to emit
+    // byte-identical output, where the byte comparison is satisfied and only
+    // the recorded version can say the tree is misdescribed.
+    //
+    // The mirror image of R483: the bundle is untouched, so the byte assertion
+    // must keep PASSING. If it ever fails here too, the two assertions have
+    // stopped being independent and the pair has stopped proving anything.
+    what: "record the previous marked version in VERSIONS.json while the vendored bytes are current",
+    file: VENDOR_VERSIONS,
+    from: '"marked": "18.0.10"',
+    to: '"marked": "18.0.9"',
+    suite: "test:packaging",
+    expect: [
+      /^libs\/vendor\/VERSIONS\.json names the versions installed in node_modules$/,
+    ],
+    mustPass: [
+      /^every vendored library is the byte-for-byte copy of the version installed in node_modules$/,
+      /^libs\/vendor\/VERSIONS\.json records what was vendored$/,
+    ],
+  },
+  {
+    id: "R485",
+    // The mermaid 11.17.0 rename tolerance, and it is a TEST-SIDE revert for
+    // the same reason as R363: the thing being defended is the oracle's ability
+    // to keep matching an upstream contract that moved under it, and no product
+    // edit can express that.
+    //
+    // MEASURED, which is the only reason this floor still runs at all: mermaid
+    // writes aria-roledescription from its REGISTERED DIAGRAM ID via its own
+    // setA11yDiagramInfo(), and 11.17.0 renamed the class diagram's id from
+    // "class" to "classDiagram". The floor keyed on the old spelling, so the
+    // find() returned undefined and the assertion failed with `missing: true` -
+    // a matcher that had stopped matching, not a product regression.
+    //
+    // This restores the single-id key, i.e. exactly the pre-bump state, and
+    // reproduces that failure verbatim. It is the realistic accident twice
+    // over: the list looks like defensive clutter a future reader would tidy
+    // back to a string, and the next upstream rename lands the same way.
+    //
+    // The value is in what it must NOT break. Both other floors are in
+    // mustPass, so the verdict distinguishes "the class matcher stopped
+    // matching" from "the suite fell over" - which matters here because the
+    // observed symptom of the real bump was a single failing floor among three,
+    // and a revert that took all three down would not have pinned the rename at
+    // all. It also pins the deliberate refusal to relax the key to "any
+    // diagram": under that weaker design this revert would pass, because the
+    // class diagram would be matched by the flowchart floor's own entry.
+    what: "key the class floor on the pre-11.17 role id only, dropping the rename tolerance",
+    file: MERMAID_TEST,
+    from: '["class", ["class", "classDiagram"], 0.3],',
+    to: '["class", ["class"], 0.3],',
+    suite: "test:mermaid",
+    expect: [/^class node boxes are reasonably filled by their labels$/],
+    mustPass: [
+      /^flowchart node boxes are reasonably filled by their labels$/,
+      /^sequence node boxes are reasonably filled by their labels$/,
+      /^no label overflows its node box$/,
+    ],
+  },
+  {
+    id: "R486",
+    // The Electron pin in scripts/post-upstream-merge.sh, which is the ONLY
+    // thing in the repo tying that script's re-pin to what package.json
+    // actually declares - the assertion says so itself, and a sweep of this
+    // harness confirmed it had never been revert-proven.
+    //
+    // It does not need a hypothetical to justify it: during the 43.2.0 ->
+    // 43.4.1 bump it fired for real, on a stale pin I had left behind, and it
+    // was the single failure in a 13-suite chain. The script is what the docs
+    // tell you to run after every upstream merge, so a stale pin there does not
+    // merely drift - it ACTIVELY DOWNGRADES Electron on the next merge and
+    // reinstates the advisories the bump cleared (undici, 8 of them). That is a
+    // security regression delivered by a maintenance script, silently.
+    //
+    // The revert restores the pre-bump value, i.e. exactly the state that
+    // failed, and it is the realistic accident twice over: an upstream merge
+    // brings its own re-pin back, or a bump moves package.json and forgets the
+    // script, which is precisely what happened.
+    //
+    // The sibling assertion is in mustPass and that is the whole design. The
+    // pin LINE still exists and still parses under this revert, so
+    // "post-upstream-merge.sh pins an Electron version" keeps passing - only
+    // the COUPLING breaks. A revert that took both down would prove the oracle
+    // runs; this one proves it compares.
+    //
+    // Exact equality is the right form and is what is being pinned here: a
+    // "not lower" comparison would need semver range parsing and would let the
+    // two numbers drift apart as long as the script pinned something newer.
+    what: "restore the pre-bump Electron pin in post-upstream-merge.sh, leaving it below what package.json declares",
+    file: MERGE_SH,
+    from: 'npm pkg set devDependencies.electron="^43.4.1"',
+    to: 'npm pkg set devDependencies.electron="^43.2.0"',
+    suite: "test:packaging",
+    expect: [/^post-upstream-merge\.sh cannot downgrade Electron$/],
+    mustPass: [/^post-upstream-merge\.sh pins an Electron version$/],
+  },
+  {
+    id: "R487",
+    // The unused-devDependency oracle, proven by reintroducing the exact dead
+    // dependency it was written for. png-to-ico was declared for years and
+    // referenced by nothing: both .ico files it would generate are TRACKED, so
+    // its outputs already ship without it, and it was installed on every
+    // contributor's machine and every CI run for nothing.
+    //
+    // It survived because the pre-existing scan covers PRODUCTION dependencies
+    // only (Object.keys(pkg.dependencies)), so a devDependency was invisible to
+    // it by construction. This revert is therefore not a hypothetical: it
+    // restores a state that really shipped, and the oracle was confirmed to
+    // bite on it BEFORE the dependency was removed - the removal was done
+    // second, deliberately, so the positive control came from the real defect
+    // rather than from a synthetic one.
+    //
+    // The sibling assertion is in mustPass and that is the whole design, the
+    // R459/R460 pattern. This revert adds a dependency that NO source justifies,
+    // so every one of the five sources keeps matching what it matched before and
+    // "every devDependency evidence source is live" must keep passing. Only the
+    // consequence fires. R488 is the mirror image - it breaks a SOURCE while
+    // leaving every dependency justified - so the two halves of the oracle
+    // cannot be satisfied by one another and a verdict names which one bit.
+    what: "reintroduce the dead png-to-ico devDependency",
+    file: PKG,
+    from: '    "mermaid": "^11.17.0",\n    "prismjs": "^1.30.0"',
+    to: '    "mermaid": "^11.17.0",\n    "png-to-ico": "^3.0.1",\n    "prismjs": "^1.30.0"',
+    suite: "test:packaging",
+    expect: [/^every devDependency is used by something in this repository$/],
+    mustPass: [/^every devDependency evidence source is live$/],
+  },
+  {
+    id: "R488",
+    // The vacuity floor under the scan above, and the mirror image of R487.
+    //
+    // The floor is a RELATIONSHIP rather than a count - each of the five
+    // evidence sources must justify at least one declared devDependency -
+    // because the failure it guards against is silent and it MISNAMES ITS
+    // VICTIM: a source that has stopped matching does not report itself, it
+    // reports a live dependency as dead. The reader then deletes a dependency
+    // that was genuinely in use. Asserting the cause beside the consequence is
+    // what makes that diagnosable.
+    //
+    // The revert is the realistic accident in its most ordinary form - a moved
+    // or renamed directory, which is exactly the drift the floor's own comment
+    // names. Nothing throws; fs.existsSync simply answers false and the source
+    // silently contributes nothing.
+    //
+    // The WORKFLOW source is chosen deliberately and it is the only one of the
+    // five that can be broken in isolation. Every other source is the SOLE
+    // justification for at least one dependency today - the LIBS table for
+    // marked/mermaid/dompurify, a committed libs/ directory for prismjs, a
+    // require for ajv - so neutralising any of those would strand a dependency
+    // and fail BOTH assertions, producing a verdict that proves the oracle runs
+    // rather than proving it discriminates. electron-builder is named by an npm
+    // script as well as by a workflow, so removing the workflow evidence leaves
+    // it justified and the consequence assertion in mustPass keeps passing.
+    //
+    // That the workflow source is not uniquely load-bearing is precisely why it
+    // was kept in the oracle rather than dropped: a CI-only devDependency is a
+    // real category, and a source removed for being redundant today is a source
+    // that reports the next one as dead.
+    what: "point the workflow evidence scan at a directory that does not exist",
+    file: PKG_TEST,
+    from: 'const wfDir = path.join(ROOT, ".github", "workflows");',
+    to: 'const wfDir = path.join(ROOT, ".github", "workflows-moved");',
+    suite: "test:packaging",
+    expect: [/^every devDependency evidence source is live$/],
+    mustPass: [/^every devDependency is used by something in this repository$/],
+  },
+  {
+    id: "R489",
+    // The Tabulator option oracle, proven by reintroducing the exact dead
+    // option it was written for. `resizableColumns` is a Tabulator 4.x
+    // spelling; it was still being passed under 6.2.5, is recognised by
+    // neither 6.2.5 nor 6.5.2, and Tabulator only LOGS unknown options rather
+    // than throwing - so it sat there being silently ignored while every test
+    // in the suite stayed green.
+    //
+    // Like R487, this is not a hypothetical: it restores a state that really
+    // shipped, and it was measured before it was removed. The option's absence
+    // from BOTH versions is what makes removing it behaviour-preserving by
+    // construction - whatever the app did before, it did with this option
+    // already ignored.
+    //
+    // The floor is in mustPass, and the pairing is the point. This revert adds
+    // an option the bundle does not name, which leaves the SCAN working
+    // perfectly - the constructor is still found, the bundle is still read, the
+    // matcher can still answer no - so only the consequence fires. R490 is the
+    // mirror image.
+    //
+    // The structural assertion is named here too, and it is an HONEST
+    // CONSEQUENCE rather than collateral. Its phantom-comment plant inserts a
+    // block comment SPELLING `resizableColumns: true,` and then requires that
+    // name NOT to survive as a captured key - which is exactly how it proves
+    // the comment strip is load-bearing. This revert makes `resizableColumns`
+    // a genuine depth-0 key of the real options literal, so the negative
+    // control fires correctly: the plant is structurally incompatible with a
+    // tree that really passes the option. Narrowing the plant to dodge this
+    // would be choosing a name to make one revert tidy, at the cost of the
+    // control naming the option the whole oracle was written for.
+    what: "reintroduce the retired Tabulator 4.x resizableColumns option",
+    file: MAIN,
+    from: "            movableColumns: true,",
+    to: "            movableColumns: true,\n            resizableColumns: true,",
+    suite: "test:packaging",
+    expect: [
+      /^every Tabulator option the app passes is recognised by the vendored bundle$/,
+      /^the Tabulator option capture is structural: a late callback cannot truncate it and a comment cannot pad it$/,
+    ],
+    mustPass: [
+      /^the Tabulator option scan read both sides and can still answer no$/,
+    ],
+  },
+  {
+    id: "R490",
+    // The floor under the scan above, and the reason it exists at all: this
+    // oracle FAILS OPEN. Break the constructor regex and `tabOpts` is empty,
+    // so `unknownOpts` is empty too and "every Tabulator option is recognised"
+    // passes having compared NOTHING. A green suite would then be reporting
+    // that the app's Tabulator options are fine on the strength of having read
+    // none of them.
+    //
+    // The revert is the realistic accident: the options object is built inside
+    // a template string in main.js, so any reformatting of that call - a
+    // renamed variable, a changed argument, a prettier pass that moves the
+    // brace - stops the regex matching. Nothing throws; the scan just goes
+    // quiet.
+    //
+    // REPOINTED. The oracle no longer locates the options object with a
+    // non-greedy regex - it finds the constructor by plain string index and
+    // brace-matches from there (see R492 for why the brace match itself is
+    // load-bearing). The defect class is unchanged and so is the fail-open:
+    // the lookup returning -1 makes `captureTabulatorOptions` return null,
+    // `tabOpts` empty, and the consequence assertion vacuously true.
+    //
+    // The anchor is the SOURCE-SIDE lookup rather than the one taken against
+    // the comment-stripped copy, because that is the one that decides whether
+    // the constructor is found at all; the second lookup only re-locates it in
+    // the stripped string. Both are plain string indexes, so the old
+    // backslash-mangling hazard that shaped the previous anchor is gone.
+    //
+    // The structural assertion is named here too, and it is the fail-open
+    // reaching one level further than the record above describes. Its two
+    // planted positive controls are captured through the SAME
+    // `captureTabulatorOptions()` this revert breaks, so both plants come back
+    // EMPTY and `truncKeys.includes("rowClick")` fails. That is the plants
+    // doing their job: they exist precisely to require that the capture
+    // machinery still works, and a capture that finds nothing cannot satisfy a
+    // positive control. Note the contrast with `mustPass` below, which still
+    // PASSES - vacuously, on an empty `tabOpts`. Those two lines together are
+    // the whole argument for this revert: one assertion is fooled by an empty
+    // capture and two are not.
+    what: "point the Tabulator constructor scan at a call that does not exist",
+    file: PKG_TEST,
+    from: 'const rawAt = src.indexOf("new Tabulator(");',
+    to: 'const rawAt = src.indexOf("new TabulatorMoved(");',
+    suite: "test:packaging",
+    expect: [
+      /^the Tabulator option scan read both sides and can still answer no$/,
+      /^the Tabulator option capture is structural: a late callback cannot truncate it and a comment cannot pad it$/,
+    ],
+    mustPass: [
+      /^every Tabulator option the app passes is recognised by the vendored bundle$/,
+    ],
+  },
+  {
+    id: "R491",
+    // EXACTNESS, and the reason R489 alone does not establish it.
+    //
+    // The oracle this replaced recognised an option by asking whether its name
+    // occurred ANYWHERE in the 400 KB minified bundle. That was measured, and
+    // it is generous in exactly the direction that matters: `fitColumns`,
+    // `cellClick` and `rowClick` all occur in the bundle - as a layout VALUE
+    // and as internal event names - while none of the three is a constructor
+    // option. R489's `resizableColumns` is caught by BOTH matchers, so it
+    // proves the consequence assertion fires but says nothing about how
+    // precisely the surface is drawn.
+    //
+    // `rowClick` is the discriminating case: it is the sort of thing a future
+    // edit would plausibly add (Tabulator really does have a rowClick
+    // CALLBACK, registered through a different mechanism than constructor
+    // options), it would have passed silently under the loose matcher, and it
+    // fails against the extracted surface.
+    //
+    // Shares its `from` with R489 - permitted, and precedented by R459/R460:
+    // anchors resolve per revert against a per-revert snapshot of the
+    // originals, so two records may perturb the same line differently.
+    //
+    // Deliberately narrow at 1: the floor still passes (13 options captured
+    // against a floor of 12) and the structural plants are unaffected, because
+    // adding a shorthand key changes neither the brace matching nor the
+    // comment stripping.
+    what: "add a Tabulator option the vendored bundle mentions but does not register",
+    file: MAIN,
+    from: "            movableColumns: true,",
+    to: "            movableColumns: true,\n            rowClick: true,",
+    suite: "test:packaging",
+    expect: [
+      /^every Tabulator option the app passes is recognised by the vendored bundle$/,
+    ],
+    mustPass: [
+      /^the Tabulator option scan read both sides and can still answer no$/,
+      /^the Tabulator option capture is structural: a late callback cannot truncate it and a comment cannot pad it$/,
+    ],
+  },
+  {
+    id: "R492",
+    // THE TRUNCATION DEFECT, restored in its exact original shape.
+    //
+    // The oracle this replaced ended the options object at the first `});`
+    // after the constructor. That is correct only while no option value
+    // contains one - i.e. while no option is a function. Add one callback and
+    // the capture stops inside it.
+    //
+    // The fail-open is what makes it worth a permanent guard, and it was
+    // MEASURED rather than reasoned about: on a tree carrying a late callback
+    // the old matcher reported TWELVE options - the same count as a clean tree
+    // - having silently swapped `height` for `rowClick`. So a length floor,
+    // however tight, structurally cannot see this. The assertion is therefore a
+    // SET relation (nothing captured on the clean tree may go missing under the
+    // plant), never a count.
+    //
+    // The revert is safe to score on the clean tree - verified by reading the
+    // shipped literal rather than assuming it: `initialSort: []` is empty and
+    // every nested structure closes as `}]` or `],`, so on the shipped source
+    // the first `});` IS the constructor's own close and the clean capture is
+    // unchanged. Only the planted control fails, which is precisely what makes
+    // the plant load-bearing rather than decorative.
+    what: "end the Tabulator options capture at the first `});` instead of brace-matching",
+    file: PKG_TEST,
+    from: "      const end = matchBracket(clean, i);",
+    to: '      const end = clean.indexOf("});", i);',
+    suite: "test:packaging",
+    expect: [
+      /^the Tabulator option capture is structural: a late callback cannot truncate it and a comment cannot pad it$/,
+    ],
+    mustPass: [
+      /^the Tabulator option scan read both sides and can still answer no$/,
+      /^every Tabulator option the app passes is recognised by the vendored bundle$/,
+    ],
+  },
+  {
+    id: "R493",
+    // THE COMMENT STRIP, and it is load-bearing on the SHIPPED SOURCE - not
+    // only on the plant. That was measured, and it is stronger than the
+    // rationale originally written for it.
+    //
+    // main.js's options literal carries a six-line block comment recording why
+    // `resizableColumns` was retired. Its first line reads "No resizableColumns
+    // option: it is a Tabulator 4.x spelling", and `keysAtTopLevel` scans
+    // depth-0 CHARACTERS rather than line starts - so "option:" is a key shape
+    // and the word `option` is captured as an option the app passes. It is not
+    // in the surface, so the consequence assertion fires on the CLEAN TREE.
+    //
+    // That is why this record names TWO assertions. The old line-anchored regex
+    // happened to skip comment lines and so measured 12 either way, which is
+    // exactly the kind of accidental immunity that disappears the moment the
+    // parser is made structural. Stripping first is the property being pinned;
+    // the planted block comment is the second, independent witness.
+    what: "scan the Tabulator options literal without stripping comments first",
+    file: PKG_TEST,
+    from: "      const clean = stripJsComments(src.slice(rawAt));",
+    to: "      const clean = src.slice(rawAt);",
+    suite: "test:packaging",
+    expect: [
+      /^every Tabulator option the app passes is recognised by the vendored bundle$/,
+      /^the Tabulator option capture is structural: a late callback cannot truncate it and a comment cannot pad it$/,
+    ],
+    mustPass: [
+      /^the Tabulator option scan read both sides and can still answer no$/,
+    ],
+  },
+  {
+    id: "R494",
+    // ISSUE 9 - the column definitions. Same bundle, same popup, DIFFERENT
+    // option surface (`registerColumnOption` plus the column defaults literal),
+    // and until this rewrite they were outside the oracle's reach entirely.
+    //
+    // The floor is the fail-open guard for that half, and it fails open the
+    // same way the table half does: lose the anchor and `colKeys` is empty, so
+    // "every column option is recognised" passes having compared nothing.
+    //
+    // The anchor is the build site in renderer.js rather than the test's own
+    // lookup, so this scores the REAL coupling - a rename or refactor of the
+    // column build is the realistic accident, and it is invisible to every
+    // behavioural test because Tabulator only logs unknown options.
+    what: "rename the renderer column build site the column-option scan anchors on",
+    file: RENDERER,
+    from: "columns.push({",
+    to: "columnsMoved.push({",
+    suite: "test:packaging",
+    expect: [
+      /^the Tabulator column option scan read both sides and can still answer no$/,
+    ],
+    mustPass: [
+      /^every Tabulator column option the popup builds is recognised by the vendored bundle$/,
+      /^the Tabulator option scan read both sides and can still answer no$/,
+    ],
+  },
+  {
+    id: "R495",
+    // The consequence half of R494, and the mirror of R489/R491 on the column
+    // axis: an option name the vendored bundle does not register at all.
+    //
+    // Narrow at 1 by construction - the floor still passes (five keys against a
+    // floor of four), so this proves the column surface DISCRIMINATES rather
+    // than proving the column scan runs.
+    what: "add a column option the vendored bundle does not register",
+    file: RENDERER,
+    from: "        headerFilter: 'input',",
+    to: "        headerFilter: 'input',\n        bogusColumnOption: true,",
+    suite: "test:packaging",
+    expect: [
+      /^every Tabulator column option the popup builds is recognised by the vendored bundle$/,
+    ],
+    mustPass: [
+      /^the Tabulator column option scan read both sides and can still answer no$/,
+    ],
+  },
+  {
+    id: "R496",
+    // THE UNION IS MANDATORY, and this is the only revert that says so.
+    //
+    // Tabulator declares its options in two places: ~150 `registerTableOption`
+    // calls and a 43-key defaults literal, with ZERO overlap. Reading only the
+    // registration calls looks complete - it is the obvious, self-describing
+    // source - and it omits `data`, `columns` and `height`, all three of which
+    // this app passes.
+    //
+    // So the accident is not a typo; it is a plausible simplification that
+    // reports three shipped, working options as unrecognised. Two assertions
+    // fail and both are named: the surface assertion, which pins the structural
+    // claim that `height` is reachable ONLY through the defaults literal, and
+    // the consequence assertion, which is where a reader would actually meet
+    // the damage.
+    what: "build the Tabulator option surface from the registration calls alone",
+    file: PKG_TEST,
+    from: "    const tableSurface = new Set([...tabReg, ...tabDfl]);",
+    to: "    const tableSurface = new Set([...tabReg]);",
+    suite: "test:packaging",
+    expect: [
+      /^the Tabulator option surface was extracted from the vendored bundle, not matched loosely$/,
+      /^every Tabulator option the app passes is recognised by the vendored bundle$/,
+    ],
+    mustPass: [
+      /^the Tabulator option scan read both sides and can still answer no$/,
+      /^every Tabulator column option the popup builds is recognised by the vendored bundle$/,
+    ],
+  },
+  {
+    id: "R497",
+    // The plain sensitivity control for the shipped version table: without one,
+    // the whole block could be comparing the README against itself and nobody
+    // would know. Picks a LOCKFILE-sourced row on purpose - five of the six
+    // versioned rows resolve that way, and a single-digit patch regression is
+    // exactly the drift that produced the defect (measured: five of six rows
+    // were stale, marked among them, at this very number).
+    what: "make one lockfile-sourced README version row stale again",
+    file: path.join(ROOT, "README.md"),
+    from: "| marked | 18.0.10 | Markdown parser |",
+    to: "| marked | 18.0.9 | Markdown parser |",
+    suite: "test:packaging",
+    expect: [/^every version the shipped README claims is the version that actually ships$/],
+    mustPass: [
+      /^the README's Technology section was located and bounded at the next heading$/,
+      /^the version table really parsed, so the checks below have subjects$/,
+      /^every row in the shipped version table is one this oracle knows how to verify$/,
+      /^every version this oracle checks against was resolved from a real source$/,
+    ],
+  },
+  {
+    id: "R498",
+    // THE EXHAUSTIVENESS PROOF, and it is deliberately distinguishable from
+    // R497. A hand-maintained row list fails by OMISSION: a component is added
+    // to the shipped table, no assertion knows about it, and the oracle reports
+    // a clean sweep over the rows it happens to recognise. So the added row
+    // must fail the classification assertion and NOT the staleness one - and it
+    // cannot fail the staleness one, because `stale` is computed only over rows
+    // `TRUTH` recognises. Joined with R497 the two would be indistinguishable.
+    //
+    // The version is spelled as a real-looking release rather than as an
+    // obviously-bogus marker, since the accident being defended against is an
+    // honest addition, not a typo.
+    what: "add a component row the version-table oracle does not know how to verify",
+    file: path.join(ROOT, "README.md"),
+    from: "| Fira Code | - | Application typeface |",
+    to: "| Fira Code | - | Application typeface |\n| Chromium | 140.0.7339.185 | Rendering engine |",
+    suite: "test:packaging",
+    expect: [/^every row in the shipped version table is one this oracle knows how to verify$/],
+    mustPass: [
+      /^the version table really parsed, so the checks below have subjects$/,
+      /^every version this oracle checks against was resolved from a real source$/,
+      /^every version the shipped README claims is the version that actually ships$/,
+    ],
+  },
+  {
+    id: "R499",
+    // Tabulator is the ONE row whose truth does not come from the lockfile, and
+    // this is what proves the banner is really being read. It is hand-vendored
+    // and absent from package.json entirely, so `npm audit`, `npm outdated` and
+    // Dependabot are all blind to it and the banner at the head of the bundle is
+    // the only statement of its version anywhere in this tree. If the block were
+    // silently resolving Tabulator through some other route, editing the banner
+    // would change nothing.
+    //
+    // THE REPLACEMENT IS THE SAME BYTE LENGTH ON PURPOSE. The Tabulator option
+    // oracle anchors on `debugInvalidOptions` at index 334 of this file, so a
+    // shorter or longer banner would shift it and produce collateral that says
+    // nothing about the version table. Grep confirmed no other assertion in the
+    // suite is keyed on this banner, which is what keeps the record narrow.
+    //
+    // THE SECOND FAILURE IS AN HONEST CONSEQUENCE AND A BETTER WITNESS THAN THE
+    // FIRST. `scripts/generate-notices.js:117 vendoredTabulatorVersion()` reads
+    // THIS SAME BANNER and emits it into THIRD-PARTY-NOTICES.md, deliberately -
+    // its own comment records that "the version a vendored file reports about
+    // itself is better evidence than a number written down beside it". So the
+    // banner is the operative version record for Tabulator in TWO independent
+    // places in this repo, and editing it makes the committed notices file
+    // genuinely stale rather than merely tripping a checksum. Named here rather
+    // than left unlisted: it is a real effect of the revert, and narrowing the
+    // edit to dodge it would mean editing something that is not the banner,
+    // which is the one thing this proof is about.
+    what: "change the vendored Tabulator banner so it disagrees with its README row",
+    file: path.join(ROOT, "libs", "tabulator", "tabulator.min.js"),
+    from: "/* Tabulator v6.5.2 (c) Oliver Folkerd 2026 */",
+    to: "/* Tabulator v6.4.9 (c) Oliver Folkerd 2026 */",
+    suite: "test:packaging",
+    expect: [
+      /^every version the shipped README claims is the version that actually ships$/,
+      /^the committed notices file is not stale$/,
+    ],
+    mustPass: [
+      /^the vendored Tabulator bundle declares the version its README row is checked against$/,
+      /^every row in the shipped version table is one this oracle knows how to verify$/,
+      /^every version this oracle checks against was resolved from a real source$/,
+    ],
+  },
+  {
+    // ISSUE 5 - THE STALE LEGAL-PROVENANCE CITATION. The comment beside the
+    // Tabulator pin in .gitattributes named `npm pack tabulator-tables` at a
+    // hardcoded 6.2.5 while the tree shipped 6.5.2. Measured: the two tarballs'
+    // LICENSE files differ, and they differ EXACTLY in the copyright notice
+    // (2015-2024 vs 2015-2026), which under MIT is the whole of the obligation.
+    // So the comment cited, as the source of a verbatim copy, an artifact that
+    // does not contain the text that ships. Fixed by removing the version
+    // rather than correcting it - the same reasoning generate-notices.js
+    // records for its own note.
+    //
+    // This is the CAUSE half. The sweep reads the whole file on purpose, so it
+    // is not satisfied by moving a pinned version out of the citation and into
+    // a comment ABOUT the citation - an earlier draft of the replacement prose
+    // did exactly that and this assertion caught it.
+    id: "R500",
+    suite: "test:packaging",
+    what: "restore the hardcoded tabulator-tables version in the .gitattributes provenance note",
+    file: ATTRS,
+    from: "# licence comes out of `npm pack tabulator-tables`, at the version the vendored",
+    to: "# licence comes out of `npm pack tabulator-tables@6.2.5`, at the version the vendored",
+    expect: [
+      /^\.gitattributes cites the Tabulator licence source without pinning a version to drift from$/,
+    ],
+    mustPass: [
+      // A comment edit must not disturb the pin itself, nor the pair check -
+      // which is what makes this a proof about the CITATION rather than about
+      // .gitattributes being readable.
+      /^\.gitattributes pins libs\/tabulator\/LICENSE to LF so it stays byte-faithful$/,
+      /^both halves of the Tabulator provenance pair were really parsed$/,
+      /^the vendored Tabulator licence and bundle still come from the same upstream tarball$/,
+    ],
+  },
+  {
+    // The CONSEQUENCE half, and the accident that actually produced Issue 5:
+    // bump the vendored bundle and forget to re-copy the licence beside it.
+    // This reverts libs/tabulator/LICENSE to 6.2.5's copyright year while the
+    // bundle banner still declares 2026, which is precisely the state the tree
+    // was in - a shipped notice that does not match the shipped code.
+    //
+    // Deliberately edits the LICENSE rather than the banner: the banner has two
+    // other consumers (the README version table and generate-notices.js), so
+    // perturbing it would fail four assertions and prove nothing narrowly. See
+    // R499, which exists to cover that side.
+    id: "R501",
+    suite: "test:packaging",
+    what: "leave the vendored Tabulator LICENSE at the previous release's copyright year",
+    file: path.join(ROOT, "libs", "tabulator", "LICENSE"),
+    from: "Copyright (c) 2015-2026 Oli Folkerd",
+    to: "Copyright (c) 2015-2024 Oli Folkerd",
+    expect: [
+      /^the vendored Tabulator licence and bundle still come from the same upstream tarball$/,
+      // Honest consequence, not collateral to be dodged: generate-notices.js
+      // reproduces this licence text verbatim into THIRD-PARTY-NOTICES.md, so
+      // changing the year genuinely makes the committed notices file stale.
+      // That is a second independent witness that this file is a shipped legal
+      // artifact rather than a copy kept for reference.
+      /^the committed notices file is not stale$/,
+    ],
+    mustPass: [
+      // The vacuity floor must still PASS here - both years are well-formed,
+      // they simply disagree. That is what distinguishes this revert from R502
+      // and makes it a proof of the comparison rather than of the parse.
+      /^both halves of the Tabulator provenance pair were really parsed$/,
+      /^\.gitattributes cites the Tabulator licence source without pinning a version to drift from$/,
+      /^libs\/tabulator\/LICENSE is stored with LF endings, as pinned$/,
+    ],
+  },
+  {
+    // THE FLOOR. Two empty strings compare equal, so if either regex stopped
+    // matching, the pair check above would report perfect agreement while
+    // comparing nothing - the same disease as the licence guard's
+    // `entries.length > 200` against a real 220, and the placeholder 1.0 in
+    // DEFAULT_SELECTION_FLOOR. The realistic accident is upstream restyling the
+    // notice (a single year rather than a range), which a re-copy would bring
+    // in silently.
+    //
+    // Fails BOTH assertions by construction, and both are listed: an unparsed
+    // year cannot equal a parsed one. The floor is what names the CAUSE.
+    id: "R502",
+    suite: "test:packaging",
+    what: "reshape the Tabulator LICENSE copyright line so the year regex stops matching",
+    file: path.join(ROOT, "libs", "tabulator", "LICENSE"),
+    from: "Copyright (c) 2015-2026 Oli Folkerd",
+    to: "Copyright (c) 2026 Oli Folkerd",
+    expect: [
+      /^both halves of the Tabulator provenance pair were really parsed$/,
+      /^the vendored Tabulator licence and bundle still come from the same upstream tarball$/,
+      // Same notices consequence as R501, for the same reason.
+      /^the committed notices file is not stale$/,
+    ],
+    mustPass: [
+      /^\.gitattributes cites the Tabulator licence source without pinning a version to drift from$/,
+      /^libs\/tabulator\/LICENSE is stored with LF endings, as pinned$/,
+    ],
+  },
+  {
+    // The realistic accident is a tidy-up: the escape call reads as redundant
+    // next to a payload that already crossed a JSON boundary, and its effect is
+    // invisible on every well-behaved document. Dropping it is therefore how
+    // this regresses.
+    //
+    // SEVERAL SEC-31 assertions fail, and they are independent findings rather
+    // than one restated. The markup leg is what the fix is for; the CSS leg is
+    // the half the popup's own CSP does NOT mitigate, because the table popup
+    // runs style-src 'unsafe-inline'. Measured on the unfixed tree:
+    // titleElements 2, outline 6.4px rgb(1,2,3) - i.e. the injected <style>
+    // really applied - plus bodyInjected 6 across the whole document. The
+    // collapse-panel and forced-tooltip legs are the two sinks a titleFormatter
+    // would NOT have closed, which is why the fix moved to the boundary.
+    //
+    // The CSP assertion is in mustPass on purpose. It passes in BOTH states,
+    // which is exactly the point: it is a control proving that script
+    // execution was never what protected this surface, so a reader cannot
+    // mistake the CSP for the fix.
+    // A FURTHER, INDEPENDENT WITNESS, and it is why the popup-error assertion is
+    // named here rather than left unlisted. On the FIXED tree the payload's
+    // <img ... onerror> never becomes an element, so there is no inline handler
+    // for the CSP to refuse and the popup console stays clean. Under the revert
+    // the handler is real and Chromium logs the refusal verbatim:
+    //   "Executing inline event handler violates ... 'script-src 'nonce-...''"
+    // So the CSP control passes in BOTH states for DIFFERENT REASONS - fixed:
+    // nothing was ever created; reverted: something was created and blocked -
+    // and this assertion is the only thing that can tell those two apart.
+    // REPOINTED. This record used to revert
+    //   columnDefaults: { titleFormatter: "plaintext" },
+    // which no longer exists: that fix was replaced by escaping the title at
+    // the IPC boundary, because a titleFormatter reaches only ONE of the three
+    // measured innerHTML title sinks - the header. It does not reach
+    // formatCollapsedData (the responsive-collapse panel reads
+    // definition.title RAW, pre-formatter) or loadTooltip. The stale anchor
+    // made this a SETUP-FAILED, so SEC-31 had no live proof at all.
+    id: "R503",
+    suite: "test:popups",
+    what: "stop escaping the column title at the IPC boundary, restoring the raw innerHTML title sinks",
+    file: MAIN,
+    from: "      title: escapeHtml(title),",
+    to: "      title: title,",
+    expect: [
+      /^SEC-31 a hostile column title renders as text, not markup$/,
+      /^SEC-31 a column title cannot inject CSS past style-src 'unsafe-inline'$/,
+      /^SEC-31 no hostile column title builds an element ANYWHERE in the popup$/,
+      /^SEC-31 the collapse panel paints the hostile title as text$/,
+      /^SEC-31 even a FORCED tooltip renders the column title as text, not markup$/,
+      /^every popup was watched, and none rendered a visible error$/,
+    ],
+    mustPass: [
+      /^SEC-31 the popup CSP still refuses an inline handler in a column title$/,
+      /^FEATURE table popup still builds the table under a hostile title$/,
+      /^SEC-06 table cell cannot terminate the popup's script element$/,
+      /^SEC-31 the wide fixture really does collapse columns into a panel$/,
+    ],
+  },
+  {
+    // THE ALLOW-LIST, which is the other half of the fix and had no record.
+    // The realistic accident is "preserve the caller's column options" - it
+    // reads as a courtesy and is invisible on every well-behaved document.
+    //
+    // Measured consequences, and they are independent findings: `formatter`
+    // reaches Tabulator again, and formatters.html is literally
+    // `function(e,t,i){return e.getValue()}` - raw, with no console warning -
+    // so the SEC-06 cell payload is written as markup and terminates the
+    // popup's script element. `headerTooltip: true` reaches Tabulator again,
+    // re-arming Tooltip.initializeColumn's column-mousemove subscriber, so a
+    // tooltip appears where the allow-list assertion says none should.
+    id: "R504",
+    suite: "test:popups",
+    what: "spread the sender's own column keys back into the definition, defeating the allow-list",
+    file: MAIN,
+    from: "    columns.push({",
+    to: "    columns.push(Object.assign({}, c, {",
+    also: {
+      from: '      headerFilterPlaceholder: "Filter...",\n    });',
+      to: '      headerFilterPlaceholder: "Filter...",\n    }));',
+    },
+    expect: [
+      /^SEC-06 table cell cannot terminate the popup's script element$/,
+      /^SEC-31 the allow-list drops headerTooltip, so no tooltip is wired at all$/,
+    ],
+    mustPass: [
+      /^SEC-06 the __pwned read channel is observable, so its absence checks mean something$/,
+      /^SEC-31 a hostile column title renders as text, not markup$/,
+    ],
+  },
+  {
+    // THE ORACLE'S OWN REGRESSION, and it is not hypothetical - this is the
+    // exact form the assertion shipped in, and it FAILED ON THE FIXED TREE
+    // while passing on the broken one.
+    //
+    // `body.innerHTML.includes("onerror=")` cannot distinguish an ATTRIBUTE
+    // from TEXT. Once the title is escaped it renders as a text node, and
+    // serialising that node back through innerHTML re-emits the literal
+    // characters `onerror=` - text serialisation escapes &, < and > but not
+    // quotes or `=`. So this revert makes the assertion fail while the product
+    // is correct, which is precisely why the oracle now asks for attributes
+    // structurally via getAttributeNames().
+    id: "R505",
+    suite: "test:popups",
+    what: "ask for the injected handler by substring over serialised markup instead of structurally",
+    file: POPUPS,
+    from: "           handlerAttrs: countHandlerAttrs(),",
+    to: "           handlerAttrs: document.body.innerHTML.includes('onerror=') ? 1 : 0,",
+    expect: [/^SEC-31 no hostile column title builds an element ANYWHERE in the popup$/],
+    mustPass: [
+      /^SEC-31 a hostile column title renders as text, not markup$/,
+      /^SEC-31 the collapse panel paints the hostile title as text$/,
+    ],
+  },
+  {
+    // THE titleDownload PREMISE, which is the entire justification for storing
+    // ESCAPED text in `title`. If exports stopped preferring titleDownload -
+    // a misspelled key, an unregistered option, an upstream change to
+    // colVisPropAttach - every CSV would silently carry &amp; and &lt; and
+    // nothing else in the suite would notice.
+    id: "R506",
+    suite: "test:popups",
+    what: "export the escaped title instead of the raw one, corrupting every CSV header",
+    file: MAIN,
+    from: "      titleDownload: rawTitle || title,",
+    to: "      titleDownload: escapeHtml(title),",
+    expect: [/^SEC-31 the CSV export carries the RAW column title, not the escaped one$/],
+    mustPass: [
+      /^FEATURE table popup CSV export completes, so SEC-30's guard admits it$/,
+      /^SEC-31 a hostile column title renders as text, not markup$/,
+    ],
+  },
+  {
+    // THE SAME REVERT AS R503, MEASURED THROUGH THE OTHER SUITE, and it is not
+    // a duplicate. R503 proves the boundary assertions bite when the payload is
+    // handed to ipcMain directly. This one proves the END-TO-END path bites:
+    // markdown -> DOMPurify -> extractTableData -> IPC -> normaliseTablePayload
+    // -> Tabulator. Either could pass while the other failed - a producer that
+    // stopped emitting `title` would leave R503 green and this red - so the two
+    // are independent findings and both are recorded.
+    id: "R507",
+    suite: "test:tables",
+    what: "stop escaping the column title, measured end-to-end from a real markdown document",
+    file: MAIN,
+    from: "      title: escapeHtml(title),",
+    to: "      title: title,",
+    expect: [/^SEC-31 a hostile header in a real DOCUMENT reaches the popup as text$/],
+    mustPass: [
+      /^no page errors while rendering tables$/,
+      /^the error sentinel was demonstrably watching both channels$/,
+    ],
+  },
+  {
+    // THE INLINING HAZARD, planted where a vendor bump would realistically
+    // introduce it. tabulator.min.js is spliced into the table popup as
+    // <script> CONTENT, and the HTML tokenizer scans that content for the raw
+    // byte sequence "</script" without regard for JavaScript syntax - so one
+    // occurrence anywhere in the bundle, even inside a comment or a string,
+    // ends the element early and everything after it is parsed as MARKUP.
+    id: "R508",
+    suite: "test:packaging",
+    what: "let an element-terminating sequence into a vendored file that is inlined into the popup",
+    file: TABULATOR_JS,
+    from: "/* Tabulator v6.5.2 (c) Oliver Folkerd 2026 */",
+    to: "/* Tabulator v6.5.2 (c) Oliver Folkerd 2026 </script> */",
+    expect: [
+      /^no vendored file inlined into the table popup can terminate its own element$/,
+    ],
+    mustPass: [
+      /^the inlining needle matcher actually matches, so its absences mean something$/,
+    ],
+  },
+  {
+    // THE CONTROL FOR THAT INVARIANT, which is an ABSENCE check and therefore
+    // fails open: a mistyped needle, a wrong path or an empty read would all
+    // report "clean". This blinds the matcher and requires the control - and
+    // only the control - to notice.
+    id: "R509",
+    suite: "test:packaging",
+    what: "blind the inlining needle matcher, so its absence checks stop meaning anything",
+    file: PKG_TEST,
+    from: '    const controlBody = "x</script<script<!-- -->y</style".toLowerCase();',
+    to: '    const controlBody = "".toLowerCase();',
+    expect: [
+      /^the inlining needle matcher actually matches, so its absences mean something$/,
+    ],
+    mustPass: [
+      /^no vendored file inlined into the table popup can terminate its own element$/,
+    ],
+  },
+  {
+    id: "R510",
+    // THE DRIFT THAT WAS ACTUALLY FOUND, reproduced exactly. docs/BUILD.md
+    // printed the pre-rebrand repo as the configuration in force while
+    // package.json said "folia", and the paragraph directly beneath the example
+    // asserted the feed resolves to lostinsea/folia. The document contradicted
+    // itself across several releases and nothing noticed, because its only
+    // reader was a human. Prose that states a value the build depends on is
+    // worth pinning to the value itself.
+    what: "document the pre-rebrand publish repo while package.json says folia",
+    file: BUILD_DOC,
+    from: '"repo": "folia" }]',
+    to: '"repo": "markdown-viewer" }]',
+    suite: "test:packaging",
+    expect: [
+      /^docs\/BUILD\.md documents the publish target package\.json actually uses$/,
+    ],
+    mustPass: [
+      // package.json is untouched, which is what makes this a proof about the
+      // DOCUMENT rather than about the build configuration. Both config-side
+      // assertions must therefore hold: if either moved, the record would be
+      // measuring the wrong thing.
+      /^auto-update publishes to this fork's own GitHub releases$/,
+      /^update feed does not point at the upstream parent repo$/,
+    ],
+  },
+  {
+    id: "R511",
+    // THE FAIL-OPEN HALF, and the reason the block count is asserted at all.
+    // Any check that reads a document can lose its SUBJECT: with the example
+    // gone, "every documented block matches the config" is vacuously true and a
+    // naive version reports success while reading nothing. This is the likelier
+    // accident of the two - documentation gets rewritten far more often than it
+    // gets deliberately falsified - so the guard is proven rather than trusted.
+    what: "remove the publish example from docs/BUILD.md so the doc check has nothing to read",
+    file: BUILD_DOC,
+    from: '"publish": [{ "provider": "github", "owner": "lostinsea", "repo": "folia" }]',
+    to: '"publish": null',
+    suite: "test:packaging",
+    expect: [
+      /^docs\/BUILD\.md documents the publish target package\.json actually uses$/,
+    ],
+    mustPass: [
+      /^auto-update publishes to this fork's own GitHub releases$/,
+    ],
+  },
+  {
+    id: "R512",
+    // The rename this repo actually performed, left half-done.
+    //
+    // test:migration -> test:profile moved test/test-userdata-migration.js to
+    // test/test-dev-profile.js with a `git mv`. Had package.json been left
+    // naming the old path, npm would have run `node` against a file that does
+    // not exist and the suite would simply not have run - and the ONLY signal
+    // would have been a failed chain run minutes later, or, if the chain was
+    // not run, none at all.
+    //
+    // The electron isolation sweep immediately above this assertion could never
+    // have caught it: its subject list is derived from `electron test/...`, and
+    // this suite is run by plain `node`. That gap is exactly what the new
+    // assertion closes, and this revert is what proves the closure is real
+    // rather than a passing line that has never been asked a question.
+    what: "point test:profile back at the pre-rename path so a node-run suite file is missing",
+    file: PKG,
+    from: '"test:profile": "node test/test-dev-profile.js",',
+    to: '"test:profile": "node test/test-userdata-migration.js",',
+    suite: "test:packaging",
+    expect: [
+      /^every test suite package\.json names actually exists on disk$/,
+    ],
+    mustPass: [
+      /^every Electron test suite establishes an isolated userData profile$/,
+    ],
+  },
+  {
+    id: "R513",
+    // The floor, not the assertion.
+    //
+    // "every Electron test suite establishes an isolated userData profile"
+    // guards TWO things: that no suite in the subject set is unisolated, and
+    // that the subject set is still the whole population. The second half is
+    // the floor, and it stood at `>= 8` against a MEASURED 10 - two suites of
+    // slack, i.e. a sweep could silently stop seeing 20% of the estate and
+    // still report itself pinned. Same magic-number defect as the licence
+    // guard's `> 200` against a real 220 and the placeholder 1.0 in
+    // DEFAULT_SELECTION_FLOOR.
+    //
+    // This revert is the realistic accident that the old floor waved through:
+    // one suite moved off the `electron` runner. It leaves `unisolated` EMPTY -
+    // test-theme.js still carries the module-scope require - so the assertion
+    // can only fail on its floor, which is what makes this a proof about the
+    // floor's VALUE rather than about the guard's existence. Same shape as
+    // R371 and R399: narrow the subject set, never loosen the constant.
+    //
+    // The neighbouring existence assertion is in mustPass because it must NOT
+    // move: the suite is still referenced and still exists on disk, it has
+    // merely changed runner, so nodeOnlySuites goes 2 -> 3 and every one of its
+    // conjuncts still holds. That is what shows the two assertions measure
+    // different properties rather than one property twice.
+    what: "move test:theme off the electron runner so the isolation sweep's subject set silently shrinks",
+    file: PKG,
+    from: '&& electron test/test-theme.js"',
+    to: '&& node test/test-theme.js"',
+    suite: "test:packaging",
+    expect: [
+      /^every Electron test suite establishes an isolated userData profile$/,
+    ],
+    mustPass: [
+      /^every test suite package\.json names actually exists on disk$/,
+    ],
+  },
+  {
+    id: "R518",
+    // F32: CI existed, and CI never ran a windowed test.
+    //
+    // Before ci.yml, `release.yml` was the only workflow. It triggers on a
+    // `v*` tag or a manual dispatch - never on an ordinary push or a pull
+    // request - and its one test step is `npm run test:packaging`, which runs
+    // under plain node. So the ten suites that drive real BrowserWindows,
+    // roughly 1,850 assertions including every render-security regression
+    // test, had never executed anywhere but on the maintainer's machine.
+    //
+    // THE REVERT IS THE REALISTIC ACCIDENT, NOT A DELETION. Deleting ci.yml
+    // is the easy case: the workflow file simply stops existing and anything
+    // looking for it notices. The likelier edit is the one that keeps the
+    // workflow, keeps the green tick, and quietly narrows what it runs -
+    // "the windowed suites are slow on a hosted runner, let's just run
+    // packaging in CI". That is exactly the state the repository was already
+    // in, so it is the state that must be provably unreachable.
+    //
+    // It bites for a measured reason: `ci.yml -> test` is the ONLY route from
+    // any workflow to any `electron test/*.js` invocation. Resolving both
+    // workflows transitively reaches all 10 declared suites; resolving
+    // release.yml alone reaches 0. Narrowing this one step therefore drops
+    // coverage from 10/10 to 0/10 in a single line.
+    //
+    // The two positive-control assertions are in `mustPass` on purpose. Both
+    // are counts derived by regex, and the coverage assertion compares one
+    // derived set against another - so if either parse silently stopped
+    // matching, an empty set would agree with an empty set and the coverage
+    // check would pass having inspected nothing. Requiring the controls to
+    // survive is what distinguishes "CI runs no windowed suite" from "this
+    // assertion can no longer see anything at all".
+    file: CI_YML,
+    what: "CI narrowed to the node-only packaging suite, leaving the ten windowed suites unguarded",
+    from: "        run: npm test\n",
+    to: "        run: npm run test:packaging\n",
+    suite: "test:packaging",
+    expect: [
+      /^CI runs every Electron test suite, not just the node-only ones$/,
+    ],
+    mustPass: [
+      /^the workflows invoke npm scripts this assertion can follow$/,
+      /^package\.json declares Electron suites for CI to run$/,
+    ],
+  },
+  {
+    id: "R519",
+    // The doc drifted past the pin - the publish-block defect, one paragraph
+    // further down the same file.
+    //
+    // Both citations in the URL example are DERIVED from the Electron version
+    // package.json pins: @electron/get asks for `v<version>/` and
+    // `electron-v<version>-<platform>-<arch>.zip`. Bumping Electron and not
+    // touching the doc leaves a reader configuring a mirror to serve a release
+    // the build never requests, which fails as a 404 from a host the reader
+    // has just been told to trust - the most confusing shape a mirror failure
+    // can take.
+    //
+    // THE REVERT IS THE REAL ACCIDENT: nobody edits this section during a
+    // version bump, so every citation goes stale together. `also` carries the
+    // third one in the prose bullet, which is a separate line and would
+    // otherwise survive - and if it did survive, the assertion would still
+    // fail, so the `also` is about reproducing the accident faithfully rather
+    // than about making the revert bite.
+    //
+    // 43.2.0 is not an arbitrary number: it is the version this repository
+    // actually shipped before the w2-l5 bump, so the reverted doc is a
+    // byte-accurate picture of the drift this assertion exists to refuse.
+    file: BUILD_DOC,
+    what: "docs/BUILD.md left citing the pre-bump Electron version in its mirror URL example",
+    from:
+      "https://github.com/electron/electron/releases/download/  v43.4.1/  electron-v43.4.1-win32-x64.zip\n",
+    to:
+      "https://github.com/electron/electron/releases/download/  v43.2.0/  electron-v43.2.0-win32-x64.zip\n",
+    also: {
+      from: "leading `v` (`v43.4.1`). Most\n",
+      to: "leading `v` (`v43.2.0`). Most\n",
+    },
+    suite: "test:packaging",
+    expect: [
+      /^docs\/BUILD\.md's Electron mirror example cites the pinned Electron version$/,
+    ],
+  },
+  {
+    id: "R520",
+    // The other half of the same assertion, and the half that fails OPEN.
+    //
+    // "no citation names a stale version" is satisfied by a section that names
+    // no version at all, so the count floor is what stops the check passing by
+    // having lost its subject. That is this suite's recorded disease, and the
+    // realistic accident is not malice - it is someone tidying a verbose ASCII
+    // URL diagram down to a sentence, which reads like an improvement and
+    // silently retires the guard.
+    //
+    // It is deliberately COMPLEMENTARY to R519 rather than a second way of
+    // saying the same thing: R519 leaves the citations in place and makes them
+    // wrong, R520 leaves nothing wrong and removes the citations. Each fails
+    // exactly one conjunct, so the evidence line names which half bit. Joined,
+    // they would be indistinguishable.
+    //
+    // One citation survives in the prose bullet below, so the section is not
+    // emptied - the floor has to be a real count rather than an existence
+    // check to notice.
+    file: BUILD_DOC,
+    what: "the mirror URL example replaced by prose, leaving the version check with nothing to read",
+    from:
+      "https://github.com/electron/electron/releases/download/  v43.4.1/  electron-v43.4.1-win32-x64.zip\n                       ELECTRON_MIRROR                ELECTRON_CUSTOM_DIR\n",
+    to: "<base><ELECTRON_MIRROR><ELECTRON_CUSTOM_DIR>/<artifact zip>\n",
+    suite: "test:packaging",
+    expect: [
+      /^docs\/BUILD\.md's Electron mirror example cites the pinned Electron version$/,
+    ],
+  },
+  {
+    id: "R514",
+    // The two oracles that disagreed with each other.
+    //
+    // post-upstream-merge.sh is run after every upstream merge and PRINTS
+    // INSTRUCTIONS. One of its checks required an `app-title` element inside a
+    // `#logoLink` in index.html - markup this fork deliberately deleted when
+    // the header was cut down to the hamburger alone. Neither element exists.
+    // So the script told the maintainer to re-add something that
+    // test-packaging.js and test-tab-refresh.js both assert must stay gone:
+    // obeying one guard guaranteed failing the other, and had done for as long
+    // as both existed. Nothing tied the script's expectations to the tree.
+    //
+    // This revert restores exactly that state - re-adding the rotted check -
+    // and the new assertion must catch it. It is deliberately the CONTENT
+    // failure and not a parse failure: lineChecks goes 6 -> 7, so the floor in
+    // "checks are still parseable" still clears and is in mustPass to prove the
+    // failure came from the tree comparison rather than from the regexes
+    // falling over.
+    //
+    // The header-content assertion is also in mustPass, and is the sharper of
+    // the two: it reads index.html, which this revert does not touch. index.html
+    // stays correct while the script's description of it becomes false - which
+    // is the whole point, because that gap is invisible to every assertion that
+    // only reads the tree.
+    what: "restore the rotted app-title check that told maintainers to re-add deleted header markup",
+    file: MERGE_SH,
+    from:
+      "check_line \"$ROOT/src/index.html\" '<title>Folia</title>'  '<title>Folia</title>'",
+    to:
+      "check_line \"$ROOT/src/index.html\" 'app-title'              " +
+      "'<span class=\"app-title\">Folia</span> - inside #logoLink'\n" +
+      "check_line \"$ROOT/src/index.html\" '<title>Folia</title>'  '<title>Folia</title>'",
+    suite: "test:packaging",
+    expect: [
+      /^post-upstream-merge\.sh index\.html checks all still match$/,
+    ],
+    mustPass: [
+      /^post-upstream-merge\.sh checks are still parseable$/,
+      /^the single-row header carries no in-header product name at all$/,
+    ],
+  },
+  {
+    id: "R515",
+    // A pointer, in a shipped document, at a file that does not ship.
+    //
+    // THIRD-PARTY-NOTICES.md installs into resources/ and opens by telling the
+    // reader where Folia's own licence is. It said `LICENSE`. The repository
+    // has both `LICENSE` and `LICENSE.txt` - deliberately, and the packaging
+    // suite already pins them byte-identical - but extraResources ships only
+    // `LICENSE.txt`, because a bare extensionless file is a "how do you want to
+    // open this" dialog on Windows. So the single pointer in the installed
+    // notices named the one licence file that is not installed beside it.
+    //
+    // The README's relative links were already pinned to extraResources, and
+    // that oracle is in mustPass here to show it could never have caught this:
+    // it passes throughout, because the pointer is inline CODE rather than a
+    // markdown link, and it lives in the other shipped document entirely.
+    //
+    // The generator is reverted TOGETHER with its output, because the notices
+    // file is generated and separately pinned as not-stale. Reverting the
+    // artifact alone would fail the staleness assertion too and prove nothing
+    // about the pointer; keeping both in step means the tree is perfectly
+    // self-consistent and only the shipping question can flip. That is why
+    // "the committed notices file is not stale" is in mustPass rather than
+    // expect.
+    what: "point the shipped notices at `LICENSE`, which extraResources does not install",
+    file: NOTICES,
+    from: "under the MIT licence (see `LICENSE.txt`)",
+    to: "under the MIT licence (see `LICENSE`)",
+    also: {
+      file: NOTICES_GEN,
+      from: "under the MIT licence (see `LICENSE.txt`)",
+      to: "under the MIT licence (see `LICENSE`)",
+    },
+    suite: "test:packaging",
+    expect: [
+      /^the notices file's licence pointer names a file that ships beside it$/,
+    ],
+    mustPass: [
+      /^the committed notices file is not stale$/,
+      /^the notices file still states where Folia's own licence is$/,
+      /^every relative README link points at a file that ships beside it$/,
+      /^LICENSE and LICENSE\.txt have not drifted apart$/,
+    ],
+  },
+  {
+    id: "R516",
+    // F21, the half no behavioural test can reach.
+    //
+    // The renderer runs nodeIntegration: true, so DevTools is a Node REPL with
+    // the user's filesystem rights. main.js bound it to F12 in EVERY build with
+    // no gate, which is the "open this file, press F12, paste this" route -
+    // it needs no bug in the app, only a person following instructions.
+    //
+    // This revert removes the gate and leaves devToolsAllowed() DEFINED and
+    // correct. That is the point of its mustPass list: "the DevTools gate is
+    // defined and reads app.isPackaged" keeps passing throughout, so the proof
+    // is that the gate is APPLIED to the call site, not merely present in the
+    // file. A regex looking for `devToolsAllowed` anywhere in main.js would
+    // have been satisfied by the reverted form.
+    //
+    // The menu-bar assertion is in mustPass for the same reason from the other
+    // direction: the accelerator route stays closed here, so the failure is
+    // attributable to the keybinding alone rather than to DevTools becoming
+    // reachable in general.
+    what: "let F12 open a Node-privileged DevTools console in every shipped build",
+    file: MAIN,
+    from:
+      '    if (input.key === "F12" && input.type === "keyDown") {\n' +
+      "      if (devToolsAllowed()) {\n" +
+      "        event.preventDefault();\n" +
+      "        mainWindow.webContents.toggleDevTools();\n" +
+      "      }\n" +
+      "    } else if",
+    to:
+      '    if (input.key === "F12" && input.type === "keyDown") {\n' +
+      "      event.preventDefault();\n" +
+      "      mainWindow.webContents.toggleDevTools();\n" +
+      "    } else if",
+    suite: "test:packaging",
+    expect: [/^the DevTools toggle is behind the packaged-build gate$/],
+    mustPass: [
+      /^main\.js has exactly one DevTools toggle to guard$/,
+      /^the DevTools gate is defined and reads app\.isPackaged$/,
+      /^the main window drops its menu bar, which suppresses the DevTools accelerator$/,
+    ],
+  },
+  {
+    id: "R517",
+    // The other half of F21, and the one that was invisible.
+    //
+    // Electron installs a default application menu when nothing calls
+    // Menu.setApplicationMenu, and its View submenu binds Toggle Developer
+    // Tools to Ctrl+Shift+I. So gating F12 alone would have closed nothing if
+    // any window ever lacked setMenu(null).
+    //
+    // MEASURED with a positive control before any of this was written: two
+    // identical windows were sent a synthesised Ctrl+Shift+I; the one WITHOUT
+    // setMenu(null) opened DevTools, the one with it did not. Every window the
+    // app creates does call it - so the global suppression this revert removes
+    // is inert TODAY and is defence against a window added later that forgets.
+    //
+    // That is exactly why the revert has to be proven behaviourally in the live
+    // app rather than by grepping main.js: the property is "no menu exists at
+    // runtime", and a source-text check would keep passing if the call were
+    // moved behind a condition that never runs.
+    what: "restore Electron's default application menu, whose View submenu binds DevTools to Ctrl+Shift+I",
+    file: MAIN,
+    from:
+      "    // Before any window exists, so no window can ever see the default menu.\n" +
+      "    suppressDefaultApplicationMenu();\n\n",
+    to: "",
+    suite: "test:security",
+    expect: [
+      /^no default application menu survives startup, so no stock keystroke reaches DevTools$/,
+    ],
+    mustPass: [
+      /^the error sentinel was demonstrably watching both channels$/,
+      /^nothing rendered a visible error at any point during the suite$/,
+    ],
+  },
+  {
+    id: "R450",
+    // SEC-29, the invariant the fix's own comment promises and nothing measured
+    // until now: the two deny-lists are shared BY REFERENCE, so a tag added to
+    // SANITIZE_CONFIG cannot leave the table path behind again.
+    //
+    // This revert is the realistic accident - literal copies, which read as
+    // harmless tidying - and its whole value is that it is BEHAVIOURALLY INERT
+    // TODAY. Both SEC-29 strip assertions and SEC-11 are in mustPass precisely
+    // because they keep passing: the drift is invisible to every behavioural
+    // test in the suite, which is why an identity assertion has to exist.
+    //
+    // The freeze is deliberately RETAINED in the reverted form, so only the
+    // aliasing half of the assertion can flip and the evidence JSON names it.
+    what: "give the table config literal copies of the deny-lists instead of sharing SANITIZE_CONFIG's arrays",
+    file: RENDERER,
+    from:
+      "  FORBID_TAGS: SANITIZE_CONFIG.FORBID_TAGS,\n" +
+      "  FORBID_ATTR: SANITIZE_CONFIG.FORBID_ATTR",
+    to:
+      "  FORBID_TAGS: Object.freeze(['form']),\n" +
+      "  FORBID_ATTR: Object.freeze(['action', 'formaction', 'download'])",
+    suite: "test:security",
+    expect: [
+      /^SEC-29 the table config shares SANITIZE_CONFIG's deny-lists by reference, frozen$/,
+    ],
+    mustPass: [
+      /^SEC-29 a <form> nested in a table cell is stripped on the context-menu table path$/,
+      /^SEC-29 a <form> nested in a table cell is stripped in the table dialog preview$/,
+      /^SEC-11 <form action> and formaction are stripped, their content is not$/,
+    ],
+  },
+  {
     id: "R147",
     suite: "test:security",
     what: "resolve relative image sources against document.baseURI again (index.html inside the asar, so a sibling PNG never loads)",
@@ -1912,7 +4632,35 @@ const REVERTS = [
     // survives the body being restructured (the R53 lesson).
     from: "function lockfileClosure(packages, roots) {",
     to: "function lockfileClosure(packages, roots) { if (roots) return new Set();",
-    expect: [/every library vendored into libs\/ has a notice/],
+    // WIDENED with the rationale recorded, rather than left understating the
+    // revert. Emptying the closure removes the bundled devDependencies from
+    // the generated notices outright, so every assertion that reads the
+    // generated set fails as an HONEST CONSEQUENCE of the same edit - the
+    // compliance oracle this revert is named for, plus the staleness compare
+    // (the committed file still documents them), the version-level oracle and
+    // the per-package dompurify check. Naming only the first understated it;
+    // these four are one defect observed from four angles, which is the
+    // layered coverage working rather than collateral.
+    expect: [
+      /every library vendored into libs\/ has a notice/,
+      /the committed notices file is not stale/,
+      /every bundled version is documented, including duplicate versions of the same package/,
+      /dompurify appears in the notices/,
+    ],
+    // The fourth regex above is UNOBSERVABLE AT REST, and that is a property of
+    // the assertion rather than a defect in this record. `dompurify appears in
+    // the notices` is emitted only from the `if (!m)` branch in
+    // test-packaging.js - when the heading is found, which is the healthy
+    // state, that check never runs and never prints its name. So a clean-tree
+    // catalogue cannot contain it and `--expects` reported it as an orphan.
+    //
+    // Excused only after MEASURING it rather than reasoning about it: running
+    // this revert produces `FAIL  dompurify appears in the notices  -> no
+    // heading found`, so the regex is live. Excusing an orphan that is actually
+    // dead would silently disarm the revert, which is the one outcome this
+    // audit exists to prevent.
+    nameVariesWithState:
+      "test-packaging.js:2548 only emits this name from its !m failure branch, so it cannot appear in a clean-tree catalogue",
   },
   {
     id: "R152",
@@ -7638,27 +10386,59 @@ const REVERTS = [
     // what turn an argument between two reviewers into a property the suite
     // re-establishes on every run.
     what: "re-enter code mode at ${ inside a template literal, as review proposed",
-    file: THEME_TEST,    from:
-      '          if (ch === "\\\\") out += src[++i] || "";\n' +
-      "          else if (ch === quote) quote = \"\";",
+    // REPOINTED. The stripper was extracted out of test-theme.js into the
+    // shared test/test-source-utils.js so only one copy exists (the duplicated
+    // overlay matcher in post-upstream-merge.sh is the recorded cost of the
+    // alternative). The anchor moved with it and its indentation dropped from
+    // 10 spaces to 6; the proof itself is unchanged, and it now covers the
+    // helper every suite consumes rather than one suite's private copy.
+    file: SOURCE_UTILS,
+    from:
+      '      if (ch === "\\\\") out += src[++i] || "";\n' +
+      "      else if (ch === quote) quote = \"\";",
     to:
-      '          if (ch === "\\\\") out += src[++i] || "";\n' +
-      '          else if (quote === "`" && ch === "$" && src[i + 1] === "{") {\n' +
-      '            out += src[++i];\n' +
-      '            quote = "";\n' +
-      "          } else if (ch === quote) quote = \"\";",
+      '      if (ch === "\\\\") out += src[++i] || "";\n' +
+      '      else if (quote === "`" && ch === "$" && src[i + 1] === "{") {\n' +
+      '        out += src[++i];\n' +
+      '        quote = "";\n' +
+      "      } else if (ch === quote) quote = \"\";",
     suite: "test:theme",
     expect: [
       /10i: the scheme-leak sweep catches an unquoted id and ignores the same letters in prose \(control\)/,
       // THE SECOND FAILURE IS THE FINDING, and it is worth more than the plant.
       // The plant is synthetic; this one is the desync damaging a sweep over
-      // the REAL product source. The mermaid.initialize assertion scans
-      // comment-stripped renderer.js precisely because a third "site" lives
-      // inside a comment at renderer.js:2358 - so a stripper that leaves a
-      // comment standing hands that assertion a phantom third site. It is an
-      // independent witness that the remedy fails open on shipped code rather
-      // than only on a fixture, which is exactly what the plant claims.
-      /10i: both mermaid\.initialize sites pass a palette chosen by a plain mode flag/,
+      // the REAL product source: measured, this transform leaves 1014 of
+      // renderer.js's 3177 comment lines standing, the first at line 339, and
+      // 185 of main.js's 622. It is an independent witness that the remedy
+      // fails open on shipped code rather than only on a fixture, which is
+      // exactly what the plant claims.
+      //
+      // IT IS NOT THE WITNESS THIS RECORD ORIGINALLY NAMED, AND THE REPLACEMENT
+      // IS THE LESSON. The original named the initialise sweep, which reported
+      // a phantom THIRD site because the desync left a commented-out
+      // mermaid.initialize() standing. That came back WRONG-GUARD on re-proof
+      // and the transform had not become safe - the WITNESS had retired.
+      // Measured, on the tree that retired it: raw renderer.js reads 3 sites,
+      // a healthy stripper 2, and the broken stripper ALSO 2. The transform
+      // sets quote = "" at ${, so a template's own closing backtick is then
+      // read in code context and OPENS a fresh string; state therefore flips on
+      // every subsequent backtick and whether any given line is scanned as code
+      // is a matter of backtick PARITY at its offset. Edits elsewhere in
+      // renderer.js moved that parity - the commented site itself moved :2358
+      // -> :3127 - and the desync's reach stopped covering it.
+      //
+      // GENERAL FORM, and it is new: A WITNESS DRAWN FROM LIVE PRODUCT SOURCE
+      // IS ONLY AS STABLE AS THAT SOURCE'S INCIDENTAL STRUCTURE. The plant
+      // table is a fixture and cannot rot this way; a single named line in a
+      // file under active edit can, silently. Same family as the recorded
+      // disjunction disease, but the failure mode is RETIREMENT rather than
+      // ambiguity - and the fail-loud harness reported it as WRONG-GUARD rather
+      // than quietly counting a proof that had stopped proving anything.
+      //
+      // The replacement is AGGREGATE for exactly that reason: a desync
+      // beginning at line 339 cannot hide behind parity across 3177 lines the
+      // way one line could.
+      /10i: the shared comment stripper leaves no line comment standing in renderer\.js/,
     ],
   },
 
@@ -9724,6 +12504,161 @@ const REVERTS = [
             /^a zoom step on the stale-budget path does not force a layout into the click handler$/,
           ],
         },
+        {
+          id: "R521",
+          // F18, THE app.exit TIER. Disabled in place rather than deleted -
+          // R222's precedent: the likelier accident is a condition edited into
+          // something that never fires, not a block that vanishes.
+          //
+          // THE MEASUREMENT THIS PINS, and it corrects a fact this project had
+          // recorded WRONGLY. `app.exit()` does NOT reliably run
+          // process.on("exit"): whether it does depends entirely on whether it
+          // is reached while still inside the ready event's own native
+          // dispatch. Measured, all five inside app.whenReady().then():
+          //   synchronous / queueMicrotask / Promise.resolve().then  -> NO
+          //   setImmediate / setTimeout(...,0)                       -> YES
+          // The earlier "probe A proves app.exit runs the exit hook" note used
+          // setTimeout(...,200), which hid the condition. So on the six windowed
+          // suites that end synchronously the exit hook is not merely late, it
+          // never runs at all, and this wrapper is the ONLY thing that sweeps.
+          //
+          // DELIBERATELY NARROW, and the narrowness is the whole design. The
+          // generated Electron child exits via setImmediate - the STABLE shape,
+          // chosen because the microtask shape flaked ~12% with 0xC0000005 - so
+          // the exit hook DOES run there and the two consequence assertions
+          // (the dir is gone, the counter says one) stay green under this
+          // revert. That is correct: they are the claim that matters and either
+          // mechanism may satisfy it. Only the CAUSE assertion, which reads a
+          // snapshot taken by a handler registered BEFORE the utils require and
+          // therefore before the registry's own hook, can distinguish them.
+          what: "never wrap app.exit, leaving suites that terminate inside the ready dispatch with no sweep at all",
+          file: VISUAL,
+          from: '  if (app && typeof app.exit === "function" && !app.__foliaTempSweepWrapped) {',
+          to: "  if (false) {",
+          suite: "test:visual",
+          expect: [
+            /^the sweep runs inside app\.exit\(\), before any process exit handler$/,
+          ],
+          mustPass: [
+            /^the child suite really ran to its exit handler and reported back$/,
+            /^a registered temp dir is removed even when the suite ends with app\.exit\(\)$/,
+            /^the exit sweep counts exactly the dirs still registered when it runs$/,
+            /^the plain-node child really ran and reported back$/,
+            /^the process exit hook sweeps a plain-node run that never calls app\.exit$/,
+          ],
+        },
+        {
+          id: "R522",
+          // F18, THE OTHER TIER. The two mechanisms are complements, not
+          // belt-and-braces, and each needs a target the other structurally
+          // cannot cover:
+          //   Electron suite, app.exit()  -> finally does NOT run, the exit
+          //                                  hook runs only past a macrotask
+          //                                  boundary  -> the wrapper
+          //   plain node, return/throw    -> no app, no app.exit at all
+          //                                  -> this hook
+          //
+          // THIS RECORD IS ONLY NON-VACUOUS BECAUSE OF THE PLAIN-NODE CHILD.
+          // Before it existed every temp-sweep assertion in the suite ran
+          // against a child that ends with app.exit(), so with the wrapper live
+          // the hook was never the mechanism doing the work and deleting it
+          // left the whole suite green - the recorded disjunction disease, where
+          // a claim satisfiable by two sources measures neither. The plain-node
+          // child (ELECTRON_RUN_AS_NODE=1, no window, ends by returning from its
+          // main module) has no app to wrap, so the hook is the only thing that
+          // can clean up after it, and its report writer is registered AFTER the
+          // require so the hook must already have run by the time it reports.
+          //
+          // If this ever comes back VACUOUS, diagnose the CHILD, not the revert:
+          // recorded precedent (R259, R295, R372, R384, R401) is that a vacuous
+          // verdict is a defect in the test.
+          what: "drop the process exit hook, leaving a plain-node suite with nothing to sweep its temp dirs",
+          file: VISUAL,
+          from: 'process.on("exit", sweepTempDirs);',
+          to: "void sweepTempDirs;",
+          suite: "test:visual",
+          expect: [
+            /^the process exit hook sweeps a plain-node run that never calls app\.exit$/,
+          ],
+          mustPass: [
+            // The wrapper covers the whole Electron tier on its own, so every
+            // app.exit assertion must survive this. If one of them fails here
+            // the two mechanisms are not the complements this design claims.
+            /^the child suite really ran to its exit handler and reported back$/,
+            /^a registered temp dir is removed even when the suite ends with app\.exit\(\)$/,
+            /^the exit sweep counts exactly the dirs still registered when it runs$/,
+            /^the sweep runs inside app\.exit\(\), before any process exit handler$/,
+            // The vacuity guard for the assertion above: a plain-node child that
+            // never ran would leave it unfalsifiable, so a broken spawn must
+            // report as a broken spawn rather than as a proof.
+            /^the plain-node child really ran and reported back$/,
+          ],
+        },
+        {
+          id: "R523",
+          // F05. The asar oracle used to pin components/prism-core.min.js,
+          // which was the wrong file TWICE OVER: src/index.html loads exactly
+          // one Prism file (libs/prismjs/prism-bundle.js) and nothing has ever
+          // loaded components/, and components/ could not have loaded even if
+          // something tried - prism-clike.min.js was never vendored, so 8 of
+          // its 14 language components could not resolve. So the guard pinned a
+          // never-loaded file while the file that actually carries syntax
+          // highlighting went unpinned: dropping the bundle would have left
+          // this assertion green.
+          //
+          // Pointing it back is the whole revert, and it bites because the
+          // redundant payload has since been DELETED - the named file is no
+          // longer in the archive at all.
+          //
+          // PRECONDITION, and it is the trap this record exists to stop the
+          // next reader falling into: dist/ must have been built AFTER the
+          // deletion. The freshness gate keys on package-lock.json only, so a
+          // dist/ predating the deletion is still "fresh" by that test, still
+          // contains components/prism-core.min.js, and would make this revert
+          // come back VACUOUS - not because the guard is weak but because the
+          // artefact under it is older than the tree. Rebuild, then re-run.
+          what: "point the asar Prism oracle back at components/prism-core.min.js, the file nothing loaded",
+          // MECHANISM (a) IN THE --expects EXCUSAL NOTE: the name is chosen
+          // from state. The oracle loops over a list of paths and templates its
+          // assertion name from whichever path it is on, so on a clean tree it
+          // emits `libs/prismjs/prism-bundle.js is really inside ...` and the
+          // components/ name this revert expects does not exist until the
+          // revert has been applied. That is not a rotted regex - it is the
+          // same shape as R154, and naming the bundle instead would match a
+          // live assertion that this revert does not make fail, which is
+          // strictly worse: it would report PROVEN while proving nothing.
+          nameVariesWithState:
+            "test-packaging.js templates this name from the path under test, so the components/ spelling only exists once the revert is applied",
+          file: PKG_TEST,
+          from: '              "libs/prismjs/prism-bundle.js",\n            ]) {',
+          to: '              "libs/prismjs/components/prism-core.min.js",\n            ]) {',
+          suite: "test:packaging",
+          expect: [
+            // The assertion NAME is templated from the path, so the revert does
+            // not fail the bundle's assertion - it replaces it with a
+            // differently-named one that fails. Naming the bundle here would
+            // match nothing and report a false SETUP-style pass.
+            /^libs\/prismjs\/components\/prism-core\.min\.js is really inside the built app\.asar$/,
+          ],
+          mustPass: [
+            // The complement stays GREEN, and that is the point: one assertion
+            // pins that the file the renderer loads is PRESENT, the other pins
+            // that the 143.8 KB of redundant payload is ABSENT. A single
+            // assertion cannot carry both claims, and this revert moving only
+            // the first is what demonstrates they are independent.
+            /^the built app\.asar carries exactly one PrismJS file, the bundle the renderer loads$/,
+            // The three vendored libraries share the loop but not the path, so
+            // a revert that broke the loop itself rather than its Prism entry
+            // would show up here instead.
+            /^libs\/vendor\/marked\.min\.js is really inside the built app\.asar$/,
+            /^libs\/vendor\/mermaid\.min\.js is really inside the built app\.asar$/,
+            /^libs\/vendor\/purify\.min\.js is really inside the built app\.asar$/,
+            // And the block must have RUN. If the asar went stale or unreadable
+            // the whole set above disappears rather than failing, which is
+            // exactly the vacuity the precondition note warns about.
+            /^the built app\.asar can be inspected$/,
+          ],
+        },
       ];
 
 const argv = process.argv.slice(2);
@@ -9808,6 +12743,23 @@ function failedNames(out) {
     .map((l) => l.trim());
 }
 
+// ONE PRINTER FOR EVERY NON-GREEN VERDICT. WRONG-GUARD, COLLATERAL and PROVEN
+// all need the same thing - the full failure set with its evidence, marked with
+// which of the revert's own lists (if any) named it - and each used to do it
+// differently, or not at all. Marks: `!` broke a mustPass, ` ` named in expect,
+// `~` named by neither.
+function printFailures(r, fails) {
+  for (const f of fails) {
+    const n = assertionNameOf(f);
+    const mark = (r.mustPass || []).some((re) => re.test(n))
+      ? "!"
+      : (r.expect || []).some((re) => re.test(n))
+        ? " "
+        : "~";
+    console.log(`      ${mark} ${f}`);
+  }
+}
+
 // Every assertion the suite emitted, reduced to the same NAME the verdict logic
 // matches against, so the audit tests each regex against exactly the string the
 // real matching would see rather than against a hand-normalised approximation.
@@ -9817,6 +12769,27 @@ function assertionNames(out) {
     .map((l) => l.trim())
     .filter((l) => /^(PASS|FAIL)\s/.test(l))
     .map(assertionNameOf);
+}
+
+// A SKIPPED BLOCK EMITS NO NAMES, AND THE AUDIT USED TO CALL THAT ROT.
+// `--expects` can only see assertions that RAN, so every regex naming an
+// assertion inside a self-skipping block reads as an orphan - a confident wrong
+// answer rather than a finding. It really happened: a lockfile touch makes
+// dist/ older than package-lock.json, the built-app.asar block skips itself,
+// and two of R135's regexes were reported as naming nothing when a `npm run
+// build` away they name live assertions.
+//
+// The verdict is deliberately NOT weakened - these are still counted as
+// orphans and still fail the exit code - because a genuinely dead regex must
+// not be able to hide behind an unrelated skip. Only the DIAGNOSIS improves:
+// the skipped blocks are named, so the reader can tell the two apart in
+// seconds instead of concluding the record is broken.
+function skippedNames(out) {
+  return out
+    .split(/\r?\n/)
+    .map((l) => l.trim())
+    .filter((l) => /^SKIP\s/.test(l))
+    .map((l) => l.replace(/^SKIP\s+/, "").split(" - ")[0].trim());
 }
 
 // A POSITIVE CONTROL FOR THE ANCHORING ITSELF. An absence check fails open: if
@@ -9829,7 +12802,7 @@ function assertionNames(out) {
 // THE SECOND HALF IS THE ONE THAT WAS MISSING, AND IT IS WHY THIS HOLE STAYED
 // OPEN. The reduction is only as good as the suites' agreement on the
 // separator, and TWO of the eleven formatted their own FAIL lines differently
-// (`test-packaging.js` used " - ", `test-userdata-migration.js` a bare "  "),
+// (`test-packaging.js` used " - ", `test-dev-profile.js` a bare "  "),
 // so for those suites the reduction was a NO-OP and every `expect` regex went
 // on matching evidence. A control over synthetic lines alone cannot see that -
 // it never reads a suite. So the suites' own formatters are checked here too.
@@ -9866,9 +12839,14 @@ function proveNameAnchoring() {
     // rather than something this function special-cases).
     ["  FAIL  the README names every colour scheme the theme menu actually offers  -> undocumented: [\"Emberr\"]",
      /the README names every colour scheme the theme menu actually offers/, /undocumented|Emberr/],
-    // The shape test-userdata-migration.js emits.
-    ["FAIL  the shared helper is required at module scope  -> indented at line 41",
-     /the shared helper is required at module scope/, /indented at line/],
+    // The shape test-dev-profile.js emits: a real assertion of that suite,
+    // with its real JSON.stringify evidence. It is the sharpest of the three
+    // cases because the evidence SHARES VOCABULARY with the name - both
+    // contain "already-relocated" - so the evidence half has to be probed with
+    // a token only the JSON can supply. An example whose evidence used a
+    // disjoint vocabulary would pass even if the reduction stopped stripping.
+    ["FAIL  an already-relocated profile is left exactly where it was  -> {\"target\":null,\"reason\":\"already-relocated\"}",
+     /an already-relocated profile is left exactly where it was/, /\{"target"|"reason":/],
   ];
   for (const [line, nameRe, evidenceRe] of cases) {
     const name = assertionNameOf(line);
@@ -9925,17 +12903,82 @@ function proveNameAnchoring() {
   );
 }
 
+// A `suite:` NAME THAT IS NOT A DECLARED SCRIPT IS INDISTINGUISHABLE FROM A
+// FIX THAT IS NOT LOAD-BEARING, and that cost a full diagnosis on R518.
+//
+// runSuite() shells `npm run <suite>` and CATCHES the failure, returning
+// stderr. npm's "Missing script" error contains no FAIL lines, so failedNames()
+// comes back empty and the verdict is VACUOUS - "suite stayed green with the
+// fix removed". The record is then read as a statement about the PRODUCT (the
+// fix does nothing) when it is really a statement about the RECORD (the suite
+// was never run). It fails loudly, which is right, but it MISNAMES ITS VICTIM -
+// the same disease R488's floor exists to prevent, one layer up.
+//
+// Checked here rather than in runSuite() so it costs nothing at run time and is
+// caught by the ~1s --anchors sweep, alongside every other rot check.
+function proveSuiteNames() {
+  const declared = new Set(
+    Object.keys(JSON.parse(fs.readFileSync(path.join(ROOT, "package.json"), "utf8")).scripts || {}),
+  );
+  // Positive control: if package.json ever stopped being readable in the shape
+  // this expects, `declared` would be empty and every suite name would look
+  // wrong - or, with the test inverted, every one would look right.
+  if (!declared.has("test:packaging")) {
+    console.error(
+      "SELF-CHECK FAILED: package.json declares no test:packaging script, so the " +
+        "suite-name check below is reading the wrong thing.",
+    );
+    process.exit(2);
+  }
+  const bogus = [
+    ...new Set(
+      REVERTS.filter((r) => r.suite && !declared.has(r.suite)).map((r) => `${r.id} -> ${r.suite}`),
+    ),
+  ];
+  // A record with no `what` prints its verdict as "PROVEN ... <- undefined".
+  // Same class as the COLLATERAL branch that used to discard evidence: the
+  // verdict survives, the diagnosis does not.
+  const unlabelled = REVERTS.filter((r) => !r.what).map((r) => r.id);
+  if (unlabelled.length) {
+    console.error(
+      `SELF-CHECK FAILED: ${unlabelled.length} revert(s) declare no \`what\`, so their ` +
+        `verdict line would read "<- undefined":\n  ` +
+        unlabelled.join(", "),
+    );
+    process.exit(2);
+  }
+  if (bogus.length) {
+    console.error(
+      `SELF-CHECK FAILED: ${bogus.length} revert(s) name a suite that is not a declared ` +
+        `npm script, so they would report VACUOUS without ever running a suite:\n  ` +
+        bogus.join("\n  "),
+    );
+    process.exit(2);
+  }
+}
+
 // Runs on EVERY invocation - audit, anchors and full run alike - because the
 // verdict logic below depends on it just as much as the audit does.
 proveNameAnchoring();
+proveSuiteNames();
 
 if (expectsOnly) {
   const suites = [...new Set(chosen.map((r) => r.suite || "test:tables"))].sort();
   const catalogue = new Map();
+  const skipsBySuite = new Map();
   for (const s of suites) {
-    const names = assertionNames(runSuite(s));
+    const out = runSuite(s);
+    const names = assertionNames(out);
+    const skips = skippedNames(out);
     catalogue.set(s, names);
+    skipsBySuite.set(s, skips);
     console.log(`${s}  ${names.length} assertion(s)`);
+    if (skips.length) {
+      console.log(
+        `  ^ ${skips.length} block(s) SKIPPED, so any assertion inside them is ` +
+          `unobservable in this run: ${skips.join("; ")}`,
+      );
+    }
     // A suite that emitted nothing would make every regex under it look like an
     // orphan, which is a confident wrong answer rather than a finding.
     if (!names.length) {
@@ -9955,18 +12998,35 @@ if (expectsOnly) {
         if (names.some((n) => re.test(n))) continue;
         // A FALSE POSITIVE THIS AUDIT REALLY HAS, and excusing it explicitly is
         // the only honest option - a check that cries wolf is a check people
-        // learn to skip. A few assertions choose their own NAME from the state
-        // they find (test-packaging.js:1426 names itself one way when
-        // build.publish is configured and another when it is not), so the name a
-        // revert expects exists only once that revert has been applied and can
-        // never appear in a clean-tree catalogue.
+        // learn to skip. TWO distinct mechanisms put an assertion name beyond
+        // the reach of a clean-tree catalogue, and both are excused here:
+        //
+        //   (a) the name is CHOSEN FROM STATE - test-packaging.js:1426 names
+        //       itself one way when build.publish is configured and another way
+        //       when it is not, so the name a revert expects exists only once
+        //       that revert has been applied (R154);
+        //   (b) the assertion EXISTS ONLY ON A FAILURE PATH - R151's
+        //       `dompurify appears in the notices` is emitted from an `if (!m)`
+        //       branch, so in the healthy state it never runs and never prints.
+        //
+        // Neither can be fixed by looking harder at the output, which is why
+        // the escape hatch is a recorded string rather than a flag: the reason
+        // has to survive being read by whoever hits it next.
         if (r.nameVariesWithState) {
           excused += 1;
           console.log(`${r.id}  EXCUSED  ${label}  ${re}  (${r.nameVariesWithState})`);
           continue;
         }
         orphans += 1;
-        console.log(`${r.id}  ORPHANED ${label}  ${re} names no assertion in ${r.suite || "test:tables"}`);
+        const suiteKey = r.suite || "test:tables";
+        const hid = skipsBySuite.get(suiteKey) || [];
+        console.log(
+          `${r.id}  ORPHANED ${label}  ${re} names no assertion in ${suiteKey}` +
+            (hid.length
+              ? ` (NOTE: ${hid.length} block(s) skipped in this run - "${hid.join('", "')}" - ` +
+                `rule those out before concluding the regex is dead)`
+              : ""),
+        );
       }
     }
   }
@@ -9990,6 +13050,11 @@ let bad = 0;
 // Counted separately from `bad` and from the proven total, so a withdrawn
 // proof can never be mistaken for a passing one in the summary line.
 let skipped = 0;
+// Edits made to a touched file WHILE a revert was applied. Separate from
+// `bad` because it is not a verdict about any revert - it is a warning that
+// work outside this run was about to be silently overwritten. It still fails
+// the exit code, because the rescued copy needs a human before it is dropped.
+let midRunEdits = 0;
 // A revert harness that leaves the tree dirty is worse than none at all: the
 // next run would measure a file it had itself corrupted. Snapshot every file
 // any chosen revert can touch, and compare at the end. (The previous version of
@@ -10047,7 +13112,20 @@ for (const r of chosen) {
       setupFailed = `anchor is not unique in ${path.basename(e.file)}`;
       break;
     }
-    const eol = m[0].includes("\r\n") ? "\r\n" : "\n";
+    // MEASURED DEFECT, now fixed: this used to be
+    //   const eol = m[0].includes("\r\n") ? "\r\n" : "\n";
+    // which derives the ending from the MATCHED ANCHOR. A single-line anchor
+    // contains no line break at all, so it silently degraded to LF - and a
+    // multi-line `to` then wrote LF into a CRLF file, leaving mixed endings
+    // behind in the product tree. Most anchors here are single-line.
+    //
+    // Derive it from the FILE instead, by PREDOMINANCE rather than presence:
+    // package.json is wholly LF (263 LF, 0 CRLF) while styles.css carries a
+    // handful of lone LFs among its CRLFs, so neither "contains a CRLF" nor
+    // "contains a bare LF" is a sound test on its own.
+    const crlfCount = (text.match(/\r\n/g) || []).length;
+    const bareLfCount = (text.match(/\n/g) || []).length - crlfCount;
+    const eol = crlfCount > bareLfCount ? "\r\n" : "\n";
     working.set(
       e.file,
       text.slice(0, m.index) + e.to.replace(/\n/g, eol) + text.slice(m.index + m[0].length),
@@ -10075,12 +13153,69 @@ for (const r of chosen) {
     skipped += 1;
     continue;
   }
-  for (const [file, text] of working) fs.writeFileSync(file, text);
+  // THE MUTATION WRITES BELONG INSIDE THE `try`, NOT ABOVE IT. They used to sit
+  // outside, so a failure part-way through a multi-file revert - a permission
+  // error, a full disk, a file deleted by a concurrent rename - threw before the
+  // `finally` existed and left the product tree with a revert PARTIALLY APPLIED
+  // and no restore. That is exactly the state the R49 incident left behind, and
+  // the incident is the reason `--anchors` is now the mandatory post-mortem
+  // check. `written` records what actually landed so the verify step below can
+  // tell "someone else edited this" apart from "the harness never wrote it".
   let out;
+  const written = new Set();
   try {
+    for (const [file, text] of working) {
+      fs.writeFileSync(file, text);
+      written.add(file);
+    }
     out = runSuite(r.suite);
   } finally {
-    for (const [file, text] of originals) fs.writeFileSync(file, text);
+    // VERIFY BEFORE RESTORE. The restore below is a blind overwrite from a
+    // snapshot taken before the run, so anything written to one of these files
+    // WHILE the suite was running - a hand edit, an editor autosave, a second
+    // agent, a concurrent harness run - is silently deleted here, with no diff
+    // and no warning. `--anchors` cannot cover this: it detects RESIDUE (a
+    // revert left applied) by checking that every `from` still resolves, and a
+    // restore that reinstates the pre-run snapshot leaves every anchor
+    // resolving perfectly while the interim work is gone.
+    //
+    // So compare what is on disk against what the harness itself last wrote.
+    // If they differ, the difference is someone else's and must not be thrown
+    // away: park it beside the file and say so loudly, then restore.
+    //
+    // EVERY FILE IS RESTORED INDEPENDENTLY. A throw while verifying or rescuing
+    // one file must not skip the restore of the ones after it - that would turn
+    // a rescue attempt into the partial-application failure this block exists to
+    // prevent. Errors are collected and re-raised once every file is back.
+    const restoreErrors = [];
+    for (const [file, text] of originals) {
+      try {
+        const expected = written.has(file) ? working.get(file) : undefined;
+        const onDisk = fs.readFileSync(file, "utf8");
+        if (expected !== undefined && onDisk !== expected) {
+          const rescue = `${file}.mid-run-edit`;
+          fs.writeFileSync(rescue, onDisk);
+          midRunEdits += 1;
+          console.error(
+            `\nEDITED MID-RUN: ${path.relative(ROOT, file)} changed while ${r.id}'s revert was applied.` +
+              `\n  The harness is about to restore its own snapshot, which would discard that change.` +
+              `\n  A copy has been saved to ${path.relative(ROOT, rescue)} - diff it before deleting.`,
+          );
+        }
+      } catch (err) {
+        restoreErrors.push(err);
+      }
+      try {
+        fs.writeFileSync(file, text);
+      } catch (err) {
+        restoreErrors.push(err);
+        console.error(
+          `\nRESTORE FAILED: ${path.relative(ROOT, file)} could not be restored after ${r.id}.` +
+            `\n  The revert may still be applied. Run --anchors before trusting the tree.`,
+        );
+      }
+    }
+    if (restoreErrors.length) throw restoreErrors[0];
   }
   const fails = failedNames(out);
   const failNames = fails.map(assertionNameOf);
@@ -10096,8 +13231,18 @@ for (const r of chosen) {
     bad += 1;
   } else if (missing.length) {
     console.log(
-      `${r.id}  WRONG-GUARD   failed, but not on the expected assertions. missing=${missing} got=${JSON.stringify(fails.slice(0, 4))}`,
+      `${r.id}  WRONG-GUARD   failed, but not on the expected assertions. missing=${missing}`,
     );
+    // THIS BRANCH USED TO PRINT `fails.slice(0, 4)` AND NOTHING ELSE, which is
+    // the same defect the COLLATERAL branch below had before commit 3357b69:
+    // the verdict says an expected assertion did not fail, and the one thing a
+    // diagnosis needs - which assertions DID fail, and with what evidence - was
+    // truncated away. Measured cost: R463 came back WRONG-GUARD naming a single
+    // missing regex while six assertions had failed, and the four that fitted
+    // in the slice were all from a different block, so the output could not say
+    // whether the missing one had passed or had never run. Print the whole set,
+    // marked the same way as COLLATERAL and PROVEN do.
+    printFailures(r, fails);
     bad += 1;
   } else if (collateral.length) {
     console.log(
@@ -10110,15 +13255,7 @@ for (const r of chosen) {
     // at all. Print every failure, evidence included, marked with which list
     // (if any) named it. Same reasoning as the `~` unlisted-failure report in
     // the PROVEN branch below: the verdict is the summary, not the record.
-    for (const f of fails) {
-      const n = assertionNameOf(f);
-      const mark = (r.mustPass || []).some((re) => re.test(n))
-        ? "!"
-        : (r.expect || []).some((re) => re.test(n))
-          ? " "
-          : "~";
-      console.log(`      ${mark} ${f}`);
-    }
+    printFailures(r, fails);
     bad += 1;
   } else {
     console.log(`${r.id}  PROVEN        ${fails.length} assertion(s) failed  <- ${r.what}`);
@@ -10134,14 +13271,34 @@ for (const r of chosen) {
     // edit) rather than a defect, so turning it into a failure would punish
     // accuracy. It is surfaced instead, so the author decides whether to widen
     // `expect` or leave it - but can no longer do so by not noticing.
-    const expected = fails.filter((f) => (r.expect || []).some((re) => re.test(assertionNameOf(f))));
     const unlisted = fails.filter((f) => !(r.expect || []).some((re) => re.test(assertionNameOf(f))));
-    for (const f of expected.slice(0, 4)) console.log(`        ${f}`);
+    // ONE PRINTER, INCLUDING HERE. This branch used to hand-roll its own
+    // output, and got three things wrong at once: it capped the expected set
+    // at `slice(0, 4)` - the very cap the paragraph above names as the defect
+    // being fixed - it dropped the `!`/` `/`~` marks, and it indented by eight
+    // where printFailures indents by six plus a mark. So PROVEN was the only
+    // non-green verdict NOT using the shared printer, which additionally made
+    // two comments false about it: printFailures' own header ("WRONG-GUARD,
+    // COLLATERAL and PROVEN all need the same thing") and WRONG-GUARD's
+    // "marked the same way as COLLATERAL and PROVEN do".
+    //
+    // printFailures is an exact drop-in. Reaching this branch means
+    // `missing.length` and `collateral.length` are both zero, so no mustPass
+    // regex can match any failure and the `!` mark can never be emitted here:
+    // the marks reduce to ` ` for expected and `~` for unlisted, which is
+    // precisely the distinction this branch was drawing by hand. It also
+    // carries the EVIDENCE, which is the load-bearing part - an unlisted
+    // failure is by definition the one nobody predicted. Under R503 that was
+    // the difference between "some popup rendered an error" and being able to
+    // read which one and why.
+    printFailures(r, fails);
+    // The COUNT survives the merge: printFailures marks each line but never
+    // says HOW MANY went unnamed, and "were there any at all" is the question
+    // this report exists to answer at a glance.
     if (unlisted.length) {
       console.log(
-        `        ~ ${unlisted.length} further failure(s) not named in expect:`,
+        `      ~ ${unlisted.length} further failure(s) not named in expect (marked ~ above)`,
       );
-      for (const f of unlisted) console.log(`        ~ ${f.split("  ->")[0]}`);
     }
   }
 }
@@ -10164,4 +13321,4 @@ console.log(
       ? `\nALL REVERTS PROVEN${skipped ? ` (${skipped} withdrawn, see SKIPPED above)` : ""}`
       : `\n${bad} revert(s) did not prove their fix`,
 );
-process.exit(bad === 0 && dirty === 0 ? 0 : 1);
+process.exit(bad === 0 && dirty === 0 && midRunEdits === 0 ? 0 : 1);

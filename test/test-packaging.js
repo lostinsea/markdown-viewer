@@ -18,6 +18,7 @@ const fs = require("fs");
 const path = require("path");
 const os = require("os");
 const { execFileSync } = require("child_process");
+const { stripJsComments } = require("./test-source-utils.js");
 
 // The repository root, which is this suite's subject - it reads package.json,
 // build.files, the shipped sources and the docs. It is one level up now that
@@ -288,6 +289,22 @@ function main() {
     check(`fonts/${f} is in build.files`, isPackaged(files, "fonts/" + f));
   }
 
+  // ONE parser for the LIBS table in scripts/vendor-libs.js, read here and
+  // consumed by three separate oracles below (the unused-devDependency scan,
+  // the "every vendored library has a notice" compliance check and the
+  // vendored-freshness block). A second copy is exactly how two oracles come
+  // to disagree about what the product vendors while both keep passing - the
+  // defect class this file has caught four times already. The regex is LAX on
+  // purpose: it takes the first string of each entry, so it still finds the
+  // package name if the triple's shape ever changes. The freshness block
+  // parses the same table STRICTLY and cross-checks the two counts, which is
+  // what stops this lax read from silently matching the wrong thing.
+  const vendorSrc = read("scripts/vendor-libs.js");
+  const libsTable = /const LIBS = \[([\s\S]*?)\];/.exec(vendorSrc);
+  const libsNames = libsTable
+    ? [...libsTable[1].matchAll(/\[\s*"([^"]+)"/g)].map((m) => m[1])
+    : [];
+
   // Production dependencies and bare requires must be the SAME set, in both
   // directions. This is the general form of the finding that shrank app.asar
   // from 153.6 MB to 23.2 MB: `build.files` ships `node_modules/**/*` and
@@ -362,6 +379,471 @@ function main() {
     );
   }
 
+  // The same sweep for devDependencies, which the block above deliberately
+  // cannot cover: its subject is `Object.keys(pkg.dependencies)`, so a dead
+  // devDependency is invisible to it by construction. That is not
+  // hypothetical - `png-to-ico` sat in this manifest long after both .ico
+  // files it once produced became TRACKED artifacts, and nothing noticed,
+  // because a devDependency is not required by any SHIPPED file BY DEFINITION.
+  //
+  // A devDependency is justified by any ONE of five sources, each MEASURED
+  // against this tree rather than assumed:
+  //   (a) the shared LIBS table   - marked, mermaid and dompurify are
+  //                                 VENDORED, so nothing ever requires them
+  //   (b) a committed libs/<name> - prismjs ships as checked-in source
+  //   (c) a require()/import under scripts/ or test/   - ajv, electron
+  //   (d) an npm script command   - electron-builder is only ever a CLI
+  //   (e) a workflow file         - a CI-only tool has no other trace
+  //
+  // (e) is not UNIQUELY load-bearing today - electron-builder is also named by
+  // an npm script - but a devDependency used only by CI is a real category,
+  // and dropping the source would report the next one of those as dead.
+  {
+    const declaredDev = Object.keys(pkg.devDependencies || {});
+
+    const toolFiles = [];
+    const walkTools = (rel) => {
+      const abs = path.join(ROOT, rel);
+      if (!fs.existsSync(abs)) return;
+      for (const e of fs.readdirSync(abs, { withFileTypes: true })) {
+        if (e.name === "node_modules") continue;
+        const child = rel + "/" + e.name;
+        if (e.isDirectory()) walkTools(child);
+        else if (/\.(js|cjs|mjs)$/.test(e.name)) toolFiles.push(child);
+      }
+    };
+    walkTools("scripts");
+    walkTools("test");
+
+    const toolRequired = new Set();
+    const specRe =
+      /(?:\brequire\(\s*["']([^"'.\/][^"']*)["']\s*\)|\bfrom\s+["']([^"'.\/][^"']*)["'])/g;
+    for (const f of toolFiles) {
+      const srcText = read(f);
+      let mm;
+      while ((mm = specRe.exec(srcText))) {
+        const spec = mm[1] || mm[2];
+        toolRequired.add(
+          spec.startsWith("@")
+            ? spec.split("/").slice(0, 2).join("/")
+            : spec.split("/")[0],
+        );
+      }
+    }
+
+    const libsDirs = fs.existsSync(path.join(ROOT, "libs"))
+      ? fs
+          .readdirSync(path.join(ROOT, "libs"), { withFileTypes: true })
+          .filter((e) => e.isDirectory())
+          .map((e) => e.name)
+      : [];
+
+    const scriptText = Object.values(pkg.scripts || {}).join("\n");
+    const wfDir = path.join(ROOT, ".github", "workflows");
+    const workflowText = fs.existsSync(wfDir)
+      ? fs
+          .readdirSync(wfDir)
+          .map((f) => read(".github/workflows/" + f))
+          .join("\n")
+      : "";
+
+    // Token match, not substring: `electron` must not be evidenced by the
+    // string "electron-builder", or removing the last real use of electron
+    // would go unnoticed for as long as electron-builder stays declared.
+    const escRe = (s) => s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+    const namedIn = (hay, n) =>
+      new RegExp(
+        "(^|[^A-Za-z0-9_@/.-])" + escRe(n) + "([^A-Za-z0-9_-]|$)",
+      ).test(hay);
+
+    const evidence = new Map();
+    const bySource = {
+      "LIBS table": [],
+      "committed libs/ directory": [],
+      "require under scripts/ or test/": [],
+      "npm script": [],
+      "workflow": [],
+    };
+    for (const n of declaredDev) {
+      const where = [];
+      if (libsNames.includes(n)) {
+        where.push("LIBS table");
+        bySource["LIBS table"].push(n);
+      }
+      if (libsDirs.includes(n)) {
+        where.push("libs/" + n);
+        bySource["committed libs/ directory"].push(n);
+      }
+      if (toolRequired.has(n)) {
+        where.push("required by scripts/ or test/");
+        bySource["require under scripts/ or test/"].push(n);
+      }
+      if (namedIn(scriptText, n)) {
+        where.push("npm script");
+        bySource["npm script"].push(n);
+      }
+      if (namedIn(workflowText, n)) {
+        where.push("workflow");
+        bySource["workflow"].push(n);
+      }
+      evidence.set(n, where);
+    }
+
+    // The vacuity floor, and it is a RELATIONSHIP rather than a count: every
+    // one of the five sources must justify at least one declared
+    // devDependency. A source that has silently stopped matching - a moved
+    // directory, a regex that no longer fits the file shape - would otherwise
+    // make a live dependency look dead, and the assertion below would fail
+    // NAMING THE WRONG THING. Assert the cause beside the consequence.
+    const deadSources = Object.entries(bySource)
+      .filter(([, v]) => v.length === 0)
+      .map(([k]) => k);
+    check(
+      "every devDependency evidence source is live",
+      declaredDev.length > 0 && deadSources.length === 0,
+      `${declaredDev.length} devDependenc(ies) declared across ${toolFiles.length} tool file(s); ` +
+        `source(s) matching nothing: ${deadSources.join(", ") || "none"} - a source that has ` +
+        "stopped matching reports a live dependency as dead",
+    );
+
+    const deadDev = declaredDev.filter((n) => evidence.get(n).length === 0);
+    check(
+      "every devDependency is used by something in this repository",
+      deadDev.length === 0,
+      `${deadDev.join(", ")} - declared but named by no vendoring table entry, committed libs/ ` +
+        "directory, require, npm script or workflow; it is installed on every contributor's " +
+        "machine and on every CI run for nothing",
+    );
+  }
+
+  // TABULATOR IS VENDORED BY HAND, SO NOTHING RESOLVES ITS API FOR US. The
+  // table popup builds its options object as a literal inside a template
+  // string, and Tabulator silently ignores options it does not recognise
+  // (it only logs, via debugInvalidOptions). A major-version bump can
+  // therefore retire an option and leave the app passing it forever: that is
+  // not hypothetical, `resizableColumns` is a Tabulator 4.x spelling that was
+  // still being passed under 6.2.5, recognised by nothing, and no test could
+  // see it because no test ever compared the two sides.
+  //
+  // THE EARLIER VERSION OF THIS BLOCK CARRIED A COMMENT CLAIMING THAT "the only
+  // honest question to ask of a minified bundle is whether the option NAME
+  // appears at all". THAT WAS FALSE, and measuring it is what replaced this
+  // whole block. Tabulator declares its own option surface in the bundle, in
+  // two places, and both can be read exactly:
+  //
+  //   registerTableOption("name") calls .......... 150 names
+  //   the core defaults object literal ............ 43 names
+  //   union (measured: zero overlap) .............. 193 names
+  //   registerColumnOption + column defaults ...... 136 names
+  //
+  // THE UNION IS MANDATORY, NOT BELT-AND-BRACES, and that is asserted rather
+  // than asserted-about: `data`, `columns` and `height` - three of the twelve
+  // options this app actually passes - are reachable ONLY through the defaults
+  // literal, and `title`/`field` likewise on the column side. Dropping either
+  // half makes a genuinely shipped option look unrecognised.
+  //
+  // What the loose `\bname\b` matcher it replaces really answered: YES for
+  // `fitColumns`, `cellClick` and `rowClick` - none of which are recognised
+  // constructor options - because those strings occur in the bundle as values,
+  // method names and event names. So it could not fail for any plausible
+  // retired option whose name survives anywhere in 3 MB of minified code.
+  //
+  // THE TEMPLATE-LITERAL RULE, which governs both captures below. `new
+  // Tabulator(` lives INSIDE the popup HTML template literal in main.js (the
+  // popup script is embedded as string content), so stripping comments from
+  // the whole file can never reach it - by design, since the stripper treats a
+  // backtick as an ordinary quote and does not descend into an interpolation.
+  // Slice from the anchor FIRST (which starts in code context), then strip.
+  // And because the hardened stripper is NOT length-preserving (a line comment
+  // collapses to "\n", a block comment to one space), an index is only ever
+  // valid against the exact string it was computed from.
+  {
+    const mainSrc = read("src/main.js");
+    const rendererSrc = read("src/renderer.js");
+    const tabBundlePath = path.join(ROOT, "libs", "tabulator", "tabulator.min.js");
+    const tabBundle = fs.existsSync(tabBundlePath)
+      ? fs.readFileSync(tabBundlePath, "utf8")
+      : "";
+
+    // Brace-match forward from an opening bracket, honouring quotes.
+    function matchBracket(src, start) {
+      const open = src[start];
+      const close = { "{": "}", "[": "]", "(": ")" }[open];
+      let depth = 0;
+      let i = start;
+      const n = src.length;
+      while (i < n) {
+        const c = src[i];
+        if (c === '"' || c === "'" || c === "`") {
+          const q = c;
+          i++;
+          while (i < n) {
+            if (src[i] === "\\") {
+              i += 2;
+              continue;
+            }
+            if (src[i] === q) break;
+            i++;
+          }
+          i++;
+          continue;
+        }
+        if (c === open) depth++;
+        else if (c === close) {
+          depth--;
+          if (depth === 0) return i;
+        }
+        i++;
+      }
+      return -1;
+    }
+
+    // Object keys at depth 0 of an object-literal body. A nested callback's own
+    // keys live at depth > 0 and are excluded STRUCTURALLY, so a callback can
+    // neither truncate the scan nor pad it.
+    function keysAtTopLevel(body) {
+      const keys = [];
+      let depth = 0;
+      let i = 0;
+      const n = body.length;
+      while (i < n) {
+        const c = body[i];
+        if (c === '"' || c === "'" || c === "`") {
+          const q = c;
+          i++;
+          while (i < n) {
+            if (body[i] === "\\") {
+              i += 2;
+              continue;
+            }
+            if (body[i] === q) break;
+            i++;
+          }
+          i++;
+          continue;
+        }
+        if (c === "{" || c === "[" || c === "(") {
+          depth++;
+          i++;
+          continue;
+        }
+        if (c === "}" || c === "]" || c === ")") {
+          depth--;
+          i++;
+          continue;
+        }
+        if (depth === 0 && /[A-Za-z_$]/.test(c)) {
+          let j = i;
+          while (j < n && /[\w$]/.test(body[j])) j++;
+          let k = j;
+          while (k < n && /\s/.test(body[k])) k++;
+          if (body[k] === ":") keys.push(body.slice(i, j));
+          i = j;
+          continue;
+        }
+        i++;
+      }
+      return keys;
+    }
+
+    // The 2nd argument of `new Tabulator(...)`, located by brace matching
+    // rather than by a non-greedy regex. See the template-literal rule above.
+    function captureTabulatorOptions(src) {
+      const rawAt = src.indexOf("new Tabulator(");
+      if (rawAt === -1) return null;
+      const clean = stripJsComments(src.slice(rawAt));
+      const at = clean.indexOf("new Tabulator(");
+      if (at === -1) return null;
+      const lparen = clean.indexOf("(", at);
+      const rparen = matchBracket(clean, lparen);
+      if (rparen === -1) return null;
+      let depth = 0;
+      for (let i = lparen; i < rparen; i++) {
+        const c = clean[i];
+        if (c === "(") depth++;
+        else if (c === ")") depth--;
+        else if (c === "{" && depth === 1) {
+          const end = matchBracket(clean, i);
+          if (end === -1 || end > rparen) return null;
+          return clean.slice(i + 1, end);
+        }
+      }
+      return null;
+    }
+
+    function registered(fn) {
+      const set = new Set();
+      const re = new RegExp(fn + '\\(\\s*"([A-Za-z_$][\\w$]*)"', "g");
+      let m;
+      while ((m = re.exec(tabBundle))) set.add(m[1]);
+      return set;
+    }
+
+    // Walk BACKWARDS from a known member of a defaults literal to its opening
+    // brace, then brace-match forward and read the keys.
+    function defaultsLiteralAt(anchor) {
+      const at = tabBundle.indexOf(anchor);
+      if (at === -1) return new Set();
+      let depth = 0;
+      let open = -1;
+      for (let i = at; i >= 0; i--) {
+        const c = tabBundle[i];
+        if (c === "}") depth++;
+        else if (c === "{") {
+          if (depth === 0) {
+            open = i;
+            break;
+          }
+          depth--;
+        }
+      }
+      if (open === -1) return new Set();
+      const end = matchBracket(tabBundle, open);
+      if (end === -1) return new Set();
+      const body = tabBundle.slice(open + 1, end);
+      const set = new Set();
+      const re = /(^|[,{])\s*([A-Za-z_$][\w$]*)\s*:/g;
+      let m;
+      while ((m = re.exec(body))) set.add(m[2]);
+      return set;
+    }
+
+    const tabReg = registered("registerTableOption");
+    const tabDfl = defaultsLiteralAt("debugInvalidOptions");
+    const tableSurface = new Set([...tabReg, ...tabDfl]);
+    const colReg = registered("registerColumnOption");
+    const colDfl = defaultsLiteralAt("title:void 0,field:void 0");
+    const colSurface = new Set([...colReg, ...colDfl]);
+    const BOGUS = "totallyBogusTabulatorOption";
+
+    check(
+      "the Tabulator option surface was extracted from the vendored bundle, not matched loosely",
+      tabReg.size > 0 &&
+        tabDfl.size > 0 &&
+        tableSurface.size === 193 &&
+        colSurface.size === 136 &&
+        !tableSurface.has(BOGUS) &&
+        !tableSurface.has("fitColumns") &&
+        !tableSurface.has("cellClick") &&
+        !tableSurface.has("rowClick") &&
+        tabBundle.includes("rowClick") &&
+        !tabReg.has("height") &&
+        tableSurface.has("height") &&
+        !colReg.has("title") &&
+        colSurface.has("title") &&
+        colSurface.has("field"),
+      `registerTableOption=${tabReg.size} + defaults=${tabDfl.size} -> table surface ` +
+        `${tableSurface.size} (measured 193); column surface ${colSurface.size} ` +
+        "(measured 136). The union is MANDATORY: `height` (table) and `title` " +
+        "(column) are shipped options reachable only through the defaults " +
+        "literal. And the surface must still answer NO for names the old loose " +
+        "matcher accepted - fitColumns, cellClick, rowClick all occur in the " +
+        "bundle but none is a recognised constructor option",
+    );
+
+    const tabOpts = keysAtTopLevel(captureTabulatorOptions(mainSrc) || "");
+
+    // THE FLOOR CARRIES ITS OWN NEGATIVE CONTROL. An absence check fails open:
+    // if the capture stopped finding the constructor, or the bundle went
+    // unread, `tabOpts` would be empty and the assertion below would pass
+    // having compared nothing. Worse, a matcher that answered TRUE for
+    // everything would also pass.
+    check(
+      "the Tabulator option scan read both sides and can still answer no",
+      tabOpts.length >= 12 &&
+        tabBundle.length > 0 &&
+        !tableSurface.has(BOGUS),
+      `${tabOpts.length} option(s) captured from the constructor (measured 12), ` +
+        `${tabBundle.length} byte(s) of bundle read - if either is empty, or an ` +
+        "impossible option name resolves, the check below compares nothing",
+    );
+
+    const unknownOpts = tabOpts.filter((o) => !tableSurface.has(o));
+    check(
+      "every Tabulator option the app passes is recognised by the vendored bundle",
+      unknownOpts.length === 0,
+      `${unknownOpts.join(", ")} - passed to the Tabulator constructor but not a ` +
+        "recognised option of the vendored bundle, so it is silently ignored; " +
+        "an option retired by an upstream major version looks exactly like this",
+    );
+
+    // PLANTED POSITIVE CONTROLS. Neither defect is reachable from the shipped
+    // source - main.js has no callback option today and its one block comment
+    // is stripped - so a test that waited for the product to exhibit them would
+    // be permanently vacuous. The plants are applied to a synthetic COPY, and
+    // the assertion additionally requires that they really landed: a plant that
+    // silently failed to apply reports a clean capture for the wrong reason.
+    const lateCallback = [
+      "",
+      "          rowClick: function (e, row) {",
+      "            requestAnimationFrame(function () {",
+      "              row.getElement();",
+      "            });",
+      "          },",
+    ].join("\n");
+    const blockComment = [
+      "",
+      "          /* rejected alternative:",
+      "             resizableColumns: true,",
+      "             not a recognised option in 6.x */",
+    ].join("\n");
+    const truncSrc = mainSrc.replace(
+      /(\n\s*initialSort\s*:[\s\S]*?\],)/,
+      "$1" + lateCallback,
+    );
+    const phantomSrc = mainSrc.replace(
+      /(\n\s*movableColumns\s*:\s*[a-z]+,)/,
+      "$1" + blockComment,
+    );
+    const truncKeys = keysAtTopLevel(captureTabulatorOptions(truncSrc) || "");
+    const phantomKeys = keysAtTopLevel(captureTabulatorOptions(phantomSrc) || "");
+    const dropped = tabOpts.filter((o) => !truncKeys.includes(o));
+    check(
+      "the Tabulator option capture is structural: a late callback cannot truncate it and a comment cannot pad it",
+      truncSrc !== mainSrc &&
+        phantomSrc !== mainSrc &&
+        dropped.length === 0 &&
+        truncKeys.includes("rowClick") &&
+        !phantomKeys.includes("resizableColumns") &&
+        !phantomKeys.includes("alternative"),
+      `truncation plant: ${truncKeys.length} key(s), dropped [${dropped.join(",")}] ` +
+        "(want none - the OLD regex stopped at the callback's own `});` and " +
+        "silently lost `height` while reporting the SAME COUNT as a clean tree, " +
+        "so a count-based floor could never see it); comment plant: " +
+        `${phantomKeys.length} key(s), resizableColumns present=` +
+        `${phantomKeys.includes("resizableColumns")} (want false)`,
+    );
+
+    // ISSUE 9 - THE COLUMN DEFINITIONS WERE OUTSIDE THE ORACLE'S REACH
+    // ENTIRELY. renderer.js builds them for the same popup and they are
+    // validated by the same bundle, against a DIFFERENT surface.
+    const colAt = rendererSrc.indexOf("columns.push({");
+    const colClean =
+      colAt === -1 ? "" : stripJsComments(rendererSrc.slice(colAt));
+    const colOpen = colClean.indexOf("{");
+    const colBodyEnd = colOpen === -1 ? -1 : matchBracket(colClean, colOpen);
+    const colKeys =
+      colBodyEnd === -1
+        ? []
+        : keysAtTopLevel(colClean.slice(colOpen + 1, colBodyEnd));
+    check(
+      "the Tabulator column option scan read both sides and can still answer no",
+      colKeys.length >= 4 && colSurface.size > 0 && !colSurface.has(BOGUS),
+      `${colKeys.length} column option(s) captured from renderer.js ` +
+        `[${colKeys.join(",")}] (measured 4), ${colSurface.size} name(s) of ` +
+        "column surface - if either is empty the check below compares nothing",
+    );
+
+    const colUnknown = colKeys.filter((k) => !colSurface.has(k));
+    check(
+      "every Tabulator column option the popup builds is recognised by the vendored bundle",
+      colUnknown.length === 0,
+      `${colUnknown.join(", ")} - written into a Tabulator column definition in ` +
+        "src/renderer.js but not a recognised column option of the vendored " +
+        "bundle, so it is silently ignored",
+    );
+  }
+
   // Shipping the right file list is useless if electron-builder refuses the
   // configuration outright. The 24 -> 26 upgrade removed `win.sign` (signing
   // moved under `win.signtoolOptions`), which made EVERY packaged build fail
@@ -421,12 +903,12 @@ function main() {
     }
   }
 
-  // The auto-update feed must never point at the parent project. `publish` is
-  // null today (updates deliberately disabled — see docs/BUILD.md), but if it is
-  // ever enabled it has to target this fork's own releases: pointing it at
-  // OmniCoreST would let upstream binaries silently replace a fork build,
-  // discarding every fix in this repo. Deliberately permissive about *whether*
-  // publishing is enabled, strict about *where* it points.
+  // The auto-update feed must never point at the parent project. Publishing is
+  // enabled today and targets this fork's own releases (see docs/BUILD.md);
+  // pointing it at OmniCoreST would let upstream binaries silently replace a
+  // fork build, discarding every fix in this repo. This half is deliberately
+  // permissive about *whether* publishing is enabled and strict about *where*
+  // it points; the positive half below pins that it stays enabled.
   //
   // The first version of this check only looked at `p.owner`, which review
   // showed was easy to walk around. electron-builder accepts a provider
@@ -500,6 +982,77 @@ function main() {
       `build.publish=${JSON.stringify(pkg.build && pkg.build.publish)} - electron-builder writes no app-update.yml without it, so installed builds can never see a release`,
     );
 
+    // docs/BUILD.md prints the publish block as the configuration IN FORCE, and
+    // prose is checked by nothing that runs. It drifted, exactly as you would
+    // expect: the documented example still named the pre-rebrand repo
+    // "markdown-viewer" long after package.json said "folia", while the
+    // paragraph directly beneath it asserted the feed resolves to
+    // lostinsea/folia. The document contradicted itself for releases on end and
+    // nothing noticed, because the only reader was a human.
+    //
+    // The block count is asserted rather than assumed: "no example found" would
+    // otherwise make this pass by having lost its subject, which is the same
+    // fail-open shape this suite exists to refuse.
+    {
+      const buildDoc = path.join(ROOT, "docs", "BUILD.md");
+      if (fs.existsSync(buildDoc)) {
+        const doc = fs.readFileSync(buildDoc, "utf8");
+        const blocks = [...doc.matchAll(/"publish"\s*:\s*\[([^\]]*)\]/g)].map((m) => m[0]);
+        const owner = github.length === 1 ? github[0].owner : null;
+        const repo = github.length === 1 ? github[0].repo : null;
+        const wrong = blocks.filter(
+          (b) => !(b.includes(`"owner": "${owner}"`) && b.includes(`"repo": "${repo}"`)),
+        );
+        check(
+          "docs/BUILD.md documents the publish target package.json actually uses",
+          blocks.length > 0 && wrong.length === 0,
+          blocks.length === 0
+            ? "no publish example found in docs/BUILD.md - the assertion has lost its subject"
+            : `documented ${wrong.join(" | ")} but build.publish is owner=${owner} repo=${repo}`,
+        );
+      }
+    }
+
+    // Same disease, same document, a different paragraph. The restrictive-network
+    // section spells the Electron download URL out literally, and the version
+    // appears inside it twice - once as the release directory and once inside the
+    // artifact filename. Those are DERIVED from the pinned Electron version, so an
+    // Electron bump makes the documented URL name a release the build never asks
+    // for, and a reader following it byte-for-byte gets a mirror layout that does
+    // not match what @electron/get actually requests. The publish block above
+    // drifted for releases on end for exactly this reason: prose has no reader
+    // that runs.
+    //
+    // The count is asserted rather than assumed, for the same fail-open reason:
+    // deleting the URL example would otherwise satisfy "no version is wrong".
+    {
+      const buildDoc = path.join(ROOT, "docs", "BUILD.md");
+      if (fs.existsSync(buildDoc)) {
+        const doc = fs.readFileSync(buildDoc, "utf8");
+        const start = doc.indexOf("## Building behind a restrictive network");
+        const end = start === -1 ? -1 : doc.indexOf("\n## ", start + 4);
+        const section = start === -1 ? "" : doc.slice(start, end === -1 ? undefined : end);
+        const declared = String(
+          (pkg.devDependencies && pkg.devDependencies.electron) ||
+            (pkg.dependencies && pkg.dependencies.electron) ||
+            "",
+        ).replace(/^[\^~>=<\s]+/, "");
+        const cited = [...section.matchAll(/\bv(\d+\.\d+\.\d+)\b/g)].map((m) => m[1]);
+        const stale = [...new Set(cited.filter((v) => v !== declared))];
+        check(
+          "docs/BUILD.md's Electron mirror example cites the pinned Electron version",
+          start !== -1 && cited.length >= 2 && declared !== "" && stale.length === 0,
+          start === -1
+            ? "the restrictive-network section is gone - the assertion has lost its subject"
+            : cited.length < 2
+              ? `only ${cited.length} version citation(s) in that section (expected the release dir and the artifact filename) - the assertion has lost its subject`
+              : declared === ""
+                ? "package.json declares no electron version to compare against"
+                : `documents Electron ${stale.join(", ")} but package.json pins ${declared}`,
+        );
+      }
+    }
+
     // Every build script must pass --publish never. electron-builder's default
     // is onTagOrDraft: with publish configured, a tag build inside the release
     // matrix would upload on all three legs at once, racing the create-release
@@ -538,8 +1091,15 @@ function main() {
     // for that suite while it ran unisolated.
     //
     // This lives in the PACKAGING suite because it is a property of the test
-    // estate as a whole - a tenth suite added later is exactly what a per-suite
-    // assertion cannot see.
+    // estate as a whole - an eleventh suite added later is exactly what a
+    // per-suite assertion cannot see.
+    //
+    // The floor is the MEASURED subject-set size (10), not a round number
+    // below it. A floor with slack is satisfied by a sweep that has silently
+    // stopped seeing part of its population - the same magic-number defect as
+    // a licence guard demanding 200 entries against a real 220. R513 pins it
+    // by moving one suite off the `electron` runner, which the old `>= 8`
+    // waved through.
     const ISOLATION_AT_MODULE_SCOPE =
       /^(?:const\s+\w+\s*=\s*)?require\(["']\.\/test-userdata-isolation["']\);?\s*$/m;
     const electronSuites = Object.values(pkg.scripts || {})
@@ -552,11 +1112,42 @@ function main() {
     });
     check(
       "every Electron test suite establishes an isolated userData profile",
-      electronSuites.length >= 8 && unisolated.length === 0,
+      electronSuites.length >= 10 && unisolated.length === 0,
       `${electronSuites.length} suites; missing: ${unisolated.join(", ") || "none"}`,
     );
 
-    // The isolation module only works because it refuses to run late. Without
+    // Every suite package.json REFERENCES must exist - for BOTH runners.
+    //
+    // The isolation sweep above derives its subject list from `electron
+    // test/...`, so it structurally cannot see a suite run by plain `node`.
+    // Two are: test-dev-profile.js and test-packaging.js. That gap is not
+    // theoretical - test:migration -> test:profile was renamed with a `git mv`
+    // in this repo, and had package.json been left pointing at the old path the
+    // ONLY signal would have been a failed chain run, minutes in. A missing
+    // file is a silent no-op for the npm script that names it.
+    //
+    // The node-only count is pinned rather than merely derived. This assertion
+    // exists BECAUSE the electron-only pattern was too narrow, so a future edit
+    // narrowing it back would shrink the subject set to exactly the population
+    // that was already covered - passing while covering nothing new. That is
+    // this file's recurring defect class: a subject list narrower than the
+    // claim it supports.
+    const referencedSuites = [
+      ...new Set(
+        Object.values(pkg.scripts || {}).flatMap((v) =>
+          [...v.matchAll(/(electron|node)\s+(test\/[\w.-]+\.js)/g)].map((m) => m[2]),
+        ),
+      ),
+    ];
+    const nodeOnlySuites = referencedSuites.filter((rel) => !electronSuites.includes(rel));
+    const missingSuites = referencedSuites.filter((rel) => !fs.existsSync(path.join(ROOT, rel)));
+    check(
+      "every test suite package.json names actually exists on disk",
+      referencedSuites.length >= 12 && nodeOnlySuites.length >= 2 && missingSuites.length === 0,
+      `${referencedSuites.length} referenced (${nodeOnlySuites.length} node-run); missing: ${missingSuites.join(", ") || "none"}`,
+    );
+
+
     // that refusal it would silently no-op and every assertion above would keep
     // passing while the suites ran against a shared profile again - an absence
     // assertion failing open, the defect class this project keeps rediscovering.
@@ -643,6 +1234,242 @@ function main() {
         );
       }
     }
+  }
+
+  // The same script asserts about two dozen OTHER things about this tree, and
+  // nothing tied any of them to it. One had rotted into the exact OPPOSITE of
+  // the truth: it required an `app-title` element inside a `#logoLink` in
+  // index.html, when the header was deliberately redesigned down to the
+  // hamburger alone. Two oracles pin that absence - the `.app-title` check
+  // further down this file, and test-tab-refresh.js asserting appTitle ===
+  // false and logoLink === false in the live DOM. So a maintainer following
+  // the script's own printed instruction would have re-added markup and failed
+  // the suite on the very next run. Two of this repo's checks disagreed with
+  // each other for as long as both existed.
+  //
+  // Parse the script's expectations and hold them against the tree. The
+  // ABSENCE family is the dangerous half and is covered too: a
+  // check_html_absent naming something that was never coming back reads as a
+  // pass forever, so it is only worth anything while the parse that finds it
+  // is known to be finding things at all. Hence the count floors below, which
+  // are the MEASURED counts with no slack - a floor with room to spare would
+  // let the parse quietly stop seeing checks and still report success.
+  {
+    const scriptPath = path.join(ROOT, "scripts", "post-upstream-merge.sh");
+    const htmlPath = path.join(ROOT, "src", "index.html");
+    if (fs.existsSync(scriptPath) && fs.existsSync(htmlPath)) {
+      const script = fs.readFileSync(scriptPath, "utf8");
+      const html = fs.readFileSync(htmlPath, "utf8");
+      const buildFiles = ((pkg.build && pkg.build.files) || []).filter(
+        (f) => typeof f === "string",
+      );
+
+      const calls = (re) => [...script.matchAll(re)].map((m) => m[1]);
+      // The helper DEFINITIONS (`check_line() {`) cannot match these: every
+      // pattern requires whitespace then a quote where the definition has `()`.
+      const lineChecks = calls(
+        /^check_line\s+"\$ROOT\/src\/index\.html"\s+'([^']*)'/gm,
+      );
+      const scriptTags = calls(/^check_html_script\s+"([^"]+)"/gm);
+      const absentTags = calls(/^check_html_absent\s+"([^"]+)"/gm);
+      const buildChecks = calls(/^check_build_file\s+"([^"]+)"/gm);
+
+      check(
+        "post-upstream-merge.sh checks are still parseable",
+        lineChecks.length >= 6 &&
+          scriptTags.length >= 4 &&
+          absentTags.length >= 1 &&
+          buildChecks.length >= 10,
+        `parsed ${lineChecks.length} check_line (need 6), ` +
+          `${scriptTags.length} check_html_script (need 4), ` +
+          `${absentTags.length} check_html_absent (need 1), ` +
+          `${buildChecks.length} check_build_file (need 10) - ` +
+          "a reformat that breaks this parse would silently disarm every " +
+          "assertion below it",
+      );
+
+      // grep semantics: the pattern is a BRE, but every one of them is a plain
+      // literal today. Accept either reading so a future regex pattern is not
+      // reported as a false failure, and so a literal containing `.` is not
+      // matched loosely by accident.
+      const matches = (hay, pat) => {
+        if (hay.includes(pat)) return true;
+        try {
+          return new RegExp(pat).test(hay);
+        } catch {
+          return false;
+        }
+      };
+
+      const missingLine = lineChecks.filter((p) => !matches(html, p));
+      check(
+        "post-upstream-merge.sh index.html checks all still match",
+        missingLine.length === 0,
+        missingLine.length === 0
+          ? `${lineChecks.length} checked; all present`
+          : `${missingLine.length} of ${lineChecks.length} no longer match ` +
+            `index.html: ${missingLine.join(", ")} - the script would tell a ` +
+            "maintainer to re-add something this repo has removed",
+      );
+
+      const missingTag = scriptTags.filter(
+        (s) => !html.includes(`src="${s}"`),
+      );
+      check(
+        "post-upstream-merge.sh required script tags are all loaded",
+        missingTag.length === 0,
+        missingTag.length === 0
+          ? `${scriptTags.length} checked; all loaded`
+          : `not loaded by index.html: ${missingTag.join(", ")}`,
+      );
+
+      const resurrected = absentTags.filter((s) => html.includes(`src="${s}"`));
+      check(
+        "post-upstream-merge.sh forbidden script tags are still absent",
+        resurrected.length === 0,
+        resurrected.length === 0
+          ? `${absentTags.length} checked; all absent`
+          : `back in index.html: ${resurrected.join(", ")}`,
+      );
+
+      const missingBuild = buildChecks.filter(
+        (f) => !buildFiles.some((b) => b.includes(f)),
+      );
+      check(
+        "post-upstream-merge.sh build.files checks all still match",
+        missingBuild.length === 0,
+        missingBuild.length === 0
+          ? `${buildChecks.length} checked; all declared`
+          : `absent from build.files: ${missingBuild.join(", ")}`,
+      );
+    }
+  }
+
+  // F32: for as long as this repository had CI, CI never ran a windowed test.
+  // release.yml triggers only on a `v*` tag or a manual dispatch, and its one
+  // test step is `npm run test:packaging` - a suite that runs under plain node.
+  // The ten suites that drive real BrowserWindows, including every
+  // render-security regression test, ran only where someone remembered to run
+  // them. ci.yml now runs the whole chain on push and pull request.
+  //
+  // Asserted as COVERAGE rather than existence: "some workflow mentions
+  // electron somewhere" would be satisfied by a single token suite, which is
+  // the shape this defect would take if it came back. So resolve what the
+  // workflows actually invoke - transitively, because `npm test` is a chain of
+  // `npm run` calls - and require the reachable set to be the WHOLE set, with
+  // no slack. The two positive controls exist because both halves are counts
+  // derived by regex: if either parse silently stopped matching, an empty set
+  // would agree with an empty set and this would pass having checked nothing.
+  {
+    const scripts = pkg.scripts || {};
+    const SUITE_RE = /electron\s+(test\/[\w.-]+\.js)/g;
+
+    const declared = new Set();
+    for (const body of Object.values(scripts)) {
+      for (const m of String(body).matchAll(SUITE_RE)) declared.add(m[1]);
+    }
+
+    const reachable = new Set();
+    const walk = (name, seen) => {
+      if (seen.has(name) || !scripts[name]) return;
+      seen.add(name);
+      const body = String(scripts[name]);
+      for (const m of body.matchAll(SUITE_RE)) reachable.add(m[1]);
+      // `npm test`, `npm run test:tabs`, `npm run build-all` all land here.
+      for (const m of body.matchAll(/npm\s+(?:run\s+)?([\w:-]+)/g)) {
+        walk(m[1], seen);
+      }
+    };
+
+    // NOTE FOR EDITORS: these locals are deliberately NOT named wfDir/wfFiles.
+    // The devDependency-evidence scan earlier in this file already declares a
+    // wfDir bound to the same workflows directory, and R488 anchors on that
+    // exact line - so a second identical declaration here makes the anchor
+    // ambiguous and R488 reports SETUP-FAILED rather than proving anything.
+    // For the same reason, do not spell that declaration out verbatim in a
+    // comment: the harness matches raw text, so a quoted copy collides too.
+    const ciWorkflowDir = path.join(ROOT, ".github", "workflows");
+    const ciWorkflowFiles = fs.existsSync(ciWorkflowDir)
+      ? fs.readdirSync(ciWorkflowDir).filter((f) => /\.ya?ml$/i.test(f))
+      : [];
+    let invocations = 0;
+    for (const f of ciWorkflowFiles) {
+      const text = fs.readFileSync(path.join(ciWorkflowDir, f), "utf8");
+      for (const m of text.matchAll(/run:\s*(?:npx\s+)?npm\s+(?:run\s+)?([\w:-]+)/g)) {
+        invocations++;
+        walk(m[1], new Set());
+      }
+    }
+
+    check(
+      "the workflows invoke npm scripts this assertion can follow",
+      ciWorkflowFiles.length > 0 && invocations > 0,
+      `${ciWorkflowFiles.length} workflow file(s) [${ciWorkflowFiles.join(", ")}], ` +
+        `${invocations} npm invocation(s) parsed - zero of either would make ` +
+        "the coverage check below vacuous",
+    );
+    check(
+      "package.json declares Electron suites for CI to run",
+      declared.size >= 10,
+      `${declared.size} suites matched \`electron test/*.js\` (expected at ` +
+        "least the 10 windowed suites)",
+    );
+
+    const uncovered = [...declared].filter((s) => !reachable.has(s)).sort();
+    check(
+      "CI runs every Electron test suite, not just the node-only ones",
+      uncovered.length === 0,
+      uncovered.length === 0
+        ? `${reachable.size} of ${declared.size} Electron suites reachable from the workflows`
+        : `${uncovered.length} of ${declared.size} never run in CI: ${uncovered.join(", ")} - ` +
+          "these are the suites that drive real windows, so a regression in " +
+          "them would reach a release unopposed",
+    );
+  }
+
+  // F21: DevTools is a Node REPL while the renderer runs nodeIntegration: true,
+  // and main.js bound it to F12 in EVERY build with no gate at all. The
+  // accelerator half of that surface is asserted behaviourally by
+  // test-render-security.js ("no default application menu survives startup");
+  // this is the half no behavioural test can reach, because flipping
+  // app.isPackaged to true requires an actual packaged build.
+  //
+  // Checked as SHAPE, deliberately narrowly: the gate must wrap the call, not
+  // merely exist somewhere in the file. An `if (devToolsAllowed())` sitting
+  // anywhere would satisfy a looser regex while the toggle stayed
+  // unconditional.
+  {
+    const main = fs.readFileSync(path.join(SRC, "main.js"), "utf8");
+    const toggles = (main.match(/toggleDevTools\s*\(/g) || []).length;
+    check(
+      "main.js has exactly one DevTools toggle to guard",
+      toggles === 1,
+      `${toggles} toggleDevTools( call sites - the gate below only covers one`,
+    );
+    check(
+      "the DevTools toggle is behind the packaged-build gate",
+      /if\s*\(\s*devToolsAllowed\(\)\s*\)\s*\{[^}]*toggleDevTools\s*\(/.test(main),
+      "toggleDevTools() is not wrapped in `if (devToolsAllowed())` - a shipped " +
+        "build would hand a Node console to anyone at the keyboard",
+    );
+    // And the gate has to consult something a shipped build actually changes.
+    // `function devToolsAllowed() { return true; }` would pass the check above.
+    const body = main.match(/function devToolsAllowed\(\)\s*\{([\s\S]*?)\n\}/);
+    check(
+      "the DevTools gate is defined and reads app.isPackaged",
+      Boolean(body) && /app\.isPackaged/.test(body[1]),
+      body
+        ? `devToolsAllowed() body does not mention app.isPackaged: ${JSON.stringify(body[1].trim().slice(0, 120))}`
+        : "no devToolsAllowed() definition found",
+    );
+    // The per-window control the accelerator measurement pinned. Every window
+    // this app opens must drop its menu; main.js's is the one that matters
+    // because it is the only window with Node integration.
+    check(
+      "the main window drops its menu bar, which suppresses the DevTools accelerator",
+      /mainWindow\.setMenu\(null\)/.test(main),
+      "mainWindow.setMenu(null) is gone - measured to re-enable Ctrl+Shift+I",
+    );
   }
 
   // The README states the Electron version in several places. Nothing tied
@@ -916,6 +1743,119 @@ function main() {
       "the README names those two dialogs rather than claiming all dialogs resize",
       /The Mermaid and table dialogs are resizable/.test(readme),
       "the dialog-resize claim was reworded, so it is no longer checked",
+    );
+  }
+
+  // ==========================================================================
+  // THE SHIPPED VERSION TABLE
+  // ==========================================================================
+  // README.md ships inside the installer through extraResources and the in-app
+  // welcome button opens it, so the `## Technology` table is a statement the
+  // PRODUCT makes about which versions of its dependencies the reader is
+  // running. Measured before this oracle existed: FIVE of the six versioned
+  // rows were stale, three of them by a whole minor. Nothing had ever compared
+  // them against anything, so the table was written once and then drifted
+  // through every dependency bump - the same disease as the four false
+  // keyboard-shortcut rows and the three-of-five download table above.
+  //
+  // Every row's truth comes from an INDEPENDENT source, never from a second
+  // copy of the number maintained beside the assertion:
+  //  - npm-sourced components resolve through package-lock.json. The RESOLVED
+  //    version is the one that ships; package.json carries CARET RANGES, so
+  //    reading it would compare the README against a range rather than against
+  //    a version and would go green on a table that names no shipped release.
+  //  - Tabulator is HAND-VENDORED. It is absent from package.json entirely, so
+  //    it is invisible to `npm audit`, `npm outdated` and Dependabot alike, and
+  //    the only statement of its version anywhere in this tree is the banner at
+  //    the top of the bundle it ships as.
+  //  - Fira Code vendors as five .ttf files that carry no version at all, so a
+  //    dash is the honest cell. That is ASSERTED rather than skipped, so the
+  //    row cannot quietly acquire an invented number.
+  //
+  // EXHAUSTIVE BY CONSTRUCTION: a row this block does not recognise FAILS. A
+  // seventh component therefore cannot be added to the table and left unchecked
+  // by omission, which is the failure mode of any hand-maintained row list.
+  {
+    // EOL-NORMALISED FOR PARSING ONLY. README.md is CRLF in the working tree
+    // (`.gitattributes` normalises it on the way in), so a `"\n## Technology\n"`
+    // needle finds nothing and every check below then passes VACUOUSLY on zero
+    // rows. Measured: that is exactly what this block's first run did, and the
+    // row floor two assertions down is what caught it.
+    const readme = read("README.md").replace(/\r\n/g, "\n");
+
+    // A PARSER WITH NO END MARKER REPORTS ON TEXT NOBODY CLAIMED IT WAS
+    // READING - recorded when the keyboard-shortcut parser ran on into the
+    // provenance table 200 lines later and classified "Electron" as a shortcut.
+    // Bounded at the next heading, and the bound is asserted rather than
+    // assumed.
+    const secAt = readme.indexOf("\n## Technology\n");
+    const tail = secAt === -1 ? "" : readme.slice(secAt + 1);
+    const endAt = tail.indexOf("\n## ", 1);
+    const section = endAt === -1 ? tail : tail.slice(0, endAt);
+    check(
+      "the README's Technology section was located and bounded at the next heading",
+      secAt !== -1 && /^## Technology\n/.test(section) && section.indexOf("\n## ", 1) === -1,
+      secAt === -1
+        ? "no `## Technology` heading - the section was renamed, so nothing is being checked"
+        : `${section.length} chars, ends: ${JSON.stringify(section.slice(-40))}`,
+    );
+
+    const rows = [...section.matchAll(/^\| *([^|\n]+?) *\| *([^|\n]+?) *\| *([^|\n]+?) *\|$/gm)]
+      .map((m) => ({ component: m[1], version: m[2], role: m[3] }))
+      .filter((r) => r.component !== "Component" && !/^-+$/.test(r.component));
+    check(
+      "the version table really parsed, so the checks below have subjects",
+      rows.length >= 7,
+      `${rows.length} row(s): ${JSON.stringify(rows.map((r) => r.component))}`,
+    );
+
+    const lockPkgs = JSON.parse(read("package-lock.json")).packages || {};
+    const lockVersion = (name) => ((lockPkgs["node_modules/" + name] || {}).version || "");
+
+    const tabBanner = ((read("libs/tabulator/tabulator.min.js").slice(0, 400)
+      .match(/Tabulator v(\d+\.\d+\.\d+)/) || [])[1] || "");
+    check(
+      "the vendored Tabulator bundle declares the version its README row is checked against",
+      /^\d+\.\d+\.\d+$/.test(tabBanner),
+      tabBanner || "no version banner at the head of libs/tabulator/tabulator.min.js",
+    );
+
+    const TRUTH = {
+      Electron: () => lockVersion("electron"),
+      marked: () => lockVersion("marked"),
+      Mermaid: () => lockVersion("mermaid"),
+      DOMPurify: () => lockVersion("dompurify"),
+      PrismJS: () => lockVersion("prismjs"),
+      Tabulator: () => tabBanner,
+      // Five .ttf files under assets/fonts/, no version anywhere in any of them.
+      "Fira Code": () => "-",
+    };
+
+    const unclassified = rows.filter((r) => !TRUTH[r.component]);
+    check(
+      "every row in the shipped version table is one this oracle knows how to verify",
+      unclassified.length === 0,
+      JSON.stringify(unclassified.map((r) => r.component)),
+    );
+
+    // THE CAUSE IS ASSERTED BESIDE THE CONSEQUENCE. A mistyped package name
+    // resolves to the empty string, which would fail the comparison below with
+    // an evidence line naming the README rather than the lookup that broke.
+    const known = rows.filter((r) => TRUTH[r.component]);
+    const unresolved = known.filter((r) => TRUTH[r.component]() === "");
+    check(
+      "every version this oracle checks against was resolved from a real source",
+      unresolved.length === 0,
+      JSON.stringify(unresolved.map((r) => r.component)),
+    );
+
+    const stale = known
+      .map((r) => ({ component: r.component, readme: r.version, ships: TRUTH[r.component]() }))
+      .filter((r) => r.readme !== r.ships);
+    check(
+      "every version the shipped README claims is the version that actually ships",
+      stale.length === 0,
+      JSON.stringify(stale),
     );
   }
 
@@ -1361,6 +2301,37 @@ function main() {
       "expected the id to come from package.json build.appId",
     );
 
+    // The dev-profile redirect has to run before ANYTHING reads the profile
+    // path, and lateness is not observable at runtime: app.setPath("userData")
+    // is silently ignored once the app is ready, so a call that moved down the
+    // file keeps returning normally while the redirect quietly stops happening.
+    // An absence check fails open, so the ordering is pinned statically here.
+    //
+    // The two readers below are the ones that resolve at MODULE SCOPE, so
+    // they capture whatever the profile path is at the instant main.js is
+    // evaluated: WINDOW_STATE_FILE and logFilePath. A behavioural suite
+    // structurally cannot cover the positive half - every windowed suite
+    // relocates userData first, so the redirect correctly declines there and
+    // the ordering never bites. test-startup-perf.js asserts the declining
+    // half live; test-dev-profile.js drives the decision itself against a stub.
+    const devCall = mainSrc.indexOf("\napplyDevProfile();");
+    check(
+      "main.js applies the dev-profile redirect at module scope",
+      devCall !== -1,
+      "no top-level applyDevProfile() call found in main.js",
+    );
+    for (const [what, needle] of [
+      ["WINDOW_STATE_FILE", "const WINDOW_STATE_FILE"],
+      ["the debug log path", "logFilePath ="],
+    ]) {
+      const at = mainSrc.indexOf(needle);
+      check(
+        `the dev-profile redirect runs before ${what} reads the profile path`,
+        devCall !== -1 && at !== -1 && devCall < at,
+        `applyDevProfile@${devCall} ${JSON.stringify(needle)}@${at}`,
+      );
+    }
+
     // The letterhead PNG was deleted with Corporate Mode. If the allowlist
     // still named it, electron-builder would fail the build on a missing file.
     check(
@@ -1745,11 +2716,59 @@ function main() {
       check("the notices generator runs", regenerated !== null, genErr && genErr.message);
       if (regenerated) {
         const committed = fs.readFileSync(noticesPath, "utf8");
-        check(
-          "the committed notices file is not stale",
-          committed === regenerated,
-          `committed ${committed.length} bytes, regenerated ${regenerated.length} bytes - run \`npm run notices\``,
+        // The evidence has to survive the case where the two differ WITHOUT
+        // differing in length - a version bump like 3.4.12 -> 3.4.14 keeps the
+        // byte count identical, so a size-only message reads "committed 196797
+        // bytes, regenerated 196797 bytes" and reports a failure whose own
+        // detail says nothing is wrong. Same disease as the licence guard's
+        // "107 entries, 0 without". Name the first divergence instead.
+        let noticesDetail = `committed ${committed.length} bytes, regenerated ${regenerated.length} bytes - run \`npm run notices\``;
+        if (committed !== regenerated) {
+          let at = 0;
+          while (at < committed.length && at < regenerated.length && committed[at] === regenerated[at]) at++;
+          const excerpt = (s) => JSON.stringify(s.slice(at, at + 48));
+          noticesDetail =
+            `first difference at offset ${at} of ${committed.length}/${regenerated.length} bytes: ` +
+            `committed ${excerpt(committed)} vs regenerated ${excerpt(regenerated)} - run \`npm run notices\``;
+        }
+        check("the committed notices file is not stale", committed === regenerated, noticesDetail);
+
+        // This document SHIPS, and its first line tells the reader where
+        // Folia's own licence is. It said `LICENSE` - a file that exists in
+        // the repository and is deliberately NOT in extraResources, because
+        // the shipped copy is `LICENSE.txt` (a bare extensionless file is a
+        // "how do you want to open this" dialog on Windows). So the one
+        // pointer in the installed notices named the one licence file that
+        // does not install beside it.
+        //
+        // The README's relative links are already pinned to extraResources
+        // further up, but that oracle could never have caught this: the
+        // pointer is inline CODE, not a markdown link, and it is in the other
+        // shipped document. Read the shipping list rather than repeating it,
+        // so renaming what ships fails here too.
+        const pointer = committed.match(
+          /distributed under the MIT licence \(see `([^`]+)`\)/,
         );
+        check(
+          "the notices file still states where Folia's own licence is",
+          Boolean(pointer),
+          pointer
+            ? ""
+            : "no `distributed under the MIT licence (see ...)` sentence found - " +
+              "the assertion below judges nothing without it",
+        );
+        if (pointer) {
+          const shipped = extra
+            .map((e) => e && (e.to || e.from))
+            .filter(Boolean);
+          check(
+            "the notices file's licence pointer names a file that ships beside it",
+            shipped.includes(pointer[1]),
+            `points at ${JSON.stringify(pointer[1])}; resources/ receives ` +
+              `${JSON.stringify(shipped)} - fix the sentence in ` +
+              "scripts/generate-notices.js, then `npm run notices`",
+          );
+        }
 
         // A second source describing the same tree. NOTE ON ITS STRENGTH: the
         // generator now reads package-lock.json directly (it used to walk
@@ -1793,14 +2812,7 @@ function main() {
         // that actually performs the vendoring) plus the committed libs/
         // subdirectories, so vendoring a new library without documenting it
         // fails rather than passing by omission.
-        const vendorSrc = read("scripts/vendor-libs.js");
-        const libsTable = /const LIBS = \[([\s\S]*?)\];/.exec(vendorSrc);
-        const vendoredHere = new Set();
-        if (libsTable) {
-          for (const m of libsTable[1].matchAll(/\[\s*"([^"]+)"/g)) {
-            vendoredHere.add(m[1]);
-          }
-        }
+        const vendoredHere = new Set(libsNames);
         // libs/prismjs and libs/tabulator are COMMITTED rather than produced by
         // vendor-libs.js, so the LIBS table cannot see them. EVERY committed
         // libs/ subdirectory counts: requiring a matching node_modules/<name>
@@ -1844,9 +2856,9 @@ function main() {
           `${missingRoots.join(", ")} not discovered - if a library really was dropped, remove it from libs/ and from the generator too`,
         );
         // Directory names are lower case ("libs/tabulator") while the notice
-        // heading is the project's own capitalisation ("Tabulator 6.2.5"), so
-        // the comparison has to be case-insensitive or it reports a false
-        // breach for the one library it was just widened to cover.
+        // heading is the project's own capitalisation ("Tabulator" plus its
+        // version), so the comparison has to be case-insensitive or it reports
+        // a false breach for the one library it was just widened to cover.
         const documentedLower = new Set([...documentedNames(regenerated)].map((n) => n.toLowerCase()));
         const undocumentedVendored = [...vendoredHere].filter(
           (n) => !documentedLower.has(n.toLowerCase()),
@@ -1856,6 +2868,109 @@ function main() {
           undocumentedVendored.length === 0,
           `${undocumentedVendored.join(", ")} - code ships inside libs/ but is documented nowhere; how it got there (npm devDependency, or committed by hand like Tabulator) does not change the obligation`,
         );
+
+        // THE VENDORED COPY CAN GO STALE WITHOUT ANYTHING FAILING, and it did.
+        // A real bump shipped the previous library's bytes: `npm install
+        // marked@18.0.10` put 18.0.10 into node_modules, left
+        // libs/vendor/marked.min.js on 18.0.9, wrote nothing to VERSIONS.json,
+        // and reported success. Every other assertion in this suite stayed
+        // green, because they ask whether the vendored files are DOCUMENTED and
+        // PACKAGED - never whether they are CURRENT. So package.json, the
+        // lockfile and `npm audit` would all have described a version the
+        // application does not run, which is the exact decorative-versions
+        // failure vendoring was introduced to end.
+        //
+        // MEASURED, because scripts/vendor-libs.js's own header asserted the
+        // opposite ("It runs on postinstall, so the copies cannot drift from
+        // package.json"): on npm 11.16.0 a bare `npm install` DOES fire the
+        // root postinstall, and `npm install <pkg>@<ver>` DOES NOT. The drift
+        // window is therefore exactly the command a dependency bump is made
+        // with. The remedy named below is `npm run vendor`.
+        //
+        // BOTH HALVES ARE NEEDED AND NEITHER IMPLIES THE OTHER. The byte
+        // comparison catches the stale copy (the case above). The version
+        // comparison catches a copy made by hand without updating
+        // VERSIONS.json, and also the case where two releases happen to emit
+        // byte-identical output - there the bytes agree while the recorded
+        // version is wrong, and only VERSIONS.json can say so.
+        const libTriples = [];
+        if (libsTable) {
+          for (const m of libsTable[1].matchAll(
+            /\[\s*"([^"]+)"\s*,\s*"([^"]+)"\s*,\s*"([^"]+)"\s*\]/g,
+          )) {
+            libTriples.push({ pkg: m[1], file: m[2], dest: m[3] });
+          }
+        }
+        // Non-vacuity by CROSS-CHECKING TWO PARSERS of the same table rather
+        // than by a count with slack in it. The shared lax parser (hoisted to
+        // one site near the top of this file) reads only the first string of
+        // each entry; this one needs all three. An entry whose shape the strict
+        // parser cannot read would otherwise be dropped from the freshness
+        // check silently, which is the same disease this block exists to catch,
+        // one level up.
+        check(
+          "the vendored-freshness oracle read every entry in the LIBS table",
+          libTriples.length === libsNames.length && libTriples.length >= 3,
+          `${libTriples.length} full triple(s) parsed against ${libsNames.length} entr(ies) found, measured 3 - a mismatch means an entry is being skipped rather than checked`,
+        );
+        let recordedVendorVersions = null;
+        try {
+          recordedVendorVersions =
+            JSON.parse(read("libs/vendor/VERSIONS.json")).versions || null;
+        } catch (e) {
+          recordedVendorVersions = null;
+        }
+        check(
+          "libs/vendor/VERSIONS.json records what was vendored",
+          recordedVendorVersions !== null,
+          "missing or unparseable - vendor-libs.js rewrites it on every run, so its absence means the vendoring never completed",
+        );
+        const staleVendored = [];
+        const versionMismatches = [];
+        const unvendorable = [];
+        for (const t of libTriples) {
+          const src = path.join(ROOT, "node_modules", t.pkg, t.file);
+          const dst = path.join(ROOT, "libs", "vendor", t.dest);
+          const meta = path.join(ROOT, "node_modules", t.pkg, "package.json");
+          if (!fs.existsSync(src) || !fs.existsSync(meta)) {
+            unvendorable.push(t.pkg);
+            continue;
+          }
+          if (!fs.existsSync(dst) || !fs.readFileSync(src).equals(fs.readFileSync(dst))) {
+            staleVendored.push(`libs/vendor/${t.dest} != node_modules/${t.pkg}/${t.file}`);
+          }
+          const installed = JSON.parse(fs.readFileSync(meta, "utf8")).version;
+          const recorded = recordedVendorVersions ? recordedVendorVersions[t.pkg] : undefined;
+          if (String(recorded) !== String(installed)) {
+            versionMismatches.push(
+              `${t.pkg}: VERSIONS.json says ${recorded}, node_modules has ${installed}`,
+            );
+          }
+        }
+        if (unvendorable.length > 0) {
+          // Naming the packages rather than the count, because a partial
+          // node_modules is the one state in which this block genuinely cannot
+          // answer - and a silent pass here would restore the hole exactly.
+          skip(
+            "every vendored library is the byte-for-byte copy of the version installed in node_modules",
+            `${unvendorable.join(", ")} not present under node_modules - run \`npm install\` so the shipped copies can be compared against their source`,
+          );
+          skip(
+            "libs/vendor/VERSIONS.json names the versions installed in node_modules",
+            `${unvendorable.join(", ")} not present under node_modules`,
+          );
+        } else {
+          check(
+            "every vendored library is the byte-for-byte copy of the version installed in node_modules",
+            staleVendored.length === 0,
+            `${staleVendored.join("; ")} - the shipped library is not the one package.json declares; run \`npm run vendor\` (a bump made with \`npm install <pkg>@<ver>\` does not fire the root postinstall)`,
+          );
+          check(
+            "libs/vendor/VERSIONS.json names the versions installed in node_modules",
+            versionMismatches.length === 0,
+            `${versionMismatches.join("; ")} - run \`npm run vendor\``,
+          );
+        }
 
         // THE ATTRIBUTION THAT USED TO SHIP AS A FILE. Solarized Light and
         // Tomorrow Night were vendored as libs/prismjs/themes/*.css, each
@@ -2028,11 +3143,22 @@ function main() {
             // installer, so a globbing change that dropped it would take the
             // renderer's syntax highlighting and every diagram with it, and
             // the two existing "in build.files" assertions would still pass.
+            //
+            // The PrismJS entry used to name components/prism-core.min.js,
+            // which was the wrong file and made this guard decorative for
+            // syntax highlighting: src/index.html loads exactly one Prism file,
+            // libs/prismjs/prism-bundle.js, and nothing has ever loaded
+            // components/. Dropping the bundle really would take highlighting
+            // with it and this assertion would have stayed green; dropping
+            // components/ took nothing and would have failed it. Measured, not
+            // assumed - the components/ tree could not even load, because
+            // prism-clike.min.js was never vendored and 8 of its 14 language
+            // components require it. It has since been deleted.
             for (const rel of [
               "libs/vendor/marked.min.js",
               "libs/vendor/mermaid.min.js",
               "libs/vendor/purify.min.js",
-              "libs/prismjs/components/prism-core.min.js",
+              "libs/prismjs/prism-bundle.js",
             ]) {
               check(
                 `${rel} is really inside the built app.asar`,
@@ -2040,6 +3166,38 @@ function main() {
                 "declared in build.files but absent from the archive - this is now the only copy that ships",
               );
             }
+
+            // The COMPLEMENT of the loop above, and the guard that stops the
+            // 143.8 KB of redundant PrismJS payload from silently coming back.
+            // build.files ships libs/**/*, so anything re-vendored under
+            // libs/prismjs/ enters the installer with nothing to review: every
+            // assertion above is equally satisfied by a directory that carries
+            // 16 dead component files beside the bundle.
+            //
+            // It fails CLOSED rather than needing a separate positive control -
+            // the expectation is a NON-EMPTY set, so a sweep that matched
+            // nothing (a path-separator change, a renamed directory) reports a
+            // mismatch rather than a clean absence.
+            //
+            // NOT revert-provable, and that is a structural limit of the
+            // harness rather than an omission: a revert is a string edit and
+            // this reads a BUILD ARTEFACT the harness cannot regenerate, so no
+            // revert can put a file back into the archive. Proven non-vacuous
+            // by MEASUREMENT instead: against the build made BEFORE the
+            // deletion this same sweep saw 21 entries (components.json,
+            // components/ and its 16 .min.js files, prism.js), and after
+            // `npm run build` on the deleted tree it sees 2. Same precedent as
+            // R457 - record the gap, prove the property the way the artefact
+            // allows.
+            const prismEntries = [...shippedFiles].filter((p) => p.startsWith("/libs/prismjs/"));
+            const prismFiles = prismEntries
+              .filter((p) => !prismEntries.some((q) => q.startsWith(p + "/")))
+              .sort();
+            check(
+              "the built app.asar carries exactly one PrismJS file, the bundle the renderer loads",
+              prismFiles.length === 1 && prismFiles[0] === "/libs/prismjs/prism-bundle.js",
+              `libs/prismjs/ ships ${prismFiles.length} file(s): ${JSON.stringify(prismFiles)}`,
+            );
           }
 
           // app-update.yml is what makes the packaged app able to find an
@@ -2505,6 +3663,72 @@ function main() {
           );
         }
 
+        // THE PROVENANCE CLAIM ABOVE USED TO NAME A VERSION, AND IT WENT STALE.
+        // The comment beside the Tabulator pin in .gitattributes read "the
+        // Tabulator licence comes out of `npm pack tabulator-tables@6.2.5`"
+        // while the tree had moved on to 6.5.2. That is not a cosmetic drift in
+        // a comment: the two artifacts differ precisely in the copyright notice
+        // (6.2.5 reads `Copyright (c) 2015-2024 Oli Folkerd`, 6.5.2 reads
+        // `2015-2026`), and under MIT the notice IS the obligation. So the
+        // comment was citing, as the source of a verbatim copy, an artifact
+        // that does not contain the text that ships.
+        //
+        // Measured, both tarballs unpacked side by side:
+        //   6.2.5  banner `Tabulator v6.2.5 ... 2024`   LICENSE 2015-2024
+        //   6.5.2  banner `Tabulator v6.5.2 ... 2026`   LICENSE 2015-2026
+        //   vendored LICENSE  ==  6.5.2's, byte for byte; differs from 6.2.5's
+        //
+        // Two assertions, because the cause and the consequence fail under
+        // different accidents. The first forbids a version being written down
+        // beside the file at all - the drift cannot recur if there is nothing
+        // to drift. The second is the substantive half: the vendored LICENSE
+        // and the vendored bundle must still look like two files out of ONE
+        // tarball, which is the actual thing the prose claims and the actual
+        // accident that produced this defect (bump the bundle, forget to
+        // re-copy the licence beside it).
+        {
+          const staleVersion = attrs.match(/tabulator-tables@\s*([\d.]+)/);
+          check(
+            ".gitattributes cites the Tabulator licence source without pinning a version to drift from",
+            !staleVersion,
+            staleVersion
+              ? `.gitattributes names tabulator-tables@${staleVersion[1]}; the vendored bundle's own banner is the version record, so nothing should restate it here`
+              : "",
+          );
+
+          // Independent of the README version oracle above: that one reads the
+          // banner for its VERSION, this one reads it for its YEAR, and
+          // compares it against a different file entirely.
+          const licText = read("libs/tabulator/LICENSE");
+          const bannerYear = ((read("libs/tabulator/tabulator.min.js").slice(0, 400)
+            .match(/Tabulator v[\d.]+ \(c\) [^\n]*?(\d{4})/) || [])[1] || "");
+          const licYear = ((licText.match(/Copyright \(c\) \d{4}-(\d{4})/) || [])[1] || "");
+          // Vacuity floor: two empty strings compare equal, so a regex that
+          // stopped matching either file would report perfect agreement. Same
+          // disease as the `entries.length > 200` licence guard against a real
+          // 220 - a comparison nobody has forced to name what it compared.
+          check(
+            "both halves of the Tabulator provenance pair were really parsed",
+            /^\d{4}$/.test(bannerYear) && /^\d{4}$/.test(licYear),
+            `banner year ${JSON.stringify(bannerYear)}, LICENSE year ${JSON.stringify(licYear)}`,
+          );
+          // Upstream stamps the bundle banner from the build and hand-maintains
+          // the LICENSE, and the two agreed on both sampled releases two years
+          // apart. This is therefore evidence rather than a guarantee: a future
+          // bump published in January, before upstream rolls its own copyright
+          // year, would fail here with the licence correctly copied. That is
+          // the intended behaviour and matches the recorded stance on the other
+          // Tabulator surface pins - a bump SHOULD fail loudly and be looked at
+          // by a human, rather than pass silently while the shipped notice
+          // quietly stops matching the shipped code.
+          check(
+            "the vendored Tabulator licence and bundle still come from the same upstream tarball",
+            bannerYear === licYear,
+            `libs/tabulator/tabulator.min.js reports ${bannerYear} but libs/tabulator/LICENSE reports ${licYear}; ` +
+              "re-copy LICENSE out of `npm pack tabulator-tables` at the banner's version",
+          );
+        }
+
         // The logo SVG is generated, like the notices above, and needs the same
         // pin for the same reason - but it earned its own assertion by failing
         // in a worse way than the others. `git add -A` ABORTED on safecrlf, and
@@ -2863,6 +4087,130 @@ function main() {
         .join(", "),
     );
 
+    // The instance-level check lives in test:security (N10). This is the CLASS:
+    // no Turkish-SPECIFIC letter survives anywhere in shipped source (see the
+    // narrower claim spelled out below - this is not "no Turkish text"). It is
+    // the only thing that would catch the NEXT one, and it is exactly what was
+    // missing - the
+    // string N10 removed evaded the original locale sweep because it was a raw
+    // literal spliced into innerHTML rather than an entry in the i18n table.
+    //
+    // Restricted to the six letters unique to Turkish. c-cedilla, o- and
+    // u-umlaut are shared with French, German and Spanish, so including them
+    // would make this fire on legitimate content one day.
+    //
+    // The name is deliberately narrow. This does NOT prove "no Turkish text":
+    // Duzenle and Gorunum carry only umlauts, and Kaydet, Kapat, Ekle, Tablo -
+    // and the two likeliest menu leftovers, Edit and View - are pure ASCII. It
+    // proves no Turkish-SPECIFIC letter survives, which is the low-noise half
+    // of the problem and the half that catches prose.
+    const TURKISH_CHARS = /[\u011E\u011F\u0130\u0131\u015E\u015F]/;
+    check(
+      "the Turkish sweep's own character class actually matches Turkish",
+      TURKISH_CHARS.test("Geçersiz tablo formatı") &&
+        !TURKISH_CHARS.test("Invalid table format"),
+      "character class does not discriminate",
+    );
+    check(
+      "no Turkish-specific letter survives in any shipped script",
+      !TURKISH_CHARS.test(allSrc),
+      (allSrc.match(new RegExp(TURKISH_CHARS.source, "g")) || []).join(", "),
+    );
+
+    // N10 built the table dialog's validation error as a node instead of
+    // assigning markup. That property is invisible from the DOM - an innerHTML
+    // assignment producing the same element is indistinguishable afterwards -
+    // so it can only be pinned at the source, here.
+    //
+    // Scoped to the one function AND the one element on purpose. The dialog's
+    // LEGITIMATE renderers (updateTablePreview, and openTableInsertDialog's
+    // edit path) assign sanitizeTableHtml() output into the preview through
+    // innerHTML, and insertTableFromDialog itself uses innerHTML on a DETACHED
+    // div to parse-test the markdown - so neither a file-wide nor a
+    // function-wide ban would be true. What must not come back is markup
+    // assigned into the LIVE preview from this function.
+    //
+    // The slice runs to the next COLUMN-0 "}", which is the function's own
+    // closing brace - every brace inside the body is indented, so a nested one
+    // cannot truncate it. MEASURED rather than assumed: the slice spans
+    // renderer.js:9235-9346, 112 lines, 4408 chars, i.e. the whole function.
+    // The vacuity guard pins BOTH ends, because "the body was located" and
+    // "the body was wholly located" are different claims and only the first is
+    // proven by a length floor: TAIL_MARKER sits at 86% of the body, so a
+    // future reformat that did introduce a column-0 brace mid-function would
+    // shrink the scope loudly instead of silently narrowing what is swept.
+    {
+      const TAIL_MARKER = "showNotification('Table inserted', 1000)";
+      const start = rendererSrc.indexOf("\nfunction insertTableFromDialog() {");
+      const body =
+        start === -1 ? "" : rendererSrc.slice(start, rendererSrc.indexOf("\n}", start));
+      check(
+        "the insertTableFromDialog body was located in full, so the check below reads the whole function",
+        start !== -1 &&
+          body.length > 400 &&
+          body.includes("table-insert-error") &&
+          body.includes(TAIL_MARKER),
+        `start=${start} len=${body.length} tail=${body.includes(TAIL_MARKER)}`,
+      );
+      check(
+        "the table dialog's validation error is built as a node, not assigned as markup",
+        !/tableInsertPreviewEl\s*\.\s*innerHTML/.test(body),
+        (body.match(/.*tableInsertPreviewEl\s*\.\s*innerHTML.*/g) || []).join(" | "),
+      );
+    }
+
+    // N12 - the same property for renderMarkdownFull's tail catch. Node-
+    // building is unobservable from the DOM (an innerHTML assignment producing
+    // the same element is indistinguishable afterwards), so the behavioural
+    // assertions in test:security pin what the banner LOOKS like and this pins
+    // how it is BUILT. Measured, not reasoned: the payload below was applied to
+    // renderer.js by hand and test:security run against it - both N12 DOM
+    // assertions still PASSED.
+    //
+    // SCOPED TO THE CATCH BLOCK, not the function, and that scope was chosen by
+    // MEASUREMENT rather than for tidiness. renderMarkdownFull assigns
+    // innerHTML three times legitimately - the mermaid SVG cache twice and the
+    // maximize button's icon once - so a function-wide ban on innerHTML would
+    // simply be false, and a ban narrowed to `viewer.innerHTML` would wave
+    // through the realistic accident of building the banner's own subtree from
+    // a string. Inside the catch the measured count is ZERO, so the ban there
+    // is both total and true.
+    //
+    // The catch is the last block of the function, so it runs to the function's
+    // own COLUMN-0 "}" - every brace inside the body is indented, so a nested
+    // one cannot truncate it. Both ends are pinned, because "the block was
+    // located" and "the block was wholly located" are different claims and a
+    // length floor only proves the first. TAIL_MARKER is deliberately the one
+    // statement a banner rewrite would NOT touch, so a future innerHTML version
+    // fails the BAN (naming the defect) rather than the vacuity guard (naming
+    // the instrument).
+    {
+      const TAIL_MARKER = "hideLoadingScreenFor(generation);";
+      const fnStart = rendererSrc.indexOf("\nasync function renderMarkdownFull(");
+      const fnEnd = fnStart === -1 ? -1 : rendererSrc.indexOf("\n}", fnStart);
+      const catchStart =
+        fnStart === -1 ? -1 : rendererSrc.indexOf("\n  } catch (error) {", fnStart);
+      const body =
+        catchStart === -1 || catchStart > fnEnd
+          ? ""
+          : rendererSrc.slice(catchStart, fnEnd);
+      check(
+        "the renderMarkdownFull catch block was located in full, so the check below reads the whole handler",
+        fnStart !== -1 &&
+          catchStart !== -1 &&
+          catchStart < fnEnd &&
+          body.length > 400 &&
+          body.includes("Error rendering markdown:") &&
+          body.includes(TAIL_MARKER),
+        `fn=${fnStart} catch=${catchStart} end=${fnEnd} len=${body.length} tail=${body.includes(TAIL_MARKER)}`,
+      );
+      check(
+        "the markdown render-failure banner is built as nodes, not assigned as markup",
+        !/\.\s*innerHTML/.test(body),
+        (body.match(/.*\.\s*innerHTML.*/g) || []).join(" | "),
+      );
+    }
+
     check(
       "the Ukrainian overlay file is deleted, not merely unregistered",
       !fs.existsSync(path.join(ROOT, "custom-language.js")) &&
@@ -3040,6 +4388,57 @@ function main() {
       "the orphaned export rasteriser was removed with its only caller",
       !/mermaidToPngDataUrl/.test(allSrc),
       "mermaidToPngDataUrl survives with no caller",
+    );
+
+    // --- THE VENDORED-INLINING INVARIANT --------------------------------
+    // main.js splices two hand-vendored files into the table popup's HTML as
+    // element CONTENT: tabulator.min.js inside <script> and tabulator.min.css
+    // inside <style>. Those are the only two files inlined that way, so this
+    // invariant is deliberately scoped to them rather than stated over libs/.
+    //
+    // The hazard is the HTML tokenizer, not JavaScript. Inside a <script>, the
+    // parser is scanning raw text for the byte sequence "</script" - it does
+    // not know or care that the sequence sits inside a JS string literal or a
+    // regex. A vendored bundle containing one would terminate the element
+    // early, and everything after it would be parsed as MARKUP in a window
+    // whose CSP permits inline styles. "<script", "<!--" and "-->" are the
+    // same class of hazard via the script-data double-escaped states.
+    //
+    // A runtime escape was considered and rejected: rewriting "</script" to
+    // "<\/script" is safe in a string literal but not inside a regex character
+    // class, and the bundle is minified, so a blanket rewrite could silently
+    // change its behaviour. These two files are hand-vendored and change only
+    // on a deliberate upgrade, so a build-time invariant is the honest control.
+    const inlined = [
+      ["libs/tabulator/tabulator.min.js", ["</script", "<script", "<!--", "-->"]],
+      ["libs/tabulator/tabulator.min.css", ["</style", "<script", "<!--", "-->"]],
+    ];
+    const inlineHits = [];
+    for (const [rel, needles] of inlined) {
+      const body = fs.readFileSync(path.join(ROOT, rel), "utf8").toLowerCase();
+      for (const n of needles) if (body.includes(n)) inlineHits.push(`${rel}: ${n}`);
+    }
+    // POSITIVE CONTROL. Every reading above is an ABSENCE, so a typo in a
+    // needle, a bad path, or an empty read would report "clean" while
+    // measuring nothing. Run the same matcher over a string that is known to
+    // contain each needle and require it to find all of them.
+    const controlBody = "x</script<script<!-- -->y</style".toLowerCase();
+    const controlFound = [
+      "</script",
+      "<script",
+      "<!--",
+      "-->",
+      "</style",
+    ].filter((n) => controlBody.includes(n)).length;
+    check(
+      "the inlining needle matcher actually matches, so its absences mean something",
+      controlFound === 5,
+      `matched ${controlFound}/5 needles in the planted control`,
+    );
+    check(
+      "no vendored file inlined into the table popup can terminate its own element",
+      inlineHits.length === 0,
+      inlineHits.join(", "),
     );
   }
 

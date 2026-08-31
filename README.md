@@ -334,9 +334,19 @@ Output lands in `dist/`. See [`BUILD.md`](https://github.com/lostinsea/folia/blo
 | `Enter` / `Shift+Enter` | Next / previous search match |
 | `Escape` | Close search or dialog |
 | `F11` | Fullscreen |
+| `F12` | Developer tools — see below |
 | `Tab` | Insert two spaces (editor) |
 
 On macOS, use `Cmd` in place of `Ctrl`.
+
+`F12` opens developer tools when Folia is run from source. **In an installed
+build it does nothing**, unless the app is started with `FOLIA_DEVTOOLS=1` in
+the environment. That is deliberate: the renderer has full Node access, so the
+developer console can read and write any file you can, and "press F12 and paste
+this" is a well-worn way to talk someone into running code they never meant to.
+An environment variable cannot be triggered by a keystroke, so the diagnostic
+stays available to anyone who actually wants it while the shoulder-surfing
+route closes.
 
 Bold, italic, code and the other formatting commands have no shortcut — they
 live in the right-click menu, in edit mode. Dark mode is toggled from the
@@ -385,11 +395,11 @@ Click a diagram's pop-out button to pan and zoom it in its own window.
 
 | Component | Version | Role |
 |-----------|---------|------|
-| Electron | 43.2.0 | Desktop runtime |
-| marked | 18.0.9 | Markdown parser |
-| Mermaid | 11.16.0 | Diagram rendering |
-| DOMPurify | 3.4.12 | HTML sanitization |
-| Tabulator | 6.2.5 | Interactive tables |
+| Electron | 43.4.1 | Desktop runtime |
+| marked | 18.0.10 | Markdown parser |
+| Mermaid | 11.17.0 | Diagram rendering |
+| DOMPurify | 3.4.14 | HTML sanitization |
+| Tabulator | 6.5.2 | Interactive tables |
 | PrismJS | 1.30.0 | Syntax highlighting |
 | Fira Code | - | Application typeface |
 
@@ -405,18 +415,18 @@ Folia's test suite is unusual, and it is unusual on purpose. Almost every defect
 in the list above was invisible - the app looked like it was working. A suite
 that only checks for the failures you already imagined will not find those.
 
-**12 suites, ~1,300 assertions**, all driving the real application in a real
+**13 suites, ~1,850 assertions**, all driving the real application in a real
 Electron window: real click events, real dialogs, real file writes, with the
 rendered DOM or the bytes on disk as the oracle. Nothing asserts on the
 implementation's own helper functions, because a test that asks the code what it
 thinks it did will always be told it went fine.
 
 **Every fix is proven by reverting it.** `scripts/prove-table-fixes.js` holds
-**189 recorded defects** (R49-R235). Each one re-applies the original bug to the
+**458 recorded defects**. Each one re-applies the original bug to the
 source, runs the suite, and requires it to fail on *that fix's own named
 assertions* - not merely to fail. A revert that fails nothing means the test was
 decorative; a revert that fails too much means the test is not specific enough.
-102 of them additionally name assertions that **must keep passing**, so a fix
+276 of them additionally name assertions that **must keep passing**, so a fix
 cannot be "proven" by a test that simply breaks everything.
 
 This has repeatedly caught tests that could not fail:

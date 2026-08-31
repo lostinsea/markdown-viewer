@@ -15,8 +15,18 @@
 // while the app actually ran whatever the CDN served.
 //
 // This copies the real installed builds into libs/vendor/ so the app runs the
-// audited versions. It runs on `postinstall`, so the copies cannot drift from
-// package.json.
+// audited versions.
+//
+// IT RUNS ON `postinstall`, BUT THAT IS NOT ENOUGH TO STOP THE COPIES DRIFTING
+// FROM package.json, and this comment used to claim it was. MEASURED on npm
+// 11.16.0: a bare `npm install` fires the root postinstall, and
+// `npm install <pkg>@<ver>` DOES NOT. The drift window is therefore exactly the
+// command a dependency bump is made with - a bump leaves node_modules on the
+// new version and libs/vendor on the old one, silently, and the app goes on
+// running bytes that no longer match anything the lockfile or `npm audit`
+// describes. RUN `npm run vendor` AFTER ANY BUMP. test/test-packaging.js
+// asserts both halves (bytes against node_modules, and VERSIONS.json against
+// the installed versions), so the drift now fails loudly instead of shipping.
 
 const fs = require("fs");
 const path = require("path");

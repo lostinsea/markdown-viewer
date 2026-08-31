@@ -1,117 +1,144 @@
 // ============================================
 // IMPORTS
 // ============================================
-const { app, BrowserWindow, ipcMain, dialog, shell } = require("electron");
+const {
+  app,
+  BrowserWindow,
+  ipcMain,
+  dialog,
+  shell,
+  session,
+  Menu,
+} = require("electron");
 const path = require("path");
 const fs = require("fs");
 const os = require("os");
 const crypto = require("crypto");
 
 // ============================================
-// USERDATA MIGRATION (markdown-viewer -> Folia)
+// DEVELOPMENT PROFILE ISOLATION
 // ============================================
-// Electron derives the userData directory from the application name, so the
-// 1.0 rename moves it from <appData>/markdown-viewer to <appData>/Folia. That
-// directory holds Local Storage - the recent-file list, the restored tab
-// session and the theme choice - plus window-state.json. Without this copy the
-// rename would silently look like data loss on first launch.
+// A development run (`npm start`, i.e. `electron .`) and an INSTALLED Folia
+// share an application name, so Electron hands them the same userData
+// directory - and that directory is not merely storage. MEASURED with two
+// concurrent Electron processes: requestSingleInstanceLock() is keyed on
+// userData (same profile -> the second process is refused and forwards its
+// argv to the first; different profiles -> both are granted). So without this,
+// launching the dev build while the installed build is running does not start
+// a second app at all: it hands the file to the installed one and exits. The
+// two also share the tab session, window bounds, recent files and debug.log,
+// so each overwrites the other's state.
 //
-// Runs before WINDOW_STATE_FILE is computed below, and before app ready.
-// Calling app.getPath("userData") this early is supported; the directory is
-// resolved from the app name, not created by readiness.
+// Guarded on !app.isPackaged, so a shipped build is untouched and keeps the
+// exact profile it has always used.
 //
-// Completion is recorded with a sentinel file rather than inferred from the
-// target directory existing. Directory existence is NOT evidence of a finished
-// migration: fs.cpSync is not atomic, so an interrupted copy, an EBUSY on a
-// LevelDB lock held by a still-running old build, or two first launches racing
-// all leave a directory that exists but is incomplete. Gating on existence
-// would then suppress every future retry and strand the user on a half-copied
-// profile forever. Gating on the sentinel means an incomplete attempt is
-// simply retried on the next launch.
-//
-// Copies rather than moves, so an older build pointed at the old directory
-// still works and the original is never at risk.
-const LEGACY_USERDATA_NAME = "markdown-viewer";
-const MIGRATION_SENTINEL = ".folia-migrated";
-const MIGRATION_STAGING = ".folia-migrate-staging";
+// ORDERING IS LOAD-BEARING. app.setPath("userData", ...) is silently ignored
+// once the app is ready, and two things below CAPTURE the profile path into
+// module-scope constants - WINDOW_STATE_FILE and logFilePath. This must stay
+// above both of them;
+// (A third module-scope read, the log("User data path:", ...) line, only
+// REPORTS the path rather than capturing it, so it is not part of this
+// invariant. The claim is deliberately about capture, not about reads: "reads"
+// is falsifiable by one grep and would rot the moment another report is added.)
+// test/test-packaging.js asserts that statically because "it did not move" is
+// an absence check and absence checks fail open.
+const DEV_PROFILE_SUFFIX = "-dev";
 
-// Copies one tree into another WITHOUT overwriting anything that already
-// exists, moving each file into place with a rename.
-//
-// The rename is the point. A plain recursive copy writes each destination file
-// incrementally, so an interruption - a crash, a kill, a full disk - leaves a
-// TRUNCATED file behind. On the next launch that file exists, so a
-// non-overwriting copy skips it, and the migration then completes and marks
-// itself done: a corrupted profile blessed as good, permanently. A rename
-// within one volume is atomic, so a destination file is either absent or
-// complete, and "exists" becomes trustworthy enough to skip on.
-function moveTreeNoClobber(from, to) {
-  fs.mkdirSync(to, { recursive: true });
-  for (const entry of fs.readdirSync(from, { withFileTypes: true })) {
-    const src = path.join(from, entry.name);
-    const dst = path.join(to, entry.name);
-    if (entry.isDirectory()) {
-      moveTreeNoClobber(src, dst);
-      continue;
-    }
-    if (fs.existsSync(dst)) continue;
-    try {
-      fs.renameSync(src, dst);
-    } catch (e) {
-      // EXDEV means the staging area landed on another volume, which should
-      // not happen (it is a sibling of the target) but is not worth failing
-      // the whole migration over. copyFile is not atomic, so this path
-      // reintroduces the truncation window - accepted only as a fallback.
-      if (e.code !== "EXDEV") throw e;
-      fs.copyFileSync(src, dst, fs.constants.COPYFILE_EXCL);
-    }
+// Pure, and separated from the application of it on purpose: a decision that is
+// only observable by booting Electron and looking at where files landed can
+// only be tested end to end, whereas this can be driven directly against a stub
+// (test/test-dev-profile.js does exactly that).
+function devProfileDecision(app) {
+  if (app.isPackaged) return { target: null, reason: "packaged" };
+
+  const appData = app.getPath("appData");
+  const name = app.getName();
+  const standard = path.join(appData, name);
+
+  // Something has ALREADY relocated the profile - test/test-userdata-isolation.js
+  // gives every suite its own directory, and Chromium's --user-data-dir switch
+  // does the same from the command line. Overriding that here would silently
+  // undo it, which in the harness's case means eight suites sharing one profile
+  // again: precisely the contamination that module exists to prevent, and it
+  // would not fail - it would just quietly stop being isolated.
+  if (path.resolve(app.getPath("userData")) !== path.resolve(standard)) {
+    return { target: null, reason: "already-relocated" };
   }
+
+  return {
+    target: path.join(appData, name + DEV_PROFILE_SUFFIX),
+    reason: "dev",
+  };
 }
 
-function migrateLegacyUserData() {
-  try {
-    const target = app.getPath("userData");
-    const sentinel = path.join(target, MIGRATION_SENTINEL);
-    if (fs.existsSync(sentinel)) return;
+function applyDevProfile() {
+  const decision = devProfileDecision(app);
+  if (!decision.target) return decision;
 
-    const legacy = path.join(path.dirname(target), LEGACY_USERDATA_NAME);
-    // path.resolve, because on Windows <appData>/markdown-viewer and a target
-    // that differs only in case are the same directory - copying it onto
-    // itself would be destructive.
-    if (path.resolve(legacy).toLowerCase() === path.resolve(target).toLowerCase()) return;
-    if (!fs.existsSync(legacy) || !fs.statSync(legacy).isDirectory()) return;
+  app.setPath("userData", decision.target);
 
-    // Stage the whole copy first, then move it into place. Staging is a
-    // sibling of the target so the moves stay on one volume, and it is wiped
-    // first because anything left there is the debris of an interrupted run.
-    const staging = path.join(path.dirname(target), MIGRATION_STAGING);
-    fs.rmSync(staging, { recursive: true, force: true });
-    fs.cpSync(legacy, staging, { recursive: true, errorOnExist: false });
-
-    // Never overwrites: the user may already have used the new profile (a
-    // failed migration does not stop the app starting), and their current
-    // settings must outrank a copy of the old ones.
-    moveTreeNoClobber(staging, target);
-    fs.rmSync(staging, { recursive: true, force: true });
-
-    // Written last, and only on a clean pass. Anything that throws above
-    // leaves the sentinel absent, so the next launch tries again.
-    fs.writeFileSync(sentinel, new Date().toISOString() + "\n");
-    console.log("Migrated settings from " + legacy + " to " + target);
-  } catch (e) {
-    // Never block startup over this; a fresh profile is a recoverable outcome,
-    // a crash loop is not. No sentinel is written, so this retries next launch.
-    //
-    // Two launches racing (a double-click, or a shell association firing
-    // twice) are safe without a lock, and it is worth being precise about why:
-    // it is not the sentinel that makes it safe - both racers read it as
-    // absent - it is that every write is a no-clobber rename and the sentinel
-    // is written last. The loser's renames fail or skip; neither can produce a
-    // half-written file.
-    console.warn("userData migration incomplete, will retry next launch:", e.message);
+  // setPath fails OPEN, so read it back rather than trusting the call. A warning
+  // rather than a throw: an exception raised while the main process is loading
+  // becomes dialog.showErrorBox - a modal owned by the process that is failing -
+  // and this is a developer-convenience path, not a correctness one.
+  if (path.resolve(app.getPath("userData")) !== path.resolve(decision.target)) {
+    console.warn(
+      "dev profile not applied - userData is still " +
+        app.getPath("userData") +
+        "; a development run will share the installed app's profile.",
+    );
+    return { target: null, reason: "setpath-ignored" };
   }
+  return decision;
 }
-migrateLegacyUserData();
+// MEASURED END TO END, because no suite can do it: every windowed suite
+// relocates userData before requiring this file, so the redirect correctly
+// DECLINES there and its positive half is unobservable from inside the harness.
+// Hand-run once, on the real product invocation (`electron .`), 2026-08-28:
+// <appData>\Folia-dev was created and received window-state.json and debug.log,
+// while <appData>\Folia's mtime did not move at all. So a development run
+// genuinely lands in the sibling and genuinely leaves an installed Folia's
+// profile untouched.
+applyDevProfile();
+
+// ============================================
+// DEVTOOLS EXPOSURE
+// ============================================
+
+// The renderer runs with nodeIntegration: true, so the DevTools console is a
+// Node REPL with the user's full filesystem rights. In a SHIPPED build that is
+// the classic self-XSS route - "open this file, press F12, paste this" - and
+// nothing about it requires a bug in Folia to exploit, only a person at the
+// keyboard following instructions.
+//
+// Source runs keep DevTools unconditionally, because that is what it is for. A
+// packaged build requires an explicit environment opt-in, which is the point:
+// an environment variable cannot be set by talking someone through a keystroke,
+// so the social-engineering route closes while the maintainer's route stays
+// open. Note this is the INTERIM control - the durable fix is SEC-08
+// (contextIsolation plus a preload bridge), after which a console in the
+// renderer is no longer a console in Node.
+function devToolsAllowed() {
+  return !app.isPackaged || process.env.FOLIA_DEVTOOLS === "1";
+}
+
+// Electron installs a DEFAULT application menu - File/Edit/View/Window - when
+// nothing calls Menu.setApplicationMenu. MEASURED: it is present, and its
+// View submenu carries Toggle Developer Tools on Ctrl+Shift+I.
+//
+// Every window this app creates already calls setMenu(null), which was measured
+// (with a positive control) to suppress that accelerator, so the default menu
+// is displayed nowhere and reachable nowhere. That makes removing it globally
+// inert TODAY and valuable tomorrow: a window added later that forgets
+// setMenu(null) would otherwise inherit a Node-privileged console on a stock
+// keystroke, which is precisely the kind of omission nobody would notice.
+//
+// Windows-only fork, so the usual macOS caveat does not apply: Chromium handles
+// clipboard and selection shortcuts natively here, and it must, because no
+// window has used the application menu for them at any point.
+function suppressDefaultApplicationMenu() {
+  Menu.setApplicationMenu(null);
+}
 
 // ============================================
 // POPUP DOCUMENT ESCAPING
@@ -507,17 +534,60 @@ function createWindow() {
   // which does not fire will-navigate - so every event reaching this handler
   // is one we did not initiate.
   //
-  // Reachable without this: <form action="https://…"> (DOMPurify allows form
-  // and action by default), <map><area href>, <meta http-equiv="refresh">,
+  // Reachable without this: <map><area href>, <meta http-equiv="refresh">,
   // window.open, and location assignment from inside an @@@html frame. The
   // renderer's click handler covers only the link-shaped ones. (SEC-11)
+  //
+  // <form action="https://…"> USED TO HEAD THAT LIST and no longer belongs on
+  // it. The claim was "DOMPurify allows form and action by default", which was
+  // true when this comment was written and was closed by the same SEC-11 work:
+  // renderer.js SANITIZE_CONFIG now carries FORBID_TAGS: ['form'] and
+  // FORBID_ATTR: ['action', …], both frozen, so a form never survives
+  // sanitization to be submitted. Corrected rather than deleted because the
+  // stale version overstated what this handler is still needed FOR, and a
+  // reader who removed FORBID_TAGS on the strength of it would reopen the hole
+  // in the one layer that is not this one.
+  //
+  // BUT THIS LAYER HAS A MEASURED HOLE, AND THE COMMENT ABOVE USED TO IMPLY IT
+  // DID NOT. A navigation target Chromium cannot PARSE - `HTTPS://host:PORT/p`,
+  // the shape a mis-templated port produces - fires NO cancellable event at
+  // all: will-navigate, will-redirect and will-frame-navigate were all observed
+  // silent for it, and Chromium commits its own `about:blank#blocked` page over
+  // this document. Every open tab and unsaved edit goes with it.
+  //
+  // AND NOTHING IN THE MAIN PROCESS EVER LEARNS WHAT THE TARGET WAS. An earlier
+  // draft said "only the non-cancellable did-start-navigation sees it", which
+  // implied an observability layer that does not exist. Measured with a
+  // did-start-navigation witness attached (test-render-security.js, the N11
+  // block): for a PARSEABLE target the witness reports the real URL
+  // (`http://probe.invalid/page`) even though will-navigate already denied it,
+  // but for the unparseable one it reports `about:blank#blocked` - the page
+  // Chromium substituted AFTERWARDS. So there is nothing to preventDefault and
+  // nothing to log either; the offending URL is never surfaced to any
+  // main-process event at all.
+  //
+  // So this is a real second layer for every URL that PARSES, and no layer at
+  // all for one that does not. What actually closes the unparseable case is the
+  // renderer's click delegation being TOTAL (renderer.js, the catch-all arm),
+  // plus the capture-phase preventDefault on the table-insert preview, which is
+  // the one sanitized-HTML surface outside #viewer. Tracked as N15; do not
+  // weaken either of those on the strength of this handler. (SEC-11/N15)
   //
   // Attached before loadFile, matching registerPopup(): loadFile does not fire
   // will-navigate so the order cannot matter today, but "guard, then load" is
   // the order that stays correct if that ever changes.
-  const denyMainNavigation = (event, url) => {
+  // The `url` positional this used to read is @deprecated in Electron's own
+  // typings (electron.d.ts, the will-navigate/will-redirect overloads); the
+  // details object is the first argument and carries `.url`. preventDefault()
+  // would survive the positional being dropped, so the app would keep denying -
+  // but the log line would print `undefined`, and that log line is not
+  // decorative: it is the only evidence a reader or a probe has that the deny
+  // fired at all, and it is what established that the denies were SILENT for
+  // the unparseable URL described above. will-frame-navigate below already
+  // reads `event.url`, so this also makes the three handlers agree.
+  const denyMainNavigation = (event) => {
     event.preventDefault();
-    console.warn(`Blocked main-window navigation to: ${url}`);
+    console.warn(`Blocked main-window navigation to: ${event.url}`);
   };
   mainWindow.webContents.on("will-navigate", denyMainNavigation);
   mainWindow.webContents.on("will-redirect", denyMainNavigation);
@@ -551,7 +621,20 @@ function createWindow() {
   // main.js" means. The app now boots the same from any entry point.
   mainWindow.loadFile(path.join(__dirname, "index.html"));
 
-  // Hide the menu bar
+  // Hide the menu bar.
+  //
+  // THIS LINE IS A SECURITY CONTROL, not tidying. Electron installs a DEFAULT
+  // application menu when nothing calls Menu.setApplicationMenu, and that menu
+  // carries View > Toggle Developer Tools on Ctrl+Shift+I. With
+  // nodeIntegration: true that shortcut is a Node-privileged console in a
+  // shipped build. MEASURED, with a positive control: an identical window
+  // WITHOUT this call opens DevTools on a synthesised Ctrl+Shift+I, and this
+  // one does not - so setMenu(null) suppresses the accelerator, and deleting
+  // the line as dead UI code would silently restore it.
+  //
+  // suppressDefaultApplicationMenu() below is the belt to this pair of braces:
+  // it removes the default menu once, for every window, so a window added
+  // later that forgets this call cannot inherit the accelerator either.
   mainWindow.setMenu(null);
 
   // Show window only when content is ready (prevents flicker)
@@ -629,9 +712,15 @@ function createWindow() {
       }
     }
 
+    // DevTools is a Node-privileged console here (see devToolsAllowed). The
+    // gate is checked before preventDefault rather than after, so when it is
+    // shut F12 is an inert key rather than a swallowed one - with no menu bar
+    // there is no default action to suppress in the first place.
     if (input.key === "F12" && input.type === "keyDown") {
-      event.preventDefault();
-      mainWindow.webContents.toggleDevTools();
+      if (devToolsAllowed()) {
+        event.preventDefault();
+        mainWindow.webContents.toggleDevTools();
+      }
     } else if (input.key === "F11" && input.type === "keyDown") {
       event.preventDefault();
       mainWindow.setFullScreen(!mainWindow.isFullScreen());
@@ -1958,9 +2047,152 @@ ipcMain.on("image-popup-save", async (event, { dataUrl, format }) => {
   }
 });
 
+// ============================================================================
+// THE TABLE-POPUP TRUST BOUNDARY.
+//
+// `tableData` arrives over IPC from a renderer that built it out of a markdown
+// document, so both its VALUES and its SHAPE are hostile. The shape matters as
+// much as the values, which is not obvious: Tabulator resolves a column
+// definition against its own option surface, so keys the SENDER chooses can
+// switch off the escaping this boundary would otherwise rely on. Measured in
+// the vendored 6.5.2 bundle:
+//   - mapDefinitions() fills a key only where the column left it undefined,
+//     and formatHeader() tests truthiness. So titleFormatter: "html" - whose
+//     formatter is literally "return e.getValue()" - or "" or null defeats any
+//     titleFormatter default, without raising a warning.
+//   - formatter: "html" switches off CELL escaping the same way. Cells are
+//     escaped only because an unset formatter defaults to plaintext ->
+//     sanitizeHTML, which is the entire reason SEC-06 passes; a sender-chosen
+//     formatter takes that default away. SEC-06's fixture now carries
+//     formatter: "html" so this claim is MEASURED - before that, dropping
+//     `formatter` from the allow-list would have broken nothing visible.
+//     Revert R504.
+//   - headerTooltip: true - a BOOLEAN, carrying no markup whatsoever - makes
+//     loadTooltip run s.innerHTML = definition.title. No amount of value
+//     scrubbing can close that one; only refusing the key can. Tooltip
+//     .initializeColumn subscribes to column-mousemove ONLY when some column
+//     definition carries headerTooltip, so dropping the key means the sink is
+//     never even wired - which is why the suite also FORCES it back on via
+//     updateDefinition and proves the escaped title is still inert there.
+// So this emits a FRESH object with an allow-listed shape, and drops anything
+// the sender added rather than validating it. A deny-list would fail the day a
+// Tabulator upgrade adds a key nobody here has read.
+//
+// WHAT ACTUALLY REACHES HERE FROM A DOCUMENT, measured rather than assumed:
+// literal markup in a header does NOT survive the producer. DOMPurify strips
+// the dangerous attributes, and extractTableData() then reads the header's
+// textContent, which drops any surviving element outright. What DOES arrive is
+// markup written as ENTITIES, because that is text at every earlier layer and
+// only becomes markup again if something assigns it through innerHTML - which
+// is exactly what Tabulator does with a column title. So this boundary is the
+// layer that matters for the realistic payload, not a redundant third copy of
+// the sanitizer.
+//
+// TITLES ARE ESCAPED HERE RATHER THAN FORMATTED DOWNSTREAM, and that is the
+// architecture rather than an implementation detail. definition.title has at
+// least three innerHTML readers in 6.5.2 - the header
+// (_formatColumnHeaderTitle), the responsive-collapse panel
+// (formatCollapsedData) and the tooltip (loadTooltip) - and a titleFormatter
+// reaches only the first. Storing ALREADY-ESCAPED text in `title` closes every
+// reader REACHABLE UNDER THIS ALLOW-LISTED SHAPE, because each of them assigns
+// through innerHTML and innerHTML renders the escaped bytes back as the
+// original characters.
+//
+// That is a narrower claim than "closes every reader", and the difference
+// matters. The bundle also has TEXT-CONTEXT readers, which would paint a
+// literal "&lt;" at the user: editableTitle's input.value = definition.title,
+// the group-header aria-title setAttribute, and the clipboard-paste header
+// matcher's string comparison. Those are out of reach because the ALLOW-LIST
+// excludes them, not because of innerHTML. So widening the allow-list later -
+// editableTitle, headerTooltip, nested `columns` - regresses this to
+// entity-visible headers, and no test would fail. Widen it only together with
+// a reader audit.
+//
+// The raw text goes into `titleDownload`. That is a registered column option
+// (registerColumnOption("titleDownload"), so no unknown-option warning) and it
+// is what the CSV exporter prefers: generateExportList sets colVisPropAttach
+// to "Download" and processColumnGroup reads
+// definition["title" + attach] || definition.title. So an exported header
+// keeps its original characters while every rendered copy is inert. The JSON
+// exporter is unaffected either way - it keys on getTitleDownload(), and
+// Column.titleDownload is initialised to null and never assigned from the
+// definition, so JSON has always keyed on `field`.
+// ============================================================================
+function normaliseTablePayload(tableData) {
+  const src = tableData && typeof tableData === "object" ? tableData : {};
+  const rawColumns = Array.isArray(src.columns) ? src.columns : [];
+  const rawRows = Array.isArray(src.data) ? src.data : [];
+  const columns = [];
+  // The sender's own field names, kept ONLY as lookup keys into its own rows.
+  // They never reach Tabulator.
+  const lookups = [];
+  for (let i = 0; i < rawColumns.length; i++) {
+    const c =
+      rawColumns[i] && typeof rawColumns[i] === "object" ? rawColumns[i] : {};
+    const rawTitle = c.title == null ? "" : String(c.title);
+    // U+00A0 for an empty title, and it has to become something non-empty for
+    // two measured reasons: _buildColumnHeaderTitle renders title || "&nbsp;"
+    // as HTML, and generateCollapsedRowData gates on
+    // if (definition.title && field), so an empty title vanishes from the
+    // collapse panel altogether. Deliberately NOT the producer's own
+    // "Column N": an assertion naming that text would be satisfied by
+    // extractTableData OR by this line, which measures a disjunction instead
+    // of this boundary. U+00A0 passes through escapeHtml untouched and renders
+    // as the blank header a reader already expects.
+    const title = rawTitle.trim() === "" ? "\u00A0" : rawTitle;
+    lookups.push(
+      typeof c.field === "string" || typeof c.field === "number" ? c.field : i,
+    );
+    columns.push({
+      title: escapeHtml(title),
+      // The RAW original, not the U+00A0-substituted render title: the
+      // substitution exists only so the header and the collapse panel have
+      // something to paint, and exporting a non-breaking space where the
+      // document had an empty header would be a data change. Falls back to
+      // `title` only when rawTitle is "", because processColumnGroup reads
+      // definition.titleDownload || definition.title and an empty string is
+      // falsy - so "" would silently reach the escaped title anyway.
+      //
+      // LATENT, deliberately recorded: downloaders.html feeds this raw value
+      // to generateHeaderElement, which does th.innerHTML = value. Nothing
+      // reaches it today - the popup calls download("csv") and
+      // download("json") only - but an "Export HTML" button would turn this
+      // field back into live markup inside a file on disk.
+      titleDownload: rawTitle || title,
+      // Re-keyed by INDEX. Validating the incoming name would only have
+      // narrowed a class of problems rather than removing it: a "." is a
+      // nested-field lookup, duplicates silently collide, and a name matching
+      // no row key blanks the column. The producer already emits col0..colN,
+      // so this is a no-op in production.
+      field: "col" + i,
+      headerFilter: "input",
+      headerFilterPlaceholder: "Filter...",
+    });
+  }
+  const data = [];
+  for (let r = 0; r < rawRows.length; r++) {
+    const row = rawRows[r];
+    if (!row || typeof row !== "object") continue;
+    // Rebuilt key by key rather than copied, so nothing off the sender's
+    // prototype chain and no "__proto__"-shaped key survives into the
+    // document. Coercing every value to a string additionally removes the
+    // object branches from Tabulator's CSV and clipboard paths, which makes
+    // exports deterministic.
+    const out = {};
+    for (let i = 0; i < columns.length; i++) {
+      const key = lookups[i];
+      const v = Object.prototype.hasOwnProperty.call(row, key) ? row[key] : "";
+      out["col" + i] = v == null ? "" : String(v);
+    }
+    data.push(out);
+  }
+  return { columns, data };
+}
+
 // Handle Table popup request
 ipcMain.on("open-table-popup", (event, data) => {
-  const { tableData, isDarkMode } = data;
+  const { tableData, isDarkMode } = data || {};
+  const safeTableData = normaliseTablePayload(tableData);
 
   // Create popup window
   const popupWindow = new BrowserWindow({
@@ -2235,18 +2467,49 @@ ipcMain.on("open-table-popup", (event, data) => {
         // tag ended this element and everything after it was parsed as markup
         // (the SEC-06 class of bug, in a window that can read local files
         // because it runs from file://).
-        const tableData = ${toJsonLiteral(tableData)};
+        const tableData = ${toJsonLiteral(safeTableData)};
 
         const table = new Tabulator("#data-table", {
             data: tableData.data,
             columns: tableData.columns,
+            // NOTE FOR EDITORS: this comment is inside a template literal that
+            // builds the popup HTML. Never write a backtick or a dollar-brace
+            // interpolation opener in here - either one terminates the literal
+            // and the file stops parsing.
+            //
+            // Column titles arrive ALREADY HTML-ESCAPED from
+            // normaliseTablePayload, with the original text preserved in
+            // titleDownload for the CSV export. That is why no titleFormatter
+            // is configured here.
+            //
+            // There WAS a columnDefaults: { titleFormatter: "plaintext" } on
+            // this line, and it was removed deliberately rather than
+            // forgotten. It closed only ONE of the three innerHTML readers of
+            // definition.title in 6.5.2 - the header - leaving the
+            // responsive-collapse panel and the header tooltip live, both of
+            // which were measured injecting markup and applying CSS with that
+            // option in force. It was also defeatable from the payload itself,
+            // since a per-column titleFormatter outranks a default. Escaping
+            // at the boundary closes every reader at once, and re-adding a
+            // formatter now would DOUBLE-escape and render entities to the
+            // reader.
+            //
+            // Fields are col0..colN by construction, so nested lookups can
+            // never be wanted; turning the separator off also skips a split()
+            // per column in setField.
+            nestedFieldSeparator: false,
             layout: "fitColumns",
             pagination: true,
             paginationSize: 50,
             paginationSizeSelector: [25, 50, 100, 200, true],
             paginationCounter: "rows",
             movableColumns: true,
-            resizableColumns: true,
+            // No resizableColumns option: it is a Tabulator 4.x spelling and
+            // is not recognised by 6.x, which validates constructor options and
+            // logs a warning for unknown ones. Column resizing is on by default
+            // via the per-column "resizable" default, so the option was a no-op
+            // that bought a console warning. The 6.x spellings, if ever needed,
+            // are resizableColumnFit and resizableColumnGuide.
             responsiveLayout: "collapse",
             headerFilterLiveFilterDelay: 300,
             initialSort: [],
@@ -2452,6 +2715,9 @@ if (!gotTheLock) {
   });
 
   app.whenReady().then(() => {
+    // Before any window exists, so no window can ever see the default menu.
+    suppressDefaultApplicationMenu();
+
     // Set dock icon on macOS (applies in dev mode where the .icns bundle isn't used)
     if (process.platform === "darwin" && app.dock) {
       try {
@@ -2460,6 +2726,51 @@ if (!gotTheLock) {
         // Non-fatal: window still opens even if icon file is missing
       }
     }
+
+    // SEC-30 layer 1 (defence in depth): deny every download except the app's
+    // own in-memory exports.
+    //
+    // A download is NOT a navigation, so it is invisible to the will-navigate /
+    // will-redirect / will-frame-navigate / setWindowOpenHandler denies in
+    // createWindow(), and CSP has no directive that governs one. Measured: an
+    // <a download href="http://..."> rendered into #tableInsertPreview - which
+    // sits outside #viewer and so is not covered by the renderer's click
+    // delegation - issued a live outbound request and fired will-download,
+    // while a plain anchor in the same click batch was blocked by will-navigate.
+    // This handler runs only once the response has begun, so it stops the file
+    // drop, not the request; stripping the download attribute in the sanitizer
+    // (renderer.js FORBID_ATTR) is what prevents the request itself.
+    //
+    // The allow-list is blob: only. The app's sole legitimate download through
+    // a webContents session is Tabulator's table export (exportCSV/exportJSON),
+    // measured at will-download as blob:file:///<uuid> with mime text/csv and
+    // no network. (The auto-updater also downloads, but electron-updater uses
+    // its own HTTP stack rather than a session, so it never reaches this
+    // handler and is unaffected.)
+    //
+    // Precise about who can mint a blob: URL, because "document content cannot"
+    // is FALSE: an @@@html block runs attacker-authored script, and it can call
+    // URL.createObjectURL. What it cannot do is DOWNLOAD one - those frames are
+    // pinned to sandbox="allow-scripts" with no allow-downloads, and their
+    // opaque origin means a blob they mint is not loadable by the top frame
+    // either. The top frame itself runs no document-authored script, so no
+    // untrusted blob: URL can reach a download here.
+    //
+    // No data: allowance is needed: DOMPurify's default ALLOWED_URI_REGEXP does
+    // not admit data: on an <a href>, so such an anchor loses its href.
+    //
+    // defaultSession is the complete surface: main.js creates no partitions and
+    // passes no custom session to any of its four BrowserWindow sites, so this
+    // one handler covers the main window, all three popups and anything added
+    // later. Registered here rather than in createWindow() so a second
+    // createWindow() (macOS activate) cannot stack duplicate listeners.
+    session.defaultSession.on("will-download", (event, item) => {
+      const url = item.getURL();
+      if (!isDownloadAllowed(url)) {
+        console.warn("Blocked download from document content:", url);
+        event.preventDefault();
+      }
+    });
 
     createWindow();
 
@@ -2720,3 +3031,25 @@ function checkForUpdatesOnStartup() {
 app.on("ready", () => {
   checkForUpdatesOnStartup();
 });
+
+// SEC-30 download policy, split out from the will-download listener above so
+// the RULE can be asserted directly. Proving the listener end-to-end needs a
+// real responding server - will-download only fires once a response has begun,
+// so an unresolvable probe host (which is what the suites deliberately use)
+// never reaches it. A pure predicate is testable without that, and a listener
+// that merely exists is not evidence its policy is right.
+//
+// blob: only. The app's sole legitimate download through a webContents session
+// is Tabulator's table export, measured at will-download as blob:file:///<uuid>,
+// text/csv, no network. (electron-updater downloads over its own HTTP stack, not
+// a session, so it never reaches the listener.) Untrusted content cannot reach
+// this with a blob: URL: the only place document-authored script runs is an
+// @@@html frame, which is sandboxed without allow-downloads and has an opaque
+// origin, so a blob it mints is neither downloadable by it nor loadable by the
+// top frame. Anything else, notably http(s):, is a fetch of remote bytes onto
+// the user's disk initiated by document content.
+function isDownloadAllowed(url) {
+  return typeof url === "string" && url.startsWith("blob:");
+}
+
+module.exports = { isDownloadAllowed };

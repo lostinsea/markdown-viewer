@@ -1,6 +1,6 @@
 # Third-party notices
 
-Folia is distributed under the MIT licence (see `LICENSE`). It also redistributes the components listed below, each under its own terms.
+Folia is distributed under the MIT licence (see `LICENSE.txt`). It also redistributes the components listed below, each under its own terms.
 
 Almost every licence here grants redistribution **on condition that its copyright notice and licence text are reproduced**. That obligation is the component's, not Folia's, and it is not discharged by Folia also being permissively licensed - which is why this file exists and ships inside the application.
 
@@ -14,7 +14,7 @@ Electron (MIT) and the Chromium content module (BSD-3-Clause and others) are shi
 
 | Licence | Components |
 | --- | --- |
-| MIT | 83 |
+| MIT | 85 |
 | ISC | 35 |
 | BSD-3-Clause | 6 |
 | (MPL-2.0 OR Apache-2.0) (Folia elects **Apache-2.0**) | 1 |
@@ -27,7 +27,7 @@ Electron (MIT) and the Chromium content module (BSD-3-Clause and others) are shi
 
 Under `(MPL-2.0 OR Apache-2.0)` Folia elects **Apache-2.0**. Apache-2.0 carries no per-file source-disclosure obligation, unlike MPL-2.0.
 
-## Components (131)
+## Components (133)
 
 ### @antfu/install-pkg 1.1.0
 
@@ -354,7 +354,7 @@ OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
 ```
 
-### @mermaid-js/parser 1.2.0
+### @mermaid-js/parser 1.2.1
 
 - Licence: MIT
 - Home: https://github.com/mermaid-js/mermaid/tree/develop/packages/mermaid/parser/#readme
@@ -2813,7 +2813,7 @@ TORTIOUS ACTION, ARISING OUT OF OR IN CONNECTION WITH THE USE OR PERFORMANCE OF
 THIS SOFTWARE.
 ```
 
-### dompurify 3.4.12
+### dompurify 3.4.14
 
 - Licence: (MPL-2.0 OR Apache-2.0)
 - Home: https://github.com/cure53/DOMPurify
@@ -3079,6 +3079,25 @@ AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
 LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
+```
+
+### fastdom 1.0.12
+
+- Licence: MIT
+- Home: https://github.com/wilsonpage/fastdom
+
+Terms as stated in the package's `README.md` (it ships no separate licence file):
+
+```
+(The MIT License)
+
+Copyright (c) 2016 Wilson Page <wilsonpage@me.com>
+
+Permission is hereby granted, free of charge, to any person obtaining a copy of this software and associated documentation files (the 'Software'), to deal in the Software without restriction, including without limitation the rights to use, copy, modify, merge, publish, distribute, sublicense, and/or sell copies of the Software, and to permit persons to whom the Software is furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED 'AS IS', WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 ```
 
 ### Fira Code
@@ -3410,7 +3429,7 @@ TORTIOUS ACTION, ARISING OUT OF OR IN CONNECTION WITH THE USE OR PERFORMANCE OF
 THIS SOFTWARE.
 ```
 
-### js-yaml 4.3.0
+### js-yaml 4.3.1
 
 - Licence: MIT
 - Home: nodeca/js-yaml
@@ -3826,7 +3845,7 @@ Redistribution and use in source and binary forms, with or without modification,
 This software is provided by the copyright holders and contributors “as is” and any express or implied warranties, including, but not limited to, the implied warranties of merchantability and fitness for a particular purpose are disclaimed. In no event shall the copyright owner or contributors be liable for any direct, indirect, incidental, special, exemplary, or consequential damages (including, but not limited to, procurement of substitute goods or services; loss of use, data, or profits; or business interruption) however caused and on any theory of liability, whether in contract, strict liability, or tort (including negligence or otherwise) arising in any way out of the use of this software, even if advised of the possibility of such damage.
 ```
 
-### marked 18.0.9
+### marked 18.0.10
 
 - Licence: MIT
 - Home: https://marked.js.org
@@ -3878,7 +3897,7 @@ Redistribution and use in source and binary forms, with or without modification,
 This software is provided by the copyright holders and contributors “as is” and any express or implied warranties, including, but not limited to, the implied warranties of merchantability and fitness for a particular purpose are disclaimed. In no event shall the copyright owner or contributors be liable for any direct, indirect, incidental, special, exemplary, or consequential damages (including, but not limited to, procurement of substitute goods or services; loss of use, data, or profits; or business interruption) however caused and on any theory of liability, whether in contract, strict liability, or tort (including negligence or otherwise) arising in any way out of the use of this software, even if advised of the possibility of such damage.
 ```
 
-### mermaid 11.16.0
+### mermaid 11.17.0
 
 - Licence: MIT
 - Home: https://github.com/mermaid-js/mermaid
@@ -4291,6 +4310,25 @@ ACTION OF CONTRACT, NEGLIGENCE OR OTHER TORTIOUS ACTION, ARISING OUT OF OR
 IN CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
 ```
 
+### strictdom 1.0.1
+
+- Licence: MIT
+- Home: https://github.com/wilsonpage/strictdom
+
+Terms as stated in the package's `README.md` (it ships no separate licence file):
+
+```
+(The MIT License)
+
+Copyright (c) 2013 Wilson Page <wilsonpage@me.com>
+
+Permission is hereby granted, free of charge, to any person obtaining a copy of this software and associated documentation files (the 'Software'), to deal in the Software without restriction, including without limitation the rights to use, copy, modify, merge, publish, distribute, sublicense, and/or sell copies of the Software, and to permit persons to whom the Software is furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED 'AS IS', WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
+```
+
 ### stylis 4.4.0
 
 - Licence: MIT
@@ -4320,7 +4358,7 @@ OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
 ```
 
-### Tabulator 6.2.5
+### Tabulator 6.5.2
 
 - Licence: MIT
 - Home: https://tabulator.info/
@@ -4329,7 +4367,7 @@ SOFTWARE.
 ```
 The MIT License (MIT)
 
-Copyright (c) 2015-2024 Oli Folkerd
+Copyright (c) 2015-2026 Oli Folkerd
 
 Permission is hereby granted, free of charge, to any person obtaining a copy
 of this software and associated documentation files (the "Software"), to deal

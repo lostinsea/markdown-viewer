@@ -13,7 +13,6 @@
 // renderer at all; what it would then choose to do is not in question.
 const { app, BrowserWindow } = require("electron");
 const fs = require("fs");
-const os = require("os");
 const path = require("path");
 
 // Isolate this suite's userData profile before main.js exists and before the
@@ -22,7 +21,7 @@ require("./test-userdata-isolation");
 
 require("../src/main.js");
 
-const dir = fs.mkdtempSync(path.join(os.tmpdir(), "mdv-sec-"));
+const dir = require("./test-visual-utils").tempDir("mdv-sec-");
 
 const results = [];
 const skipped = [];
@@ -38,9 +37,74 @@ const {
   proveSentinelAlive,
   captureScreenshot,
   trapExternalOpens,
+  waitForExternalTrap,
 } = require("./test-visual-utils");
 
+// THE SUITE-LEVEL half of the renderer's state, extracted so that a document
+// rebuilt mid-run is equivalent to the one the bootstrap established - not
+// merely to the one the current section established.
+//
+// MEASURED, and the diagnosis it corrects was mine. n11EnsureAlive's recovery
+// reload restored S12_INSTALL, N11_TRAP and the section's fixture, so the N11
+// section itself ran to completion and its teardown passed. The suite then
+// aborted 20 lines later, inside SEC-13, on `window.__e2eErrors.length = 0` -
+// a global installed ONCE before run() and destroyed by the reload. It
+// surfaced as `harness threw: Error: Script failed to execute` with no line
+// information, and I twice attributed it to the N11 teardown's
+// `__n11SavedExternal` restore by reading rather than by running. What settled
+// it was hand-applying R463 and reading the suite's own PASS/FAIL stream: the
+// last line before the throw is SEC-13's control assertion, and the teardown's
+// own assertion passes above it.
+//
+// The accumulated entries are NOT recoverable across the reload - the document
+// holding them is already gone when the recovery notices - so this reinstalls
+// an EMPTY array. That is honest rather than lossy: every reader of the
+// sentinel in this file clears it immediately before the action it describes
+// (SEC-13:2313 and SEC-30 both do), so no assertion depends on entries
+// recorded in an earlier section.
+const E2E_SENTINEL = `
+  window.__e2eErrors = [];
+  window.addEventListener('error', e => window.__e2eErrors.push(String(e.message)));
+  window.addEventListener('unhandledrejection', e => window.__e2eErrors.push(String(e.reason)));
+  null;
+`;
+
 async function run(win) {
+  // A MAIN-PROCESS property, asserted before any page state matters.
+  //
+  // Electron installs a default application menu - File/Edit/View/Window -
+  // whenever nothing calls Menu.setApplicationMenu, and its View submenu
+  // carries Toggle Developer Tools on Ctrl+Shift+I. The renderer here runs with
+  // nodeIntegration: true, so that stock keystroke is a Node console with the
+  // user's full filesystem rights in a shipped build: the "open this file,
+  // press the shortcut, paste this" route, which needs no bug in Folia at all.
+  //
+  // MEASURED, with a positive control, because a bare "it did not open" would
+  // have failed open: two identical windows were sent a synthesised
+  // Ctrl+Shift+I, and the one WITHOUT setMenu(null) opened DevTools while the
+  // one with it did not. So the per-window call is a security control and not
+  // the UI tidying its old comment claimed.
+  //
+  // main.js now does both halves - setMenu(null) per window, and a global
+  // suppression at whenReady so a window added later that forgets the call
+  // cannot inherit the accelerator. This asserts the global half in the LIVE
+  // app rather than by grepping for the call, which would keep passing if the
+  // call were moved behind a condition that never runs.
+  {
+    const { Menu } = require("electron");
+    const menu = Menu.getApplicationMenu();
+    check(
+      "no default application menu survives startup, so no stock keystroke reaches DevTools",
+      menu === null,
+      menu === null
+        ? ""
+        : `application menu present with top-level ${JSON.stringify(
+            menu.items.map((i) => i.label || i.role),
+          )} - its View submenu binds Toggle Developer Tools to Ctrl+Shift+I, ` +
+          "which is a Node console while nodeIntegration is on",
+    );
+  }
+
   const exec = (code) => win.webContents.executeJavaScript(code, true);
 
   // This suite's whole job is to fire hostile input at the app, so a large
@@ -561,21 +625,189 @@ async function run(win) {
     JSON.stringify(basics),
   );
 
-  // Data-URI images are placeholder-swapped around DOMPurify; moving the
-  // sanitize step is exactly what could break that dance.
+  // Data-URI images must survive sanitization. This used to be implemented by
+  // swapping them for a placeholder around DOMPurify; that dance was SEC-28 (a
+  // full sanitizer bypass) and has been deleted. DOMPurify permits data: on
+  // <img> natively via DATA_URI_TAGS, so this check now guards the real
+  // behaviour rather than the workaround.
   const tinyPng =
     "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==";
   await render(`# Doc\n\n![tiny](${tinyPng})\n`, "full", 1000);
   const dataUri = await exec(`
     (() => {
       const img = document.querySelector('#viewer img');
-      return { src: img ? img.getAttribute('src') : null };
+      return {
+        src: img ? img.getAttribute('src') : null,
+        renderError: window.__lastRenderError,
+      };
     })()
   `);
   check(
     "FEATURE data-URI images survive the sanitize step",
-    typeof dataUri.src === "string" && dataUri.src.startsWith("data:image/png;base64,"),
+    typeof dataUri.src === "string" &&
+      dataUri.src.startsWith("data:image/png;base64,") &&
+      dataUri.renderError === null,
     JSON.stringify(dataUri),
+  );
+
+  // The same, on the light-format path. Both render paths carried the deleted
+  // dance, so both need the guard. The alt text differs from the full-path
+  // document on purpose: patchViewerDOM keys top-level blocks by a hash of
+  // their outerHTML and reuses matched nodes verbatim, so an identical
+  // <p><img></p> block would be adopted from the previous render and this
+  // assertion would inspect a node the FULL path built. Measured: with the alt
+  // text shared, a probe expando set on the full-path node survived into this
+  // check. Changing the alt forces light-format to build the node it is
+  // being measured on.
+  await render(`# Doc\n\n![tiny light](${tinyPng})\n\nedited\n`, "light-format", 900);
+  const dataUriLight = await exec(`
+    (() => {
+      const img = document.querySelector('#viewer img');
+      return {
+        src: img ? img.getAttribute('src') : null,
+        alt: img ? img.getAttribute('alt') : null,
+        renderError: window.__lastRenderError,
+      };
+    })()
+  `);
+  check(
+    "FEATURE data-URI images survive the sanitize step (light-format path)",
+    typeof dataUriLight.src === "string" &&
+      dataUriLight.src.startsWith("data:image/png;base64,") &&
+      dataUriLight.alt === "tiny light" &&
+      dataUriLight.renderError === null,
+    JSON.stringify(dataUriLight),
+  );
+
+  // The deleted dance had one real side effect nobody had noticed: it swapped
+  // the data: URI out for a placeholder BEFORE DOMPurify parsed the HTML, so
+  // the payload was never judged by DOMPurify's SAFE_FOR_XML filter. That
+  // filter (on by default; SANITIZE_CONFIG does not set it) drops any
+  // attribute whose value matches /((--!?|])>)|<\/(style|script|title|xmp|
+  // textarea|noscript|iframe|noembed|noframes)/i, and it is applied BEFORE
+  // forceKeepAttr is consulted, so a hook cannot rescue it.
+  //
+  // Measured against the vendored DOMPurify 3.4.12, not assumed: raw,
+  // entity-encoded and DTD-subset SVG data URIs all lose their src now, where
+  // the dance smuggled them through; base64 is unaffected. This is an accepted
+  // trade - the payload the dance protected is indistinguishable from the
+  // payload it exfiltrated (SEC-28). These checks pin the trade so it stays a
+  // recorded fact rather than a future surprise.
+  const rawStyleSvg =
+    "<img src=\"data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg'><style>.a{fill:red}</style></svg>\">";
+  const entityStyleSvg =
+    "<img src=\"data:image/svg+xml,&lt;svg&gt;&lt;/style&gt;&lt;/svg&gt;\">";
+  const dtdSvg =
+    "<img src=\"data:image/svg+xml,<!DOCTYPE svg PUBLIC '-//W3C//DTD SVG 1.1//EN' [ <!ENTITY a 'b'> ]><svg/>\">";
+  const b64StyleSvg =
+    "<img src=\"data:image/svg+xml;base64," +
+    Buffer.from(
+      "<svg xmlns='http://www.w3.org/2000/svg'><style>.a{fill:red}</style></svg>",
+      "utf8",
+    ).toString("base64") +
+    "\">";
+  await render(
+    `# XmlTrade\n\n${rawStyleSvg}\n\n${entityStyleSvg}\n\n${dtdSvg}\n\n${b64StyleSvg}\n`,
+    "full",
+    900,
+  );
+  const xmlTrade = await exec(`
+    (() => {
+      const imgs = [...document.querySelectorAll('#viewer img')];
+      return {
+        count: imgs.length,
+        withSrc: imgs.filter((i) => i.hasAttribute('src')).length,
+        b64Kept: imgs.filter((i) =>
+          (i.getAttribute('src') || '').startsWith('data:image/svg+xml;base64,'),
+        ).length,
+        renderError: window.__lastRenderError,
+      };
+    })()
+  `);
+  check(
+    "FEATURE base64 data-image survives SAFE_FOR_XML where raw/entity/DTD forms do not",
+    xmlTrade.count === 4 &&
+      xmlTrade.withSrc === 1 &&
+      xmlTrade.b64Kept === 1 &&
+      xmlTrade.renderError === null,
+    JSON.stringify(xmlTrade),
+  );
+
+  // SEC-28. The deleted code restored stored data URIs after sanitization with
+  // `html.replace(<fixed literal>, uri)`. A string search value rewrites only
+  // the FIRST occurrence, so a document could plant a decoy copy of the
+  // placeholder in a code span, consume the restore with it, and have its own
+  // unsanitized markup spliced into already-sanitized HTML - yielding an
+  // <img onerror> DOMPurify never saw, in a window with Node access.
+  //
+  // These two checks are the revert-proof: restore either block and the
+  // handler reappears in the DOM and __pwned is set.
+  //
+  // All three oracles are absence checks, so each leg also carries a positive
+  // control: renderError must be null and the payload <img> must actually be
+  // present carrying its data: src. Without those, a render that threw - or
+  // one that silently produced nothing - would satisfy every absence check and
+  // report green having tested nothing.
+  const sec28Doc =
+    "# Doc\n\n" +
+    "`https://data-uri-placeholder.local/0`\n\n" +
+    "<img src=\"data:image/svg+xml,<img src=x onerror=window.__pwned='sec28'>\">\n";
+
+  const sec28Pwned = await render(sec28Doc, "full", 1000);
+  const sec28 = await exec(`
+    (() => {
+      const v = document.querySelector('#viewer');
+      return {
+        onerror: v ? v.querySelectorAll('[onerror]').length : -1,
+        srcX: v ? v.querySelectorAll('img[src="x"]').length : -1,
+        dataImg: v
+          ? [...v.querySelectorAll('img')].filter(
+              (i) => (i.getAttribute('src') || '').startsWith('data:image/svg+xml'),
+            ).length
+          : -1,
+        renderError: window.__lastRenderError,
+      };
+    })()
+  `);
+  check(
+    "SEC-28 a decoy placeholder cannot splice markup past the sanitizer (full path)",
+    sec28Pwned === null &&
+      sec28.onerror === 0 &&
+      sec28.srcX === 0 &&
+      sec28.dataImg === 1 &&
+      sec28.renderError === null,
+    JSON.stringify({ sec28Pwned, ...sec28 }),
+  );
+
+  // Render something benign through the full path first: light-format only
+  // engages once something has been rendered, and routing through a clean
+  // document keeps this check independent of whatever the full path just left
+  // in the viewer.
+  await render("# Clean\n\nplain paragraph\n", "full", 900);
+  const sec28LightPwned = await render(sec28Doc, "light-format", 900);
+  const sec28Light = await exec(`
+    (() => {
+      const v = document.querySelector('#viewer');
+      return {
+        onerror: v ? v.querySelectorAll('[onerror]').length : -1,
+        srcX: v ? v.querySelectorAll('img[src="x"]').length : -1,
+        dataImg: v
+          ? [...v.querySelectorAll('img')].filter(
+              (i) => (i.getAttribute('src') || '').startsWith('data:image/svg+xml'),
+            ).length
+          : -1,
+        renderError: window.__lastRenderError,
+      };
+    })()
+  `);
+  check(
+    "SEC-28 a decoy placeholder cannot splice markup past the sanitizer (light-format path)",
+    sec28LightPwned === null &&
+      sec28Light.onerror === 0 &&
+      sec28Light.srcX === 0 &&
+      sec28Light.dataImg === 1 &&
+      sec28Light.renderError === null,
+    JSON.stringify({ sec28LightPwned, ...sec28Light }),
   );
 
   // A javascript: URL must not survive, in either path.
@@ -1011,7 +1243,12 @@ async function run(win) {
   const s12doc = path.join(s12dir, "doc.md");
   fs.writeFileSync(s12doc, "# doc\n");
 
-  await exec(`
+  // Held in a const and installed through a helper rather than written inline,
+  // because the N11 block below can lose the entire JS context mid-section and
+  // has to be able to put this back. See n11Click(). Re-running it is safe: it
+  // re-captures __s12Restore from whatever is currently installed, and after a
+  // context wipe that is the pristine set.
+  const S12_INSTALL = `
     (() => {
       const { shell, ipcRenderer } = require('electron');
       const nodeFs = require('fs');
@@ -1042,12 +1279,20 @@ async function run(win) {
       window.currentFilePath = ${JSON.stringify(s12doc)};
       return null;
     })()
-  `);
+  `;
+  await exec(S12_INSTALL);
 
+  // Wipe-safe on purpose. This used to dereference window.__s12 unconditionally
+  // and it is the FIRST thing n11Click() does, so when a click below replaced
+  // the top frame the reset threw before any recovery could run - and the throw
+  // aborted the whole suite from inside a helper whose name says "reset". A
+  // helper that cannot survive the condition its caller exists to detect turns
+  // a measurable finding into a harness crash.
   const s12Reset = () =>
     exec(`
       (() => {
         const s = window.__s12;
+        if (!s) return null;
         s.openPath.length = 0; s.ipc.length = 0;
         s.notes.length = 0; s.confirms.length = 0; s.exists.length = 0;
         return null;
@@ -1266,6 +1511,833 @@ async function run(win) {
       s12Lic.confirms[0].includes("LICENSE") &&
       s12Lic.openPath.length === 1,
     JSON.stringify(s12Lic),
+  );
+
+  // ==========================================================================
+  // N11 - the click delegation was not TOTAL, and the hole was shaped like a
+  // filename.
+  //
+  // Three arms decide what a click does: `#...` anchors, then http(s), then
+  // local files. The http(s) arm tests the RESOLVED url (`link.href`); the
+  // local-file arm tested the raw href ATTRIBUTE for `startsWith('http')`. A
+  // sibling file called `httpd.md` or `https-notes.txt` satisfies NEITHER - the
+  // attribute begins "http" so the local arm skipped it, and it resolves to
+  // `file:` so the http arm skipped it too. No preventDefault ran, Chromium
+  // followed the link natively, and main.js's will-navigate deny killed the
+  // navigation. Net effect for the reader: the link does nothing at all, in
+  // silence, with no notification and nothing in the renderer console.
+  //
+  // These are ordinary filenames - `httpd.conf`, `http-api.md`, `https-setup.md`
+  // are exactly the sort of sibling a documentation repo contains - so this is
+  // a real "some of my links are dead" bug, not a curiosity.
+  //
+  // The hrefs below are deliberately BARE (`httpd.md`, not `./httpd.md`). The
+  // first draft of this block used the `./` form and all three assertions
+  // passed against the unfixed code, because `./httpd.md` does not begin with
+  // "http" and so took the local arm normally. The `./` prefix is optional in
+  // markdown and most authors omit it, which is precisely why the bug is
+  // reachable - and why the assertion has to pin the exact href it clicked.
+  //
+  // The third assertion is the one that guards the FIX rather than the bug: the
+  // local arm is now a genuine catch-all, so it must be proved that an absolute
+  // http(s) URL is still taken by the arm above it and never treated as a path.
+  // `exists.length === 0` is the load-bearing conjunct there - if the catch-all
+  // ever swallowed external URLs, the first observable symptom would be
+  // fs.existsSync() being called on "http://probe.invalid/page".
+  // ==========================================================================
+  fs.writeFileSync(path.join(s12dir, "https-notes.txt"), "placeholder");
+  fs.writeFileSync(path.join(s12dir, "httpd.md"), "# httpd\n");
+
+  // Stubbed here rather than in the shared __s12 setup above so that the
+  // existing SEC-12 assertions - and the reverts anchored to them - are not
+  // disturbed. Restored immediately after this block. Held in a const for the
+  // same reason as S12_INSTALL: n11Click() can have to reinstall it.
+  const N11_TRAP = `
+    (() => {
+      const { shell } = require('electron');
+      window.__n11External = [];
+      window.__n11SavedExternal = shell.openExternal;
+      shell.openExternal = (u) => { window.__n11External.push(String(u)); return Promise.resolve(); };
+      return null;
+    })()
+  `;
+  await exec(N11_TRAP);
+
+  // The document every carrier below is clicked in. Held in a const because
+  // n11Click() re-renders it after a context wipe; a second literal would be
+  // free to drift from this one and the recovery would silently start clicking
+  // a different document.
+  const N11_DOC = [
+    "# Totality",
+    "",
+    "[txt](https-notes.txt)",
+    "",
+    "[md](httpd.md)",
+    "",
+    "[web](http://probe.invalid/page)",
+    "",
+    // An absolute URL Chromium's parser REJECTS - `PORT` is not a number, so
+    // the port is invalid. That matters because `link.href` then hands back the
+    // attribute verbatim instead of a normalised, lowercased URL, which is the
+    // only way an uppercase scheme can reach the arms below. It is what makes
+    // ABSOLUTE_WEB_URL's `i` flag load-bearing rather than decorative.
+    "[caps](HTTPS://api.example.invalid:PORT/v1)",
+    "",
+    // Inline SVG, both anchor spellings. Not reachable from markdown link
+    // syntax - an SVGAElement can only be authored as raw HTML - which is
+    // precisely why it went unhandled for so long.
+    '<svg width="10" height="10" xmlns="http://www.w3.org/2000/svg">',
+    '<a href="http://svg.invalid/p"><text y="8">svgh</text></a>',
+    '<a xlink:href="http://xlink.invalid/p"><text y="8">svgx</text></a>',
+    "</svg>",
+    "",
+  ].join("\n");
+
+  // The fixture currently in the viewer. The recovery inside n11Click() has to
+  // rebuild whatever the CALLER rendered, and this section renders three
+  // different documents; tracking it here rather than hard-coding N11_DOC in
+  // the recovery is what keeps the two in step when a fixture is added later.
+  let n11Fixture = N11_DOC;
+  const n11Render = async (md) => {
+    n11Fixture = md;
+    return render(md, "full");
+  };
+
+  await n11Render(N11_DOC);
+
+  // The app's own document URL, captured before anything is clicked. Every
+  // click below must leave the top frame here. Read rather than constructed:
+  // the assertion is "the frame did not move", and a hand-built expectation
+  // would be asserting where I think index.html lives.
+  const n11BaseHref = await exec(`location.href`);
+
+  // A MAIN-PROCESS WITNESS FOR NAVIGATION, because the renderer-side one is
+  // not sufficient on its own. Reading `location.href` and a surviving global
+  // after the click proves the frame's FINAL identity; it cannot, by itself,
+  // rule out a navigation that started and was still in flight at the moment
+  // of observation, nor one that left and came back. `did-start-navigation` is
+  // non-cancellable and fires for every main-frame navigation attempt
+  // including the ones no cancellable event reports - which is exactly the
+  // class N15 is about - so it is the only observation that makes the
+  // assertion's name ("never navigates") true rather than approximately true.
+  const n11Navs = [];
+  // THE POSITIONAL ARGUMENTS ARE DEPRECATED. `node_modules/electron/
+  // electron.d.ts` marks `url`, `isInPlace` and `isMainFrame` on
+  // `did-start-navigation` as @deprecated in favour of the `details` object.
+  // Reading only the positionals is a silent time bomb: on the Electron bump
+  // that drops them `isMainFrame` becomes undefined, this array never grows,
+  // and every assertion that consumes it passes for the worst possible reason.
+  // Read `details` first and fall back, so the witness survives the bump in
+  // either direction.
+  //
+  // `isMainFrame` is the right filter for FALSE NEGATIVES: did-start-navigation
+  // is the observer hook for every NavigationRequest, including one committing
+  // a blocked or error page, so `about:blank#blocked` cannot reach the top
+  // frame without firing it. It is too broad for FALSE POSITIVES - a fragment
+  // navigation fires with isMainFrame true - so `isSameDocument` is RECORDED
+  // rather than filtered on. Filtering would hide a same-document navigation
+  // that no assertion here expects; recording names it in the evidence if one
+  // ever appears. (Unreachable today: renderer.js contains no location.hash,
+  // pushState, replaceState, location.assign/replace or `location.href =`.)
+  const onN11Nav = (details, url, _isInPlace, isMainFrame) => {
+    const d = details && typeof details === "object" ? details : null;
+    const main = d && typeof d.isMainFrame === "boolean" ? d.isMainFrame : isMainFrame;
+    if (main) n11Navs.push({ url: (d && d.url) || url, sameDoc: d ? d.isSameDocument : null });
+  };
+  win.webContents.on("did-start-navigation", onN11Nav);
+
+  // Reloads performed by the recovery below. Counted so the terminal
+  // reconciliation can account for every event the listener saw.
+  let n11RecoveryLoads = 0;
+
+  // RECOVERY, EXTRACTED FROM n11Click BECAUSE ITS COVERAGE WAS EXACTLY AS WIDE
+  // AS THE CALLS THAT WENT THROUGH THAT HELPER. The section also reads the DOM
+  // directly - the SVG shape premise, the empty-href probe, the blank-href
+  // probe and the teardown - and every one of those ran against a destroyed
+  // document whenever a preceding click had torn the page down. Measured: under
+  // R463 the SVG premise `exec` returned [] and broke a mustPass; under R465
+  // the same gap surfaced as "harness threw: Error: Script failed to execute".
+  // Neither is a product defect. The recovery simply was not reachable from the
+  // probe that needed it.
+  const n11EnsureAlive = async (why) => {
+    // MEASURED, not anticipated: clicking the `caps` carrier with the external
+    // arm removed leaves the top frame at `about:blank#blocked` with
+    // performance navigation type "navigate". Chromium's URL parser rejects
+    // `HTTPS://api.example.invalid:PORT/v1`, so it commits its own blocked page
+    // rather than following the link - and that page REPLACES the app's
+    // document. Every stub, every observation array and every product global
+    // goes with it.
+    // THE CONJUNCT LIST IS THE CLAIM. A liveness probe answers only for the
+    // globals it names, and this one previously named two SECTION globals and
+    // was read as "the document is fully re-armed". It is not: the suite's own
+    // error sentinel is installed before run() and is destroyed by the same
+    // navigation, so a document could satisfy both conjuncts and still abort
+    // the next section. `__e2eErrors` is therefore named here as well - the
+    // recorded disjunction disease, in its "an absence check answers for less
+    // than it claims" form.
+    const alive0 = await exec(
+      `typeof window.__s12 !== 'undefined' && typeof window.__n11External !== 'undefined'` +
+        ` && typeof window.__e2eErrors !== 'undefined'`,
+    );
+    if (alive0 === true) return;
+
+    // THE RELOAD IS THE RECOVERY, and its absence was a real defect rather
+    // than a missing nicety. The first draft of this branch polled for
+    // `renderMarkdown` to reappear - but nothing in this app or this suite
+    // ever navigates the main window back: main.js loads index.html exactly
+    // once at startup and has no did-fail-load handler. Once Chromium commits
+    // `about:blank#blocked` in this webContents it STAYS there, so the poll
+    // could only ever time out. Measured consequence before the fix: R465
+    // reported COLLATERAL with "the renderer was destroyed by a link click
+    // and did not come back within 6s", and R463 lost its three trailing
+    // assertions because the SVG premise ran against the blocked page and
+    // returned []. Both read as harness crashes rather than as the finding.
+    await win.loadFile(path.join(__dirname, "..", "src", "index.html"));
+    n11RecoveryLoads += 1;
+
+    // Wait for the reloaded renderer to finish booting before reinstalling -
+    // renderMarkdown is what the render helper drives, and it is defined late.
+    // Polled rather than slept: a fixed sleep here is a bet on machine load,
+    // and this suite has lost that bet before.
+    let booted = false;
+    for (let i = 0; i < 120 && !booted; i++) {
+      booted = (await exec(`typeof window.renderMarkdown === 'function'`)) === true;
+      if (!booted) await sleep(50);
+    }
+    if (!booted) {
+      // THROWN, NOT check()ed, deliberately. An assertion that only exists when
+      // a revert is applied makes the suite's assertion COUNT depend on tree
+      // state, which breaks the name-set reconciliation this project relies on.
+      //
+      // The witness is detached HERE rather than in a finally around the whole
+      // section. This is the only live measured path that leaves the section
+      // early - every other statement between the attach and the removal is a
+      // check() or an exec whose failure aborts the process anyway - so a
+      // 500-line reindent would buy nothing except rotted revert anchors. What
+      // it does buy is real: the listener's lifetime never outlives the claims
+      // it supports, even on the path a revert actually takes.
+      win.webContents.removeListener("did-start-navigation", onN11Nav);
+      throw new Error(
+        "N11: the renderer was destroyed by a link click and did not come back within 6s" +
+          ` (${why})`,
+      );
+    }
+    // The shared trap re-arms itself from a did-finish-load listener, which
+    // is ASYNCHRONOUS to the loadFile above. Installing N11_TRAP first would
+    // be a race whose loser decides what teardown restores: if our stub lands
+    // before the rearm, the rearm overwrites it; if the rearm lands after our
+    // stub captured `shell.openExternal`, teardown reinstalls the REAL
+    // opener into a suite that is still firing hostile links at it. Waiting
+    // for the rearm makes the stub layer on top of the trap here exactly as
+    // it does on the non-recovery path.
+    await waitForExternalTrap(win);
+    // Reinstalled BEFORE the section stubs, in the same order the bootstrap
+    // established it, so a throw inside S12_INSTALL or N11_TRAP is still
+    // recorded by the sentinel rather than lost.
+    await exec(E2E_SENTINEL);
+    await exec(S12_INSTALL);
+    await exec(N11_TRAP);
+    // Restore what the CALLER last rendered, not the section's first
+    // document. The placeholder and whitespace assertions each render their
+    // own fixture, and re-rendering N11_DOC here would silently swap the
+    // fixture out from under them - the click would then look for an anchor
+    // that is no longer in the DOM and report `found: false`, which reads as
+    // "the link vanished" rather than "the recovery rebuilt the wrong page".
+    await render(n11Fixture, "full");
+  };
+
+  const n11Click = async (text) => {
+    // Runs FIRST - before s12Reset(), before anything dereferences a global.
+    await n11EnsureAlive(`about to click "${text}"`);
+
+    await s12Reset();
+    await exec(`window.__n11External.length = 0; null`);
+    // Everything the main process saw before this click belongs to setup (the
+    // initial load, and any recovery reload above). Slice from here so the
+    // evidence names only navigations THIS click caused.
+    const navMark = n11Navs.length;
+    const clicked = await exec(`
+      (() => {
+        const a = Array.from(document.querySelectorAll('#viewer a'))
+          .find((x) => (x.textContent || '').trim() === ${JSON.stringify(text)});
+        if (!a) return { found: false };
+        // dispatchEvent rather than a.click(), because its return value is the
+        // only way to see preventDefault() from here. It reports false when the
+        // event was cancelled. Without this, a handler that does nothing and a
+        // handler that is never reached are indistinguishable - every other
+        // observation below is empty in both cases, which is exactly how the
+        // first draft of the placeholder assertion managed to be vacuous.
+        const ev = new MouseEvent('click', { bubbles: true, cancelable: true, view: window });
+        const notCancelled = a.dispatchEvent(ev);
+        return {
+          found: true,
+          href: a.getAttribute('href'),
+          prevented: notCancelled === false,
+          // WHICH NODE WAS ACTUALLY CLICKED. The selector is by TEXT, so the
+          // SVG legs are only testing SVG handling for as long as the fixture
+          // keeps spelling those labels inside an <svg>. A future fixture edit
+          // adding an ordinary HTML anchor labelled "svgh" would let every
+          // behaviour assertion pass while SVG handling was broken - the
+          // premise block asserts the SVG shape, but nothing tied the premise
+          // to the node the click found. Recorded here so the behaviour
+          // assertions can require it themselves.
+          svgAnchor: a instanceof SVGAElement,
+        };
+      })()
+    `);
+    await sleep(140);
+    // Read the frame's own identity BEFORE the observation arrays, because if
+    // the frame moved those arrays no longer exist and JSON.stringify silently
+    // drops undefined keys - a truncated evidence blob with no explanation.
+    const nav = await exec(`
+      (() => {
+        const n = performance.getEntriesByType('navigation')[0];
+        return {
+          href: location.href,
+          navType: n ? n.type : null,
+          alive: typeof window.__s12 !== 'undefined',
+        };
+      })()
+    `);
+    // The main-process half of the same question. Recorded on every click, not
+    // just the ones that are expected to move, so a surprise navigation is
+    // attributed to the click that caused it rather than discovered later.
+    nav.mainProcessNavs = n11Navs.slice(navMark);
+    const state = (await exec(`window.__s12`)) || {};
+    const external = (await exec(`window.__n11External`)) || [];
+    return { ...state, external, clicked, nav };
+  };
+
+  const n11Txt = await n11Click("txt");
+  check(
+    "N11 a local file whose name begins with http is opened, not silently ignored",
+    // The href conjunct pins the shape of the bug: without it the assertion
+    // would still pass if the sanitizer had rewritten the name.
+    n11Txt.clicked.found === true &&
+      n11Txt.clicked.href === "https-notes.txt" &&
+      n11Txt.clicked.prevented === true &&
+      n11Txt.openPath.length === 1 &&
+      n11Txt.openPath[0].endsWith("https-notes.txt") &&
+      n11Txt.external.length === 0 &&
+      n11Txt.notes.length === 0,
+    JSON.stringify(n11Txt),
+  );
+
+  const n11Md = await n11Click("md");
+  check(
+    "N11 a markdown file whose name begins with http opens in the app",
+    n11Md.clicked.found === true &&
+      n11Md.clicked.href === "httpd.md" &&
+      n11Md.clicked.prevented === true &&
+      n11Md.ipc.length === 1 &&
+      n11Md.ipc[0].endsWith("httpd.md") &&
+      n11Md.openPath.length === 0 &&
+      n11Md.external.length === 0,
+    JSON.stringify(n11Md),
+  );
+
+  const n11Web = await n11Click("web");
+  // SPLIT IN TWO on purpose. "was it opened" and "was it stat'd" are different
+  // claims about different code, and two reverts depend on telling them apart:
+  // R463 deletes the external arm and fails only the first, while R464 deletes
+  // the arm AND widens the catch-all so the URL really is resolved against the
+  // document directory and handed to fs.existsSync - the only mutation that
+  // leaks the reader's filesystem layout. Joined into one assertion both
+  // reverts produce an identical verdict and the second finding is invisible.
+  check(
+    "N11 an absolute http URL is still routed externally",
+    n11Web.clicked.found === true &&
+      n11Web.clicked.prevented === true &&
+      n11Web.external.length === 1 &&
+      n11Web.external[0] === "http://probe.invalid/page",
+    JSON.stringify(n11Web),
+  );
+  check(
+    "N11 an absolute http URL is never treated as a local path",
+    n11Web.openPath.length === 0 && n11Web.ipc.length === 0 && n11Web.exists.length === 0,
+    JSON.stringify(n11Web),
+  );
+
+  // The uppercase carrier. `HTTPS://api.example.invalid:PORT/v1` has an invalid
+  // port, so Chromium's parser rejects it and `link.href` hands back the
+  // attribute verbatim rather than a lowercased, normalised URL. Both arms
+  // therefore see an uppercase scheme, which is the whole reason
+  // ABSOLUTE_WEB_URL carries the `i` flag. Without it this URL matches no arm
+  // and reaches the catch-all, which resolves it as a path.
+  const n11Caps = await n11Click("caps");
+  check(
+    "N11 an uppercase unparseable http URL is routed externally, not stat'd as a path",
+    n11Caps.clicked.found === true &&
+      n11Caps.clicked.prevented === true &&
+      n11Caps.external.length === 1 &&
+      n11Caps.external[0] === "HTTPS://api.example.invalid:PORT/v1" &&
+      n11Caps.openPath.length === 0 &&
+      n11Caps.ipc.length === 0 &&
+      n11Caps.exists.length === 0,
+    JSON.stringify(n11Caps),
+  );
+
+  // A PRODUCT CLAIM THAT HAD NEVER BEEN ASSERTED, and it is stronger than
+  // "the link is dead".
+  //
+  // MEASURED: with the external arm removed, this exact click leaves the top
+  // frame at `about:blank#blocked`, navigation type "navigate" - Chromium
+  // rejected the malformed URL and committed its OWN blocked page over the
+  // app's document. Every open tab and every unsaved edit goes with it and the
+  // window is left blank with no way back except a restart. So the delegation
+  // being TOTAL is not merely tidiness; it is what stops a single click on an
+  // ordinary-looking link destroying the reader's session.
+  //
+  // Note what this does NOT claim. main.js's will-navigate / will-redirect
+  // denies do not fire for this URL at all - measured, by the absence of their
+  // distinct log lines - so the renderer's totality is the ONLY layer standing
+  // here. That gap is recorded as its own finding rather than implied away.
+  //
+  // THREE CONJUNCTS, AND THE THIRD IS WHY THE NAME IS HONEST. `alive` and
+  // `href` together establish the frame's FINAL identity, which is enough for
+  // the measured failure (Chromium commits about:blank#blocked and stays
+  // there) but would not catch a navigation that left and returned, or one
+  // still in flight when the observation was taken 140ms after the click -
+  // both of which "never navigates" claims to exclude. mainProcessNavs is a
+  // did-start-navigation record kept OUTSIDE the renderer, so it survives the
+  // document being destroyed and is independent of the polling interval. It is
+  // also the one signal that fires for the unparseable case at all, which is
+  // what makes it the right witness rather than merely an extra one.
+  check(
+    "N11 an unhandled link click never navigates the top frame out of the app",
+    n11Caps.nav.alive === true &&
+      n11Caps.nav.href === n11BaseHref &&
+      Array.isArray(n11Caps.nav.mainProcessNavs) &&
+      n11Caps.nav.mainProcessNavs.length === 0,
+    JSON.stringify({ nav: n11Caps.nav, base: n11BaseHref }),
+  );
+
+  // SVG anchors. An <a> inside inline SVG is an SVGAElement whose `href` is an
+  // SVGAnimatedString OBJECT, and the two spellings disagree about which
+  // getAttribute answers. The shape is PINNED rather than assumed, because
+  // every assertion below is about how the handler copes with it: if a
+  // dompurify bump ever started stripping SVG anchors, or Chromium started
+  // handing back a plain string, these would pass while testing nothing.
+  // THE RECOVERY HAS TO RUN HERE TOO. This is a direct exec, not a click, so
+  // it never went through n11Click - and under R463/R465 the caps carrier
+  // immediately above destroys the document, leaving this probe to return []
+  // against about:blank#blocked and break its own mustPass.
+  await n11EnsureAlive("about to read the SVG shape premise");
+  const n11SvgShape = await exec(`
+    (() => {
+      return Array.from(document.querySelectorAll('#viewer svg a')).map((a) => ({
+        text: (a.textContent || '').trim(),
+        isSvgElement: a.constructor.name,
+        hrefIsObject: typeof a.href === 'object' && a.href !== null,
+        getAttrHref: a.getAttribute('href'),
+        getAttrXlink: a.getAttribute('xlink:href'),
+        // baseVal is THE load-bearing value - it is what the handler's
+        // normalisation actually reads - so record it rather than only
+        // recording that href is an object. Without this the premise pinned
+        // the SHAPE of href and said nothing about its CONTENT, while the
+        // comment claimed otherwise.
+        baseVal:
+          a.href && typeof a.href === 'object' && typeof a.href.baseVal === 'string'
+            ? a.href.baseVal
+            : null,
+        closestMatches: a.closest('a, area') === a,
+      }));
+    })()
+  `);
+  check(
+    "N11 both SVG anchor spellings survive sanitization as SVGAElements the delegation can see",
+    Array.isArray(n11SvgShape) &&
+      n11SvgShape.length === 2 &&
+      n11SvgShape.every(
+        (s) =>
+          s.isSvgElement === "SVGAElement" && s.hrefIsObject === true && s.closestMatches === true,
+      ) &&
+      // The asymmetry is the premise the fallback exists for: the xlink form
+      // has a NULL getAttribute('href'). baseVal is asserted to an EXACT value
+      // for both spellings, because "is a string" would still hold if Chromium
+      // started resolving xlink:href to the empty string - which is precisely
+      // the regression that would make the two behaviour assertions below pass
+      // while testing nothing.
+      n11SvgShape.some(
+        (s) =>
+          s.text === "svgh" &&
+          s.getAttrHref === "http://svg.invalid/p" &&
+          s.baseVal === "http://svg.invalid/p",
+      ) &&
+      n11SvgShape.some(
+        (s) =>
+          s.text === "svgx" &&
+          s.getAttrHref === null &&
+          s.getAttrXlink === "http://xlink.invalid/p" &&
+          s.baseVal === "http://xlink.invalid/p",
+      ),
+    JSON.stringify(n11SvgShape),
+  );
+
+  const n11SvgH = await n11Click("svgh");
+  check(
+    "N11 an SVG anchor using href is routed externally instead of throwing",
+    n11SvgH.clicked.found === true &&
+      n11SvgH.clicked.svgAnchor === true &&
+      n11SvgH.clicked.prevented === true &&
+      n11SvgH.external.length === 1 &&
+      n11SvgH.external[0] === "http://svg.invalid/p" &&
+      n11SvgH.openPath.length === 0 &&
+      n11SvgH.exists.length === 0,
+    JSON.stringify(n11SvgH),
+  );
+
+  const n11SvgX = await n11Click("svgx");
+  check(
+    "N11 an SVG anchor using xlink:href is routed externally instead of silently ignored",
+    n11SvgX.clicked.found === true &&
+      n11SvgX.clicked.svgAnchor === true &&
+      n11SvgX.clicked.prevented === true &&
+      n11SvgX.external.length === 1 &&
+      n11SvgX.external[0] === "http://xlink.invalid/p" &&
+      n11SvgX.openPath.length === 0 &&
+      n11SvgX.exists.length === 0,
+    JSON.stringify(n11SvgX),
+  );
+
+  // A placeholder link - markdown's `[text]()` - is a link to nowhere. It is
+  // NOT stripped by the sanitizer: measured, the empty href attribute survives
+  // and `link.href` resolves to index.html itself. Every arm of the delegation
+  // requires a non-empty hrefAttr, so before N11 the click fell through to
+  // Chromium, which treated it as a top-frame navigation to the app's own page.
+  // Only main.js's will-navigate deny stood between a placeholder link and a
+  // full reload that would have discarded every open tab.
+  //
+  // `exists.length === 0` matters as much as the rest: the fix must be an early
+  // return, not a trip through the local-file arm that resolves "" against the
+  // document directory and stats it.
+  //
+  // `prevented === true` is the conjunct that carries this assertion, and it
+  // was missing from the first draft - which the revert harness caught by
+  // returning VACUOUS. Every other observation here is EMPTY whether the
+  // handler deliberately did nothing or was never reached at all, so without
+  // reading the cancelled flag the assertion passed with the fix deleted.
+  await n11EnsureAlive("about to render the placeholder fixture");
+  await n11Render("# Placeholder\n\n[empty]()\n");
+  const n11Empty = await n11Click("empty");
+  const n11EmptyNav = await exec(`
+    (() => {
+      const a = Array.from(document.querySelectorAll('#viewer a'))
+        .find((x) => x.textContent.trim() === 'empty');
+      return { href: a ? a.getAttribute('href') : null, hasAttr: a ? a.hasAttribute('href') : false };
+    })()
+  `);
+  check(
+    "N11 a placeholder link with an empty href is a deliberate no-op, not a fall-through",
+    // hasAttr pins the premise: if DOMPurify ever started stripping the empty
+    // href, the anchor would fail the handler's outer `link.href` guard for a
+    // different reason and this assertion would pass without testing anything.
+    n11EmptyNav.hasAttr === true &&
+      n11EmptyNav.href === "" &&
+      n11Empty.clicked.found === true &&
+      n11Empty.clicked.prevented === true &&
+      n11Empty.openPath.length === 0 &&
+      n11Empty.ipc.length === 0 &&
+      n11Empty.external.length === 0 &&
+      n11Empty.notes.length === 0 &&
+      n11Empty.confirms.length === 0 &&
+      n11Empty.exists.length === 0,
+    JSON.stringify({ n11Empty, n11EmptyNav }),
+  );
+
+  // Whitespace-only hrefs. The handler tests emptiness with URL_BLANK
+  // (/^[\u0000-\u0020]*$/ - the class the URL parser strips, NOT /^\s*$/,
+  // which an earlier version of this comment claimed) while the local-file arm
+  // trims separately, so in principle the two could disagree about a `&nbsp;`,
+  // a BOM or a C0 control and let a "blank" href reach the path resolver.
+  //
+  // MEASURED, AND THE MEASUREMENT IS THE FINDING: they cannot disagree, but
+  // NOT for the reason the first draft of this comment gave. The mechanism is
+  // DOMPurify's own `stringTrim(initValue)` on every attribute value
+  // (purify.js:1917 in the vendored 3.4.12), followed by the validity check's
+  // final `else if (value) return false` (purify.js:1805-1806), which
+  // explicitly KEEPS an attribute whose value is empty. Native String.trim()
+  // is the filter, so the two predicates split the carriers into two different
+  // outcomes rather than one:
+  //
+  //   \u00A0, \uFEFF - inside JS's trim set, so DOMPurify trims them to "" and
+  //     keeps the attribute. `hrefAttr === ""`, where URL_BLANK and trim()
+  //     trivially agree.
+  //   \u0001 - a C0 control. URL_BLANK calls it blank; JS trim() does NOT, so
+  //     it SURVIVES the trim, then fails IS_ALLOWED_URI, and the ATTRIBUTE IS
+  //     REMOVED ENTIRELY. The anchor is then not a link at all: `link.href` is
+  //     "" and the handler's outer guard rejects it before either predicate is
+  //     evaluated.
+  //
+  // So the direction where URL_BLANK is broader than trim() is unreachable
+  // because the attribute is DELETED, not because it is emptied - and note the
+  // irony that the predicate R468 proposed swapping IN is the one the sanitizer
+  // already applies. This is why the DOM premise is asserted SEPARATELY from
+  // the behaviour: the behavioural assertion below is true for reasons that
+  // have nothing to do with URL_BLANK, and a reader who saw only that assertion
+  // would credit the wrong code. It is also why the revert that swapped
+  // URL_BLANK for a bare trim() was withdrawn as vacuous rather than recorded
+  // as proven: the property is real, but it is unobservable from the DOM.
+  await n11EnsureAlive("about to render the whitespace fixture");
+  await n11Render(
+    "# Whitespace\n\n" +
+      '<a href="&#160;">nbsp</a>\n\n' +
+      '<a href="&#65279;">bom</a>\n' +
+      // The C0 carrier covers the OTHER direction of the disagreement, and it
+      // earns its place by behaving differently from the first two rather than
+      // by confirming them. Without it the premise would describe one mechanism
+      // and claim the whole class.
+      '\n<a href="&#1;">ctrl</a>\n',
+  );
+  const n11Blank = await exec(`
+    (() => {
+      return Array.from(document.querySelectorAll('#viewer a')).map((a) => ({
+        text: (a.textContent || '').trim(),
+        hasAttr: a.hasAttribute('href'),
+        href: a.getAttribute('href'),
+        // The outer guard in the handler tests link.href, not the attribute,
+        // so record the RESOLVED value too: a removed attribute leaves it "",
+        // which is what makes the C0 carrier unreachable rather than merely
+        // blank. (No backticks in this comment: it lives inside an exec()
+        // template literal.)
+        resolved: a.href,
+      }));
+    })()
+  `);
+  const n11ByText = Object.fromEntries((n11Blank || []).map((a) => [a.text, a]));
+  check(
+    "N11 the sanitizer neutralises every whitespace-only href, so URL_BLANK and trim() cannot disagree in the DOM",
+    Array.isArray(n11Blank) &&
+      n11Blank.length === 3 &&
+      // The two carriers inside JS's trim set: attribute KEPT, value emptied.
+      ["nbsp", "bom"].every(
+        (t) => n11ByText[t] && n11ByText[t].hasAttr === true && n11ByText[t].href === "",
+      ) &&
+      // The carrier outside it: attribute REMOVED, so the anchor is not a link.
+      n11ByText.ctrl &&
+      n11ByText.ctrl.hasAttr === false &&
+      n11ByText.ctrl.href === null &&
+      n11ByText.ctrl.resolved === "",
+    JSON.stringify(n11Blank),
+  );
+
+  const n11Nbsp = await n11Click("nbsp");
+  const n11Bom = await n11Click("bom");
+  const n11Ctrl = await n11Click("ctrl");
+  check(
+    "N11 a whitespace-only href is a silent no-op, never a path lookup",
+    [n11Nbsp, n11Bom].every(
+      (r) =>
+        r.clicked.found === true &&
+        r.clicked.prevented === true &&
+        r.openPath.length === 0 &&
+        r.ipc.length === 0 &&
+        r.external.length === 0 &&
+        r.notes.length === 0 &&
+        r.confirms.length === 0 &&
+        r.exists.length === 0,
+    ),
+    JSON.stringify({ n11Nbsp, n11Bom }),
+  );
+
+  // The C0 carrier is asserted SEPARATELY and with a different predicate,
+  // because it is inert for a different reason and lumping it in with the two
+  // above would have made the combined assertion false.
+  //
+  // Measured: `prevented` is FALSE here, and that is correct rather than a
+  // defect. DOMPurify removed the href attribute outright, so `link.href` is ""
+  // and the handler's outer `if (link && link.href)` guard declines the anchor
+  // before any arm runs - there is nothing to preventDefault, and an <a> with
+  // no href is not a hyperlink, so Chromium does nothing either. Asserting
+  // `prevented === true` here (as a first draft did, by adding this carrier to
+  // the array above) would have been asserting a falsehood and would have
+  // masked the far more interesting fact that the attribute never survived.
+  check(
+    "N11 a C0-control href is stripped by the sanitizer, so the anchor never reaches the link policy at all",
+    n11Ctrl.clicked.found === true &&
+      n11Ctrl.clicked.prevented === false &&
+      n11Ctrl.clicked.href === null &&
+      n11Ctrl.nav.alive === true &&
+      n11Ctrl.nav.href === n11BaseHref &&
+      n11Ctrl.nav.mainProcessNavs.length === 0 &&
+      n11Ctrl.openPath.length === 0 &&
+      n11Ctrl.ipc.length === 0 &&
+      n11Ctrl.external.length === 0 &&
+      n11Ctrl.notes.length === 0 &&
+      n11Ctrl.confirms.length === 0 &&
+      n11Ctrl.exists.length === 0,
+    JSON.stringify({ n11Ctrl, base: n11BaseHref }),
+  );
+
+  // THE AGGREGATE, AND WHY IT HAD TO EXIST. Before this, mainProcessNavs was
+  // asserted in exactly two places (the caps carrier and the C0 carrier) and in
+  // BOTH of them the other conjuncts already decided the verdict on their own.
+  // No revert in the harness made an empty nav list the SOLE failing conjunct,
+  // so if the witness had been permanently empty - the deprecated-positional
+  // time bomb the listener comment describes - every N11 verdict would have
+  // been byte-identical. A sentinel that is never the sole discriminator is
+  // unproven.
+  //
+  // This makes it the sole discriminator for four reverts. MEASURED, not
+  // assumed: under R463 the `web` carrier reports alive:true, an unchanged href
+  // AND mainProcessNavs ["http://probe.invalid/page"] - so a navigation that
+  // will-navigate DENIES still fires did-start-navigation, and the witness is
+  // therefore live rather than merely quiet. Under R461/R462/R466 the carriers
+  // fall through to Chromium, which starts a main-frame navigation the deny
+  // then cancels: the frame survives, `href` is unchanged, and this aggregate
+  // is the ONLY assertion that can see it.
+  const n11All = {
+    txt: n11Txt,
+    md: n11Md,
+    web: n11Web,
+    caps: n11Caps,
+    svgh: n11SvgH,
+    svgx: n11SvgX,
+    empty: n11Empty,
+    nbsp: n11Nbsp,
+    bom: n11Bom,
+    ctrl: n11Ctrl,
+  };
+  const n11Started = Object.entries(n11All)
+    .filter(
+      ([, r]) => !r.nav || !Array.isArray(r.nav.mainProcessNavs) || r.nav.mainProcessNavs.length,
+    )
+    .map(([k, r]) => [k, r.nav ? r.nav.mainProcessNavs : null]);
+  check(
+    "N11 no link click anywhere in this section started a main-frame navigation",
+    // The length check is a vacuity guard: it pins that every carrier really
+    // was collected, so a future edit that drops one from the object cannot
+    // shrink the claim silently.
+    Object.keys(n11All).length === 10 && n11Started.length === 0,
+    JSON.stringify({ carriers: Object.keys(n11All).length, started: n11Started }),
+  );
+
+  // TERMINAL RECONCILIATION. The per-click slices are taken 140ms after the
+  // click, so a navigation that started later lands in NO slice and would be
+  // invisible to every assertion above - the index arithmetic proves what was
+  // observed between the mark and the read, which is weaker than "nothing
+  // happened". This closes the gap from the other end: the listener's total
+  // must equal every recovery reload plus everything any slice reported.
+  // Anything else is an event no assertion accounted for.
+  // MEASURED CORRECTION: there is no "+1 for the initial load". The listener is
+  // attached long AFTER main.js has loaded index.html, so on a clean tree it
+  // sees exactly zero events - which the first version of this assertion got
+  // wrong, reporting seen:0 against accounted:1 and failing at rest. A revert
+  // scored against a permanently-failing assertion is indistinguishable from a
+  // real proof, so this is the half that had to be right before any revert
+  // could use it.
+  const n11Accounted =
+    n11RecoveryLoads +
+    Object.values(n11All).reduce(
+      (n, r) =>
+        n + (r.nav && Array.isArray(r.nav.mainProcessNavs) ? r.nav.mainProcessNavs.length : 0),
+      0,
+    );
+  check(
+    "N11 every main-frame navigation the main process saw is accounted for by a click slice or a recovery reload",
+    n11Navs.length === n11Accounted,
+    JSON.stringify({
+      seen: n11Navs.length,
+      accounted: n11Accounted,
+      recoveryLoads: n11RecoveryLoads,
+      navs: n11Navs,
+    }),
+  );
+
+  // The navigation witness is scoped to this section. Left attached it would
+  // keep recording for every later block in this file - harmless in itself,
+  // but it makes the listener's lifetime longer than the claim it supports,
+  // and a listener nobody reads is the same defect as a field nobody reads.
+  //
+  // DETACHED BEFORE THE TEARDOWN BELOW, not after, and that ordering is a
+  // MEASUREMENT rather than a preference. Every claim the witness supports -
+  // the ten per-click slices, the aggregate and the reconciliation - has been
+  // evaluated by this line, so it has nothing left to observe; and the
+  // recovery immediately below may issue a reload of its own, which would
+  // otherwise be recorded after the reconciliation that is supposed to account
+  // for every event it sees.
+  win.webContents.removeListener("did-start-navigation", onN11Nav);
+
+  // THE TEARDOWN NEEDS A LIVE DOCUMENT, AND THAT WAS NOT GUARDED - but the
+  // stated reason below was WRONG, and the retraction is kept visible because
+  // this project treats a wrong record as worse than no record.
+  //
+  // WHAT THIS COMMENT ORIGINALLY CLAIMED: "R463 and R465 both leave the top
+  // frame at `about:blank#blocked` after the LAST carrier click, so the exec
+  // below ran against Chromium's blocked page, where neither `require` nor
+  // `window.__n11SavedExternal` exists, and threw."
+  //
+  // REFUTED BY MEASUREMENT. Under R463 the frame is destroyed by the `caps`
+  // carrier, which is the SECOND of four that navigate - the two SVG carriers
+  // follow it and both report `alive:true`, because n11Click calls
+  // n11EnsureAlive first and the recovery had already rebuilt the document. So
+  // `alive0` is true by the time this line runs, this guard returns
+  // immediately, and the restore exec below has always succeeded: its own
+  // assertion, `the local openExternal stub is fully removed and the shared
+  // trap answers again`, PASSES under R463. The abort was twenty lines further
+  // on, in SEC-13, on `window.__e2eErrors.length = 0` - a SUITE-level global
+  // the recovery reload destroyed and did not reinstall. See E2E_SENTINEL at
+  // the top of this file.
+  //
+  // THE GUARD STAYS ANYWAY, on the R202 precedent that an unreachable guard is
+  // still a contract: no carrier is currently last-and-fatal, but that is a
+  // property of which reverts exist today, not of the teardown.
+  //
+  // WHAT REMAINS TRUE, AND IS THE REASON ANY OF THIS MATTERED: aborting
+  // anywhere in this file means every later block simply never runs, so its
+  // assertions cannot fail - they cease to exist. That is exactly what the
+  // long-standing R463 anomaly was: `SEC-11 an <area href> is routed through
+  // the link policy, not Chromium` was reported as `missing=` and read as a
+  // wrong guard about <area> handling, when in fact the assertion had never
+  // been reached. An aborted suite is indistinguishable from a passing one for
+  // every assertion after the abort point. With the sentinel reinstalled the
+  // suite runs all 161 assertions under R463 and that <area> assertion fails
+  // on its own merits - measured, not predicted.
+  await n11EnsureAlive("about to restore the external opener");
+
+  await exec(`
+    (() => {
+      require('electron').shell.openExternal = window.__n11SavedExternal;
+      delete window.__n11SavedExternal;
+      return null;
+    })()
+  `);
+
+  // The N11 stub shadowed the SHARED external trap that every windowed suite
+  // installs (test-visual-utils.js trapExternalOpens). If it is not fully
+  // removed, every later block in this file records into a dead local array
+  // and the trap that stops the harness launching the user's browser is
+  // silently disarmed - which is exactly the defect that trap was written for
+  // after the user reported accumulating tabs.
+  //
+  // Asserted BEHAVIOURALLY rather than by checking the saved slot is gone: the
+  // slot being deleted says nothing about which function is now installed. A
+  // probe call must land in the shared trap's array.
+  const n11Restored = await exec(`
+    (() => {
+      const before = (window.__externalOpens || []).length;
+      const localBefore = (window.__n11External || []).length;
+      require('electron').shell.openExternal('https://n11-restore-probe.invalid/');
+      const after = window.__externalOpens || [];
+      return {
+        savedGone: typeof window.__n11SavedExternal === 'undefined',
+        trapInstalled: window.__externalTrapInstalled === true,
+        grew: after.length === before + 1,
+        last: after[after.length - 1] || null,
+        localUntouched: (window.__n11External || []).length === localBefore,
+      };
+    })()
+  `);
+  check(
+    "N11 the local openExternal stub is fully removed and the shared trap answers again",
+    n11Restored.savedGone === true &&
+      n11Restored.trapInstalled === true &&
+      n11Restored.grew === true &&
+      n11Restored.last === "https://n11-restore-probe.invalid/" &&
+      // The probe must land in the SHARED array and nowhere else. Without this
+      // conjunct a stub that recorded into both would pass.
+      n11Restored.localUntouched === true,
+    JSON.stringify(n11Restored),
   );
 
   await exec(`
@@ -1821,6 +2893,654 @@ async function run(win) {
     JSON.stringify(formState),
   );
 
+  // ==========================================================================
+  // SEC-29 - the table paths sanitized with a BARE DOMPurify.sanitize()
+  //
+  // Five call sites parsed markdown and sanitized it without SANITIZE_CONFIG,
+  // silently opting out of the SEC-11 <form> control above. The comment on
+  // SANITIZE_CONFIG called itself the "single source of truth for what the
+  // sanitizer permits" - it was not.
+  //
+  // Reachability is the point: renderTableInDOM extracts only the <table>
+  // element from its scratch div, so a <form> as a SIBLING of the table would
+  // be dropped by the extraction. Nested inside a CELL it travels with the
+  // table and is appended straight into the Node-privileged viewer.
+  // ==========================================================================
+  await render("# TableClean\n\nreset\n", "full", 600);
+  const tableFormMd =
+    "| A | B |\n" +
+    "|---|---|\n" +
+    '| <form action="https://probe.invalid/tbl"><button>TableFormProbe</button></form> | y |\n';
+  const tableFormState = await exec(`
+    (() => {
+      window.renderTableInDOM(${JSON.stringify(tableFormMd)}, 'insert');
+      const v = document.getElementById('viewer');
+      const btns = Array.from(v.querySelectorAll('button'));
+      return {
+        tables: v.querySelectorAll('table').length,
+        forms: v.querySelectorAll('form').length,
+        actionAttrs: v.querySelectorAll('[action]').length,
+        // Same control as SEC-11: DOMPurify unwraps a forbidden tag and keeps
+        // its children, so the button surviving proves the payload reached the
+        // sanitizer and was specifically stripped - not that the table failed
+        // to render, or that renderTableInDOM bailed at its querySelector.
+        probeBtn: btns.some(b => b.textContent === 'TableFormProbe'),
+      };
+    })()
+  `);
+  check(
+    "SEC-29 a <form> nested in a table cell is stripped on the context-menu table path",
+    tableFormState.tables === 1 &&
+      tableFormState.forms === 0 &&
+      tableFormState.actionAttrs === 0 &&
+      tableFormState.probeBtn === true,
+    JSON.stringify(tableFormState),
+  );
+
+  // The other reachable half: the table dialog's live preview element. This is
+  // fed from the open DOCUMENT on the 'edit' path, so its input is
+  // attacker-controlled too, and it is a live node in the privileged window
+  // rather than a detached scratch div.
+  const tablePreviewState = await exec(`
+    (() => {
+      window.openTableInsertDialog(${JSON.stringify(tableFormMd)}, 'edit');
+      const p = document.getElementById('tableInsertPreview');
+      const out = {
+        found: !!p,
+        // Symmetric with the check above: without this, a marked change that
+        // stopped emitting a <table> would put the <form> in a <p>, strip it
+        // identically, and let probeBtn pass green while measuring a shape the
+        // assertion's own name does not describe.
+        tables: p ? p.querySelectorAll('table').length : -1,
+        cellBtns: p ? p.querySelectorAll('td button').length : -1,
+        forms: p ? p.querySelectorAll('form').length : -1,
+        actionAttrs: p ? p.querySelectorAll('[action]').length : -1,
+        probeBtn: p
+          ? Array.from(p.querySelectorAll('button')).some(
+              b => b.textContent === 'TableFormProbe',
+            )
+          : false,
+      };
+      // closeTableInsertDialog() only removes the 'visible' class, so on its
+      // own it would leave tableDialogMode==='edit', the attack markdown in the
+      // textarea and its render in the live preview - a trap for whatever test
+      // is appended here next. Clear the source first, then reopen in 'insert'
+      // (which resets the mode, the button label and, via updateTablePreview(),
+      // the preview itself) before closing for real.
+      const ta = document.getElementById('tableInsertMarkdown');
+      if (ta) ta.value = '';
+      window.openTableInsertDialog(null, 'insert');
+      window.closeTableInsertDialog();
+      out.residualForms = p ? p.querySelectorAll('form').length : -1;
+      out.residualBtn = p
+        ? Array.from(p.querySelectorAll('button')).some(
+            b => b.textContent === 'TableFormProbe',
+          )
+        : true;
+      return out;
+    })()
+  `);
+  check(
+    "SEC-29 a <form> nested in a table cell is stripped in the table dialog preview",
+    tablePreviewState.found === true &&
+      tablePreviewState.tables === 1 &&
+      tablePreviewState.cellBtns === 1 &&
+      tablePreviewState.forms === 0 &&
+      tablePreviewState.actionAttrs === 0 &&
+      tablePreviewState.probeBtn === true,
+    JSON.stringify(tablePreviewState),
+  );
+  check(
+    "SEC-29 the table dialog is left reset, not holding the attack markdown",
+    tablePreviewState.residualForms === 0 &&
+      tablePreviewState.residualBtn === false,
+    JSON.stringify(tablePreviewState),
+  );
+
+  // The comment on TABLE_SANITIZE_CONFIG makes a load-bearing promise: the two
+  // deny-lists are shared BY REFERENCE, so a tag added to SANITIZE_CONFIG can
+  // never leave the table path behind again. Nothing measured that. Rewriting
+  // the config to literal copies (['form'] / ['action','formaction']) leaves
+  // both SEC-29 checks green and R449 still failing exactly as designed, while
+  // fully re-arming the drift the comment declares impossible.
+  //
+  // Object identity is the right oracle: a copy, a spread, or a literal all
+  // fail it, and it is the property the comment actually claims. SANITIZE_CONFIG
+  // is a top-level `const` in a classic script, so it is not on `window` but IS
+  // a global lexical binding - hence the reachability control, without which a
+  // renaming refactor would make this pass by throwing into the catch.
+  const aliasState = await exec(`
+    (() => {
+      try {
+        return {
+          reach: true,
+          tagsAliased:
+            SANITIZE_CONFIG.FORBID_TAGS === TABLE_SANITIZE_CONFIG.FORBID_TAGS,
+          attrsAliased:
+            SANITIZE_CONFIG.FORBID_ATTR === TABLE_SANITIZE_CONFIG.FORBID_ATTR,
+          tagsFrozen: Object.isFrozen(SANITIZE_CONFIG.FORBID_TAGS),
+          attrsFrozen: Object.isFrozen(SANITIZE_CONFIG.FORBID_ATTR),
+          tags: SANITIZE_CONFIG.FORBID_TAGS.slice(),
+          attrs: SANITIZE_CONFIG.FORBID_ATTR.slice(),
+        };
+      } catch (e) {
+        return { reach: false, err: String(e && e.message) };
+      }
+    })()
+  `);
+  check(
+    "SEC-29 the table config shares SANITIZE_CONFIG's deny-lists by reference, frozen",
+    aliasState.reach === true &&
+      aliasState.tagsAliased === true &&
+      aliasState.attrsAliased === true &&
+      aliasState.tagsFrozen === true &&
+      aliasState.attrsFrozen === true &&
+      aliasState.tags.join() === "form" &&
+      aliasState.attrs.join() === "action,formaction,download",
+    JSON.stringify(aliasState),
+  );
+
+  // ==========================================================================
+  // SEC-30 - <a download> as an outbound-request primitive
+  //
+  // `download` is in DOMPurify 3.4.12's default ALLOWED_ATTR (measured: 118
+  // entries; `download` and `href` in, `target` and `ping` out). A download is
+  // NOT a navigation, so main.js's will-navigate / will-redirect /
+  // will-frame-navigate / setWindowOpenHandler denies never see it, and CSP has
+  // no directive that governs one. Inside #viewer the attribute was already
+  // inert - every branch of the click delegation calls preventDefault() and
+  // routes the link to shell.openExternal - but #tableInsertPreview sits
+  // OUTSIDE #viewer and had no delegation. Measured before the fix: a download
+  // anchor rendered there issued a live outbound HTTP request from the
+  // Node-privileged renderer to a loopback beacon, while a plain anchor in the
+  // same click batch was blocked by will-navigate.
+  // ==========================================================================
+  const dlProbeMd =
+    "| A | B |\n" +
+    "|---|---|\n" +
+    '| <a download="pwned.txt" href="https://probe.invalid/dl">DownloadProbe</a> | y |\n';
+
+  await render(dlProbeMd, "full", 600);
+  const dlViewerState = await exec(`
+    (() => {
+      const v = document.getElementById('viewer');
+      const a = Array.from(v.querySelectorAll('a')).find(
+        x => x.textContent === 'DownloadProbe',
+      );
+      return {
+        // Positive control: the anchor itself must survive, with its href. A
+        // marked or DOMPurify change that stopped emitting the <a> at all would
+        // otherwise report zero download attributes and read green while
+        // measuring nothing.
+        anchor: !!a,
+        href: a ? a.getAttribute('href') : null,
+        downloadAttrs: v.querySelectorAll('[download]').length,
+        tables: v.querySelectorAll('table').length,
+        renderError: window.__lastRenderError,
+      };
+    })()
+  `);
+  check(
+    "SEC-30 the download attribute is stripped from document content in the viewer",
+    dlViewerState.anchor === true &&
+      dlViewerState.href === "https://probe.invalid/dl" &&
+      dlViewerState.downloadAttrs === 0 &&
+      dlViewerState.tables === 1 &&
+      dlViewerState.renderError === null,
+    JSON.stringify(dlViewerState),
+  );
+
+  // The reachable half: the dialog preview, whose 'edit' input is the open
+  // document. Covered by the same strip only because TABLE_SANITIZE_CONFIG
+  // aliases FORBID_ATTR by reference - the property the check above pins.
+  const dlPreviewState = await exec(`
+    (() => {
+      window.openTableInsertDialog(${JSON.stringify(dlProbeMd)}, 'edit');
+      const p = document.getElementById('tableInsertPreview');
+      const a = p
+        ? Array.from(p.querySelectorAll('a')).find(
+            x => x.textContent === 'DownloadProbe',
+          )
+        : null;
+      const out = {
+        found: !!p,
+        anchor: !!a,
+        href: a ? a.getAttribute('href') : null,
+        downloadAttrs: p ? p.querySelectorAll('[download]').length : -1,
+        tables: p ? p.querySelectorAll('table').length : -1,
+      };
+      // Inertness of the preview surface itself, independent of the attribute
+      // strip. A bubble-phase listener observes the SAME event the capture
+      // guard has already defaultPrevented. clickSeen is the control: it
+      // proves the click really was dispatched to the anchor, so
+      // clickPrevented cannot pass by the click silently not happening.
+      let seen = false;
+      let prevented = null;
+      const spy = (e) => { seen = true; prevented = e.defaultPrevented; };
+      if (p) p.addEventListener('click', spy);
+      if (a) a.click();
+      if (p) p.removeEventListener('click', spy);
+      out.clickSeen = seen;
+      out.clickPrevented = prevented;
+      // Same reset as the SEC-29 block above: closeTableInsertDialog() only
+      // drops the 'visible' class, so without this the attack markdown stays in
+      // the textarea and its render stays in the live preview, trapping
+      // whatever test is appended here next.
+      const ta = document.getElementById('tableInsertMarkdown');
+      if (ta) ta.value = '';
+      window.openTableInsertDialog(null, 'insert');
+      window.closeTableInsertDialog();
+      out.residualDownloadAttrs = p ? p.querySelectorAll('[download]').length : -1;
+      return out;
+    })()
+  `);
+  check(
+    "SEC-30 the download attribute is stripped in the table dialog preview",
+    dlPreviewState.found === true &&
+      dlPreviewState.anchor === true &&
+      dlPreviewState.href === "https://probe.invalid/dl" &&
+      dlPreviewState.downloadAttrs === 0 &&
+      dlPreviewState.tables === 1 &&
+      dlPreviewState.residualDownloadAttrs === 0,
+    JSON.stringify(dlPreviewState),
+  );
+  check(
+    "SEC-30 clicks in the table dialog preview are inert",
+    dlPreviewState.clickSeen === true && dlPreviewState.clickPrevented === true,
+    JSON.stringify(dlPreviewState),
+  );
+
+  // ==========================================================================
+  // N10 - the table dialog's validation error
+  //
+  // Three defects in one line. It was the last Turkish string in the product
+  // (the Turkish and Ukrainian locales, and the switcher between them, were
+  // removed earlier; this one survived because it never went through i18n(),
+  // so the locale sweep could not see it). It was assigned with innerHTML,
+  // into the very preview box SEC-30 had just hardened. And it hardcoded
+  // background:#ffe6e6, a light pink that is unreadable on the three dark
+  // themes, while every theme already defines --danger-fg/--danger-glow-rgb.
+  // ==========================================================================
+  const n10State = await exec(`
+    (() => {
+      const ta = document.getElementById('tableInsertMarkdown');
+      const p = document.getElementById('tableInsertPreview');
+      const btn = document.getElementById('tableInsertBtn');
+      const overlay = document.getElementById('tableInsertOverlay');
+      window.openTableInsertDialog(null, 'insert');
+      if (ta) ta.value = 'not a table, just prose';
+      // Driven through the real button, not the function, so the check also
+      // covers the listener being connected.
+      if (btn) btn.click();
+
+      const err = p ? p.querySelector('.table-insert-error') : null;
+      const out = {
+        found: !!p,
+        clicked: !!btn,
+        err: !!err,
+        // The dialog must STAY OPEN on invalid input. If validation stopped
+        // rejecting, insertTableFromDialog() would fall through, close the
+        // dialog and insert nothing - a silent failure this pins.
+        stillOpen: overlay ? overlay.classList.contains('visible') : null,
+        text: err ? err.textContent : null,
+        role: err ? err.getAttribute('role') : null,
+        // Shape and ordering: the error is the ONLY thing in the box and it is
+        // first. Deliberately NOT claimed as proof of node construction - an
+        // innerHTML assignment with no surrounding whitespace produces exactly
+        // one child node too, and would satisfy every conjunct here. That
+        // property is unobservable from the DOM and is pinned statically in
+        // test:packaging instead. What this does catch is a whitespace-padded
+        // assignment, or an append that leaves the previous render in place.
+        previewNodes: p ? p.childNodes.length : -1,
+        previewFirstIsErr: p ? p.firstChild === err : null,
+        errChildren: err ? err.children.length : -1,
+        inlineStyle: err ? err.getAttribute('style') : 'NO-ELEMENT',
+        // Full Turkish-specific set, upper and lower: the earlier version
+        // omitted c-cedilla, o- and u-umlaut and so could not have seen a
+        // partial reintroduction.
+        turkish: err
+          ? /[\\u011E\\u011F\\u0130\\u0131\\u015E\\u015F\\u00C7\\u00E7\\u00D6\\u00F6\\u00DC\\u00FC]/.test(
+              err.textContent,
+            )
+          : null,
+        fromTable: err ? err.textContent === i18n('table.invalidFormat') : null,
+      };
+
+      // Theming. Read the resolved colours under two different themes: the
+      // whole point of the change is that they track the theme rather than
+      // being frozen at one hardcoded red.
+      //
+      // try/finally, not straight-line: if a read throws, data-theme would
+      // otherwise be left on 'clarity' for every test appended after this one -
+      // the one leak the "do not trap the next test" reset below does not
+      // cover, because it only restores the dialog.
+      const themeBefore = document.body.getAttribute('data-theme');
+      const readColours = () => {
+        if (!err || !p) return null;
+        const cs = getComputedStyle(err);
+        return {
+          fg: cs.color,
+          // Non-vacuity control. If --danger-fg were misspelt, the declaration
+          // color: var(--typo) is invalid at computed-value time and the
+          // element INHERITS instead - and inherited text colour also differs
+          // between themes, so "fg differs across themes" alone would still
+          // pass. Pinning err's colour as distinct from its parent's catches
+          // that.
+          inherited: getComputedStyle(p).color,
+          // The ABSENCE of a fill is a deliberate, measured decision (see the
+          // rule's comment in styles.css) and nothing else observes it.
+          bg: cs.backgroundColor,
+          // Width and style, not colour. border-top-COLOR is useless here: its
+          // initial value is currentcolor, so if the border declaration were
+          // misspelt or deleted outright it still reports the element's color,
+          // which already differs between themes - the conjunct could only
+          // fail when the colour check had already failed.
+          //
+          // Width is read as a NUMBER and only pinned non-zero. The string is
+          // not "1px": getComputedStyle returns the used value, which Chromium
+          // snaps to device pixels, and this window reports 0.8px. Deletion
+          // still computes to 0 with style 'none', which is what this catches.
+          borderW: parseFloat(cs.borderTopWidth),
+          borderS: cs.borderTopStyle,
+        };
+      };
+      try {
+        document.body.setAttribute('data-theme', 'abyss');
+        out.abyss = readColours();
+        document.body.setAttribute('data-theme', 'clarity');
+        out.clarity = readColours();
+      } finally {
+        if (themeBefore === null) {
+          document.body.removeAttribute('data-theme');
+        } else {
+          document.body.setAttribute('data-theme', themeBefore);
+        }
+      }
+      out.themeRestored = document.body.getAttribute('data-theme') === themeBefore;
+
+      if (ta) ta.value = '';
+      window.openTableInsertDialog(null, 'insert');
+      window.closeTableInsertDialog();
+      return out;
+    })()
+  `);
+  check(
+    "N10 the table validation error is an English text node, not Turkish markup",
+    n10State.found === true &&
+      n10State.clicked === true &&
+      n10State.err === true &&
+      n10State.stillOpen === true &&
+      n10State.turkish === false &&
+      // Both halves are required. i18n() returns the KEY when the key is
+      // missing, so fromTable alone would still be true if the string were
+      // deleted - both sides would collapse to 'table.invalidFormat'. The
+      // literal pins the actual English text.
+      n10State.fromTable === true &&
+      n10State.text.includes("Invalid table format") &&
+      // The glyph survives neither revert on its own, so nothing else pins it.
+      n10State.text.startsWith("\u26A0") &&
+      n10State.role === "alert" &&
+      n10State.previewNodes === 1 &&
+      n10State.previewFirstIsErr === true &&
+      n10State.errChildren === 0 &&
+      n10State.inlineStyle === null,
+    JSON.stringify(n10State),
+  );
+  check(
+    "N10 the validation error is themed, and tracks the active theme",
+    n10State.abyss !== null &&
+      n10State.clarity !== null &&
+      // The colour it replaced, frozen at this value under every theme.
+      n10State.abyss.fg !== "rgb(255, 0, 0)" &&
+      n10State.clarity.fg !== "rgb(255, 0, 0)" &&
+      // The token really resolved, rather than the declaration being dropped
+      // and the element inheriting its parent's colour.
+      n10State.abyss.fg !== n10State.abyss.inherited &&
+      n10State.clarity.fg !== n10State.clarity.inherited &&
+      // No tinted fill, under either theme. This is what makes R457's
+      // background line load-bearing: without it, a regression that re-added a
+      // fill while keeping the themed colour would pass every other conjunct.
+      n10State.abyss.bg === "rgba(0, 0, 0, 0)" &&
+      n10State.clarity.bg === "rgba(0, 0, 0, 0)" &&
+      // The box outline survives at all - deletion is the realistic accident,
+      // and it is invisible to a colour comparison.
+      n10State.abyss.borderW > 0 &&
+      n10State.abyss.borderS === "solid" &&
+      n10State.abyss.fg !== n10State.clarity.fg &&
+      n10State.themeRestored === true,
+    JSON.stringify(n10State),
+  );
+
+  // ==========================================================================
+  // N12 - the markdown render-failure banner
+  //
+  // The tail catch of renderMarkdownFull() assigned viewer.innerHTML from a
+  // template literal interpolating ${error.message}, styled with a hardcoded
+  // color:red. Strictly worse than the N10 line above: marked and DOMPurify
+  // both quote document content back in their errors, so a document that
+  // fails to render could put markup of its own choosing into a Node-
+  // privileged renderer through the very handler written to report the
+  // failure. Now built from nodes, with the message as a text node, and
+  // themed through --danger-fg.
+  //
+  // The catch is not reachable from a document alone - every stage of the
+  // pipeline that can fail on hostile input is already guarded - so the
+  // failure has to be injected. That is a statement about the product, not a
+  // weakness in the test: a probe that waited for the app to reach this sink
+  // on its own would be permanently vacuous. Same reasoning as 13b2 in the
+  // mermaid suite.
+  // ==========================================================================
+
+  // The deliberate failure logs console.error('Error rendering markdown:', e).
+  // Muted narrowly, and the mute is asserted to have caught exactly that
+  // below - a mute that suppresses nothing has quietly stopped describing the
+  // test it was opened for.
+  await sentinel.mute("N12 forces the render pipeline to throw on purpose");
+
+  const n12Installed = await exec(`
+    (() => {
+      // renderer.js is a classic <script>, so its top-level function
+      // declarations are properties of window and the pipeline's own call
+      // site resolves through that global binding. Replacing it here really
+      // does make renderMarkdownFull's internal call throw.
+      //
+      // applyRawHtmlDocuments() is the throw site because it is called inside
+      // the try IMMEDIATELY AFTER patchViewerDOM(html) - so the viewer holds a
+      // fully rendered document when the throw lands, and the banner
+      // REPLACING that content is observable rather than merely appearing in
+      // an empty pane.
+      //
+      // Deliberately not marked.parse: marked 18's esbuild UMD makes every
+      // export a getter-only, non-configurable accessor, so assigning to it
+      // fails SILENTLY under sloppy mode and the throw would never happen.
+      window.__n12Saved = window.applyRawHtmlDocuments;
+      // Carries markup on purpose. If the message were ever interpolated into
+      // HTML again, these two elements would exist in the banner and the
+      // onerror handler would set __pwned.
+      window.__n12Msg = '<img src=x onerror="window.__pwned = 1"><b>bold</b>';
+      window.applyRawHtmlDocuments = function () {
+        throw new Error(window.__n12Msg);
+      };
+      return (
+        typeof window.__n12Saved === 'function' &&
+        window.applyRawHtmlDocuments !== window.__n12Saved
+      );
+    })()
+  `);
+
+  const n12Pwned = await render("# N12\n\nrender failure probe\n", "full", 700);
+
+  const n12State = await exec(`
+    (() => {
+      const viewer = document.getElementById('viewer');
+      const box = viewer.querySelector('.render-error');
+      const strong = box ? box.querySelector('strong') : null;
+      const overlay = document.getElementById('loadingScreen');
+      const out = {
+        box: !!box,
+        // The banner REPLACED the rendered document rather than being
+        // appended beside it, and it is the only thing left.
+        viewerNodes: viewer.childNodes.length,
+        viewerFirstIsBox: viewer.firstChild === box,
+        role: box ? box.getAttribute('role') : null,
+        label: strong ? strong.textContent : null,
+        // Both halves are required. i18n() returns the KEY on a miss, so the
+        // comparison alone would still hold if the string were deleted - both
+        // sides would collapse to 'render.failed'. The literal pins the text.
+        fromRender: strong
+          ? strong.textContent === i18n('render.failed')
+          : null,
+        text: box ? box.textContent : null,
+        // The message reaches the reader VERBATIM, markup and all, as text.
+        // Escaping is proven by the two conjuncts below rather than by this
+        // one: a correctly-escaped text node and an innerHTML assignment both
+        // put these characters on screen, but only the second creates
+        // elements out of them.
+        hasMessage: box ? box.textContent.indexOf(window.__n12Msg) >= 0 : null,
+        // Exactly <strong> and <br>. Anything the message spelled would show
+        // up here as a third element.
+        boxChildren: box ? box.children.length : -1,
+        injected: box ? box.querySelectorAll('img, b, script').length : -1,
+        inlineStyle: box ? box.getAttribute('style') : 'NO-ELEMENT',
+        // The catch is the last thing to run on this path, so it owns the
+        // full-screen click-blocking overlay. Leaving it up strands the whole
+        // UI behind a permanent "Loading..." - the defect already recorded on
+        // the superseded-render path.
+        overlayActive: overlay ? overlay.classList.contains('active') : null,
+      };
+
+      // Theming, read under two schemes. try/finally rather than straight
+      // line: a throw in a read would otherwise leave data-theme on 'clarity'
+      // for every test appended after this one.
+      const themeBefore = document.body.getAttribute('data-theme');
+      const readColours = () => {
+        if (!box) return null;
+        const cs = getComputedStyle(box);
+        return {
+          fg: cs.color,
+          // Non-vacuity control: a misspelt var() is invalid at
+          // computed-value time and the element INHERITS, and the inherited
+          // colour also differs between themes - so "fg differs across
+          // themes" alone would still pass. #viewer is the parent, and it is
+          // also the surface whose background this banner is measured
+          // against.
+          inherited: getComputedStyle(viewer).color,
+          // No fill, deliberately and measurably (see the rule's comment in
+          // styles.css). Nothing else observes the absence.
+          bg: cs.backgroundColor,
+          // Width and style, never border-top-COLOR: its initial value is
+          // currentcolor, so a deleted border declaration still reports the
+          // element's own colour and the conjunct could only fail once the
+          // colour check already had. Width is a NUMBER and only pinned
+          // non-zero - getComputedStyle returns the device-snapped used
+          // value, 0.8px on this display.
+          borderW: parseFloat(cs.borderTopWidth),
+          borderS: cs.borderTopStyle,
+        };
+      };
+      try {
+        document.body.setAttribute('data-theme', 'abyss');
+        out.abyss = readColours();
+        document.body.setAttribute('data-theme', 'clarity');
+        out.clarity = readColours();
+      } finally {
+        if (themeBefore === null) {
+          document.body.removeAttribute('data-theme');
+        } else {
+          document.body.setAttribute('data-theme', themeBefore);
+        }
+      }
+      out.themeRestored = document.body.getAttribute('data-theme') === themeBefore;
+      return out;
+    })()
+  `);
+
+  check(
+    "N12 a render failure reports as an escaped text node, not interpolated markup",
+    n12Installed === true &&
+      // The message spells an onerror handler. If it were ever interpolated
+      // into HTML the image would load, fail and run it.
+      n12Pwned === null &&
+      n12State.box === true &&
+      n12State.viewerNodes === 1 &&
+      n12State.viewerFirstIsBox === true &&
+      n12State.role === "alert" &&
+      n12State.fromRender === true &&
+      n12State.label === "Error rendering markdown:" &&
+      n12State.hasMessage === true &&
+      n12State.boxChildren === 2 &&
+      n12State.injected === 0 &&
+      n12State.inlineStyle === null &&
+      n12State.overlayActive === false,
+    JSON.stringify(n12State) + " installed=" + n12Installed + " pwned=" + n12Pwned,
+  );
+
+  check(
+    "N12 the render-failure banner is themed, and tracks the active theme",
+    n12State.abyss !== null &&
+      n12State.clarity !== null &&
+      // The colour it replaced, frozen at this value under every theme.
+      n12State.abyss.fg !== "rgb(255, 0, 0)" &&
+      n12State.clarity.fg !== "rgb(255, 0, 0)" &&
+      // The token really resolved, rather than the declaration being dropped
+      // and the element inheriting #viewer's colour.
+      n12State.abyss.fg !== n12State.abyss.inherited &&
+      n12State.clarity.fg !== n12State.clarity.inherited &&
+      n12State.abyss.bg === "rgba(0, 0, 0, 0)" &&
+      n12State.clarity.bg === "rgba(0, 0, 0, 0)" &&
+      n12State.abyss.borderW > 0 &&
+      n12State.abyss.borderS === "solid" &&
+      n12State.abyss.fg !== n12State.clarity.fg &&
+      n12State.themeRestored === true,
+    JSON.stringify(n12State),
+  );
+
+  // Uninstall, then prove it BEHAVIOURALLY by rendering again: a check that
+  // the saved slot is gone would pass for a restore that put back the wrong
+  // function. The banner disappearing is what says the pipeline is whole.
+  await exec(`
+    (() => {
+      if (typeof window.__n12Saved === 'function') {
+        window.applyRawHtmlDocuments = window.__n12Saved;
+      }
+      delete window.__n12Saved;
+      return null;
+    })()
+  `);
+  await render("# N12Restored\n\nthe pipeline is whole again\n", "full", 700);
+  const n12After = await exec(`
+    (() => {
+      const viewer = document.getElementById('viewer');
+      return {
+        banner: !!viewer.querySelector('.render-error'),
+        heading: !!viewer.querySelector('h1'),
+      };
+    })()
+  `);
+  check(
+    "N12 the injected failure is removed and the pipeline renders normally again",
+    n12After.banner === false && n12After.heading === true,
+    JSON.stringify(n12After),
+  );
+
+  // The mute has to have caught the console.error it was opened for. Drained
+  // first: console-message crosses an IPC boundary, so it does not arrive just
+  // because the awaited executeJavaScript resolved.
+  await sentinel.drain();
+  const n12Mute = sentinel.currentMute();
+  const n12Suppressed = (n12Mute && n12Mute.suppressed) || [];
+  check(
+    "N12 the deliberate render failure really reached the console (the mute is not vacuous)",
+    n12Suppressed.some(
+      (s) =>
+        s.kind === "console-error" && /Error rendering markdown/.test(s.detail),
+    ),
+    JSON.stringify(n12Suppressed).slice(0, 400),
+  );
+  await sentinel.unmute();
+
+  await render("# TableCleanup\n\nreset\n", "full", 600);
+
   // <map><area href> survives DOMPurify: an image map is a hyperlink that is
   // not an <a>. The renderer's click handler now matches it, so it obeys the
   // same external/local policy as every other link instead of falling through
@@ -1851,6 +3571,19 @@ async function run(win) {
     null;
   `);
   const urlBeforeArea = win.webContents.getURL();
+  // A synthetic .click() is a faithful stand-in for a real pointer HERE, and
+  // that was MEASURED rather than assumed - the question "does this assertion
+  // validate real image-map input, or only a hand-dispatched event?" is exactly
+  // the shape that has produced vacuous passes elsewhere in this project.
+  // Probed with a trusted CDP Input.dispatchMouseEvent at a point proven by
+  // elementFromPoint to be topmost-AREA, with a plain <a> as a positive control:
+  // the delivered event had target=AREA and isTrusted=true, closest('a, area')
+  // found the AREA, shell.openExternal received https://probe.invalid/area and
+  // the top frame did not move - i.e. byte-identical routing to the line below.
+  // Chromium hit-tests the <area>, not the <img>; the app's image pop-out
+  // overlay (button.img-zoom-btn) occludes only the centre band of the image,
+  // which is why the aim point matters and why the first probe run measured the
+  // overlay and reported a convincing false negative.
   await exec(`document.querySelector('#viewer area').click(); null`);
   await sleep(700);
   const urlAfterArea = win.webContents.getURL();
@@ -2434,12 +4167,7 @@ app.whenReady().then(async () => {
     return;
   }
 
-  await win.webContents.executeJavaScript(`
-    window.__e2eErrors = [];
-    window.addEventListener('error', e => window.__e2eErrors.push(String(e.message)));
-    window.addEventListener('unhandledrejection', e => window.__e2eErrors.push(String(e.reason)));
-    null;
-  `);
+  await win.webContents.executeJavaScript(E2E_SENTINEL);
 
   try {
     await run(win);
@@ -2458,7 +4186,7 @@ app.whenReady().then(async () => {
       (skipped.length ? `  (${skipped.length} skipped: ${skipped.join(", ")})` : ""),
   );
   try {
-    fs.rmSync(dir, { recursive: true, force: true });
+    require("./test-visual-utils").releaseTempDir(dir);
   } catch (e) {
     /* ignore */
   }

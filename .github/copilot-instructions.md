@@ -76,23 +76,23 @@ changed and why, so an upstream merge does not silently undo it), `docs/BUILD.md
 
 ```bash
 npm start                 # run the app
-npm test                  # everything. ~9 minutes. 12 suites, ~1290 assertions
+npm test                  # everything. ~11 minutes. 13 suites, ~1850 assertions
 npm run test:tabs         # the fork's core loop - run this for any tab/refresh change
 npm run test:packaging    # node, not electron. Fast. Identity, licences, asar contents
 npm run test:corpus       # node --check on bench sources, then bench/verify.js (~1s, 315 checks)
 npm run bench             # electron bench/run.js. ~8 min. --profiles= --sizes= --reps=
 node scripts/prove-table-fixes.js R229 R234   # prove specific fixes are load-bearing
-node scripts/prove-table-fixes.js --anchors  # ~1s dry run: do all 191 anchors still resolve?
+node scripts/prove-table-fixes.js --anchors  # ~1s dry run: do all 458 anchors still resolve?
 npm run build-all         # electron-builder, Windows portable + NSIS
 ```
 
 **Run `--anchors` after ANY rename, move or reformat.** Each revert works by
 string-replacing an anchor it expects to find in a source file; a full run takes
 hours, so a rotted anchor is otherwise discovered far too late. The dry run does
-the string half of all 191 setups and runs no suite. It has caught three proofs
+the string half of all 458 setups and runs no suite. It has caught three proofs
 that had silently stopped proving anything — one of them dead for weeks, because
 a rename reformatted a JSON block the anchor quoted on a single line. Its summary
-deliberately refuses to imply proof: *"ALL 191 ANCHORS RESOLVE - nothing is
+deliberately refuses to imply proof: *"ALL 458 ANCHORS RESOLVE - nothing is
 proven; run without --anchors for that."*
 
 **Anchor rot is the one failure this project cannot detect by testing.** A rotted
@@ -141,15 +141,15 @@ is vacuous until proven otherwise.
 
 ### 1. Every fix gets a revert
 
-`scripts/prove-table-fixes.js` currently holds **184 reverts (R49-R235)** across
-all 10 suites. Each one undoes a real fix in the source, runs the suite that is
+`scripts/prove-table-fixes.js` currently holds **458 reverts** across
+11 suites. Each one undoes a real fix in the source, runs the suite that is
 supposed to notice, and requires:
 
 - `expect` — the assertions that **must fail** when the fix is undone. If the
   suite stays green, the test is decorative and the fix is unprotected.
 - `mustPass` — assertions that **must keep passing**, so a revert that fails
   everything (a syntax error, a crashed app) cannot be mistaken for a real
-  detection. There are 102 of these.
+  detection. There are 276 of these.
 
 A fix without a revert is not finished. If you cannot write a revert that turns
 the suite red, you have not tested the fix — you have tested that the app still
@@ -200,7 +200,7 @@ These have each cost real time. They are not hypothetical.
 `dialog.showMessageBoxSync` blocks the main process itself, so a renderer stub,
 an `executeJavaScript` timeout and an in-process watchdog are all equally
 useless — the process that would run the rescue is the process that is blocked.
-The measured instance: **eight** suites `require("../src/main.js")`, so in all
+The measured instance: **nine** suites `require("../src/main.js")`, so in all
 of them `ipcMain "confirm-large-render"` is registered and a real window opens.
 They all used to share ONE persistent profile, so `test-tab-refresh.js`'s own
 260 KB `guard-big.md` fixture — persisted by `saveTabs()` the instant its tab is
@@ -221,11 +221,14 @@ finished **7/7 in 8s**.
   poison its own next run. R238 pins the wipe; it deliberately does *not*
   revert the redirect, because that would reintroduce the hang and a harness
   that hangs reports a timeout, not a verdict.
-- Coverage is enforced in `test:packaging`, because a *thirteenth* suite added
-  later is exactly what a per-suite assertion cannot see.
-- **My own grep said one suite, not eight, and that changed the diagnosis.**
+- Coverage is enforced in `test:packaging`, because an *eleventh* suite added
+  later is exactly what a per-suite assertion cannot see. The floor there is the
+  measured subject-set size (10 Electron suites), not a round number below it.
+- **My own grep said one suite, not nine, and that changed the diagnosis.**
   It was exposed only by a failing run. A negative grep result deserves a
-  positive control.
+  positive control. (It bit again while writing this: the isolation helper is
+  required *without* a `.js` extension, so an extension-bearing pattern reported
+  zero of the eleven files that carry it.)
 - This was the **fourth** instance of suites measuring inherited session state
   (window bounds, splitter ratio, an `mdv-probe` temp dir resolving a relative
   `<img>`). Prefer fixing the class.

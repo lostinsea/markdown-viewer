@@ -304,6 +304,312 @@ app.whenReady().then(async () => {
       otherWrong === 0,
       `unrecognised frames: ${observed.join(",")}`,
     );
+
+    // ---------------------------------------------------------------------
+    // The exit-time temp-dir sweep.
+    //
+    // The claim being defended is "a registered temp dir is gone after the
+    // suite ends, whichever exit path it takes" - and the exit path that
+    // matters is app.exit(), which unwinds nothing (probe C in
+    // test-visual-utils.js), so a try/finally cannot do this and the whole
+    // registry exists for that reason.
+    //
+    // "No temp dirs remain" is an ABSENCE check and fails open, so the
+    // mechanics below are asserted positively - the directory must be
+    // observed to EXIST and to be REGISTERED before anything claims it was
+    // removed.
+    const fsx = require("fs");
+    const pathx = require("path");
+    const osx = require("os");
+    const { spawnSync } = require("child_process");
+    const {
+      tempDir,
+      releaseTempDir,
+      sweepTempDirs,
+      TEMP_SWEEP,
+      REGISTERED_TEMP_DIRS,
+    } = require("./test-visual-utils");
+
+    const madeDir = tempDir("mdv-selfcheck-");
+    expect(
+      "tempDir creates the directory and registers it for the exit sweep",
+      fsx.existsSync(madeDir) &&
+        REGISTERED_TEMP_DIRS.has(madeDir) &&
+        pathx.basename(madeDir).startsWith("mdv-selfcheck-") &&
+        pathx.resolve(pathx.dirname(madeDir)) === pathx.resolve(osx.tmpdir()),
+      `dir=${madeDir} exists=${fsx.existsSync(madeDir)} registered=${REGISTERED_TEMP_DIRS.has(madeDir)}`,
+    );
+
+    releaseTempDir(madeDir);
+    expect(
+      "releaseTempDir removes the directory and de-registers it",
+      !fsx.existsSync(madeDir) && !REGISTERED_TEMP_DIRS.has(madeDir),
+      `exists=${fsx.existsSync(madeDir)} registered=${REGISTERED_TEMP_DIRS.has(madeDir)}`,
+    );
+
+    // The positive control for TEMP_SWEEP: without it, every assertion about
+    // the sweep is satisfied by a sweep that never ran. The tree is nested and
+    // non-empty on purpose - the claim is a RECURSIVE removal, and an empty
+    // rmdir would pass a shallower test.
+    const sweptDir = tempDir("mdv-selfcheck-sweep-");
+    fsx.mkdirSync(pathx.join(sweptDir, "a", "b"), { recursive: true });
+    fsx.writeFileSync(pathx.join(sweptDir, "a", "b", "f.bin"), Buffer.alloc(65536));
+    const sweptBefore = TEMP_SWEEP.swept;
+    sweepTempDirs();
+    expect(
+      "the sweep removes a registered tree and reports the work it did",
+      TEMP_SWEEP.ran === true &&
+        TEMP_SWEEP.swept === sweptBefore + 1 &&
+        TEMP_SWEEP.failed.length === 0 &&
+        !fsx.existsSync(sweptDir) &&
+        !REGISTERED_TEMP_DIRS.has(sweptDir),
+      `ran=${TEMP_SWEEP.ran} swept=${sweptBefore}->${TEMP_SWEEP.swept} ` +
+        `failed=${JSON.stringify(TEMP_SWEEP.failed)} exists=${fsx.existsSync(sweptDir)}`,
+    );
+
+    // ---------------------------------------------------------------------
+    // The end-to-end half, which cannot be observed in-process: this suite is
+    // still running, so its own exit sweep has not happened yet, and the one
+    // above was called by hand. A CHILD Electron process that ends the way
+    // every windowed suite ends - app.exit() - is the only way to measure
+    // that the sweep really fires on that path. This makes probes A and B from
+    // test-visual-utils.js permanent instead of one-off.
+    //
+    // THE CHILD REGISTERS TWO EXIT HANDLERS AND THE ORDER IS THE WHOLE POINT.
+    // Two independent mechanisms remove the directory - the app.exit wrapper
+    // and the process.on("exit") hook - so "the dir is gone" is a DISJUNCTION
+    // and cannot say which one did the work. Handlers run in registration
+    // order, so a handler registered BEFORE the utils require runs before the
+    // hook's sweep: if it already sees TEMP_SWEEP.ran, the wrapper did it.
+    const childHome = tempDir("mdv-selfcheck-child-");
+    // Stable basename: test-userdata-isolation derives the child's profile
+    // directory from the script name, so a randomised name would leak a fresh
+    // profile under folia-test-userdata on every run - the same class of leak
+    // this section exists to close.
+    const childScript = pathx.join(childHome, "folia-temp-sweep-child.js");
+    const childReport = pathx.join(childHome, "report.json");
+    // NOTE FOR EDITORS: assembled line by line rather than as a template
+    // literal. A backtick or a dollar-brace inside a nested literal terminates
+    // the outer one, which has bitten this project repeatedly.
+    fsx.writeFileSync(
+      childScript,
+      [
+        'const fs = require("fs");',
+        'const path = require("path");',
+        "const report = process.argv[process.argv.length - 1];",
+        "let utils = null;",
+        "let kept = null;",
+        "let released = null;",
+        "let early = null;",
+        "// Registered BEFORE the utils require, so it runs BEFORE the",
+        "// registry's own sweep hook: what it sees is the wrapper's work.",
+        'process.on("exit", () => {',
+        "  const s = utils && utils.TEMP_SWEEP;",
+        "  early = {",
+        "    ran: !!(s && s.ran),",
+        "    swept: s ? s.swept : -1,",
+        "    keptGone: !!(kept && !fs.existsSync(kept)),",
+        "  };",
+        "});",
+        'const { app } = require("electron");',
+        "utils = require(" +
+          JSON.stringify(pathx.join(__dirname, "test-visual-utils.js")) +
+          ");",
+        "// Registered AFTER the require, so it runs AFTER the hook's sweep and",
+        "// reports the final state whichever mechanism did the work.",
+        'process.on("exit", () => {',
+        "  try {",
+        "    fs.writeFileSync(",
+        "      report,",
+        "      JSON.stringify({",
+        "        kept: kept,",
+        "        released: released,",
+        "        early: early,",
+        "        sweep: utils.TEMP_SWEEP,",
+        "        keptGone: !fs.existsSync(kept),",
+        "        releasedGone: !fs.existsSync(released),",
+        "      }),",
+        "    );",
+        "  } catch (e) {",
+        "    /* the parent treats a missing report as a failure */",
+        "  }",
+        "});",
+        "app.whenReady().then(() => {",
+        '  kept = utils.tempDir("mdv-sweepchild-keep-");',
+        '  released = utils.tempDir("mdv-sweepchild-rel-");',
+        '  fs.mkdirSync(path.join(kept, "a", "b"), { recursive: true });',
+        '  fs.writeFileSync(path.join(kept, "a", "b", "f.bin"), Buffer.alloc(65536));',
+        "  utils.releaseTempDir(released);",
+        "  // setImmediate, not a bare app.exit(): a bare call stays inside the",
+        "  // ready event's own dispatch, where exit handlers do not run at all",
+        "  // (measured 0/5) and where Electron's teardown intermittently faults",
+        "  // with 0xC0000005. This is the shape every real windowed suite has.",
+        "  setImmediate(() => app.exit(0));",
+        "});",
+        "",
+      ].join("\n"),
+    );
+
+    const childEnv = Object.assign({}, process.env);
+    // Would turn the Electron binary into a plain node, so app would be
+    // undefined and the child could not exercise the app.exit() path at all.
+    delete childEnv.ELECTRON_RUN_AS_NODE;
+    const child = spawnSync(process.execPath, [childScript, childReport], {
+      env: childEnv,
+      encoding: "utf8",
+      timeout: 60000,
+      windowsHide: true,
+    });
+
+    let childReported = null;
+    try {
+      childReported = JSON.parse(fsx.readFileSync(childReport, "utf8"));
+    } catch (e) {
+      childReported = null;
+    }
+    // Vacuity guard: every assertion below is about what the child observed,
+    // so a child that never ran would leave them all unfalsifiable.
+    expect(
+      "the child suite really ran to its exit handler and reported back",
+      child.status === 0 &&
+        childReported !== null &&
+        childReported.sweep &&
+        childReported.sweep.ran === true &&
+        typeof childReported.kept === "string",
+      `status=${child.status} report=${JSON.stringify(childReported)} ` +
+        `stderr=${String(child.stderr || "").slice(-400)}`,
+    );
+
+    const keptPath = childReported && childReported.kept;
+    expect(
+      "a registered temp dir is removed even when the suite ends with app.exit()",
+      !!keptPath &&
+        childReported.keptGone === true &&
+        !fsx.existsSync(keptPath) &&
+        childReported.sweep.failed.length === 0,
+      `kept=${keptPath} childSaw=${childReported && childReported.keptGone} ` +
+        `stillOnDisk=${keptPath ? fsx.existsSync(keptPath) : "n/a"} ` +
+        `failed=${JSON.stringify(childReported && childReported.sweep && childReported.sweep.failed)}`,
+    );
+
+    // The counter is what stops "the sweep ran" being satisfied by a sweep
+    // that found nothing, and it also pins that an early release does not get
+    // counted as work the exit sweep did.
+    expect(
+      "the exit sweep counts exactly the dirs still registered when it runs",
+      !!childReported &&
+        childReported.sweep.swept === 1 &&
+        childReported.releasedGone === true &&
+        !fsx.existsSync(childReported.released),
+      `swept=${childReported && childReported.sweep && childReported.sweep.swept} ` +
+        `releasedGone=${childReported && childReported.releasedGone}`,
+    );
+
+    // THE CAUSE, ASSERTED SEPARATELY FROM THE CONSEQUENCE. The two assertions
+    // above are satisfied by EITHER mechanism, so on their own they say only
+    // "something cleaned up". This one reads the snapshot taken by the child's
+    // FIRST exit handler - registered before the utils require, so it runs
+    // before the registry's own hook - and requires the work to be already
+    // done at that instant. Nothing but the app.exit wrapper can have done it.
+    // It is also the only assertion here that covers a suite whose app.exit()
+    // is reached inside the ready event's own dispatch, where the hook is
+    // measured not to run at all.
+    const early = childReported && childReported.early;
+    expect(
+      "the sweep runs inside app.exit(), before any process exit handler",
+      !!early &&
+        early.ran === true &&
+        early.swept === 1 &&
+        early.keptGone === true,
+      `early=${JSON.stringify(early)}`,
+    );
+
+    // ---------------------------------------------------------------------
+    // THE OTHER TIER, AND THE ONLY PATH THE WRAPPER STRUCTURALLY CANNOT
+    // COVER. Everything above ends with app.exit(), so with the wrapper live
+    // the hook is never the mechanism that does the work - neutralising it
+    // would leave every assertion above green, i.e. the hook would be pinned
+    // by nothing. A plain-node child (ELECTRON_RUN_AS_NODE=1, no window, no
+    // app.exit - it just returns from its main module) has no app to wrap, so
+    // the hook is the only thing that can clean up after it. Its report writer
+    // is registered AFTER the utils require on purpose, the mirror image of
+    // the discriminator above: here the hook must have run FIRST.
+    const nodeHome = tempDir("mdv-selfcheck-node-");
+    const nodeScript = pathx.join(nodeHome, "folia-temp-sweep-node.js");
+    const nodeReport = pathx.join(nodeHome, "report.json");
+    // NOTE FOR EDITORS: no backtick and no dollar-brace inside this array.
+    fsx.writeFileSync(
+      nodeScript,
+      [
+        'const fs = require("fs");',
+        'const path = require("path");',
+        "const report = process.argv[process.argv.length - 1];",
+        "const utils = require(" +
+          JSON.stringify(pathx.join(__dirname, "test-visual-utils.js")) +
+          ");",
+        'const kept = utils.tempDir("mdv-sweepnode-keep-");',
+        'fs.mkdirSync(path.join(kept, "a"), { recursive: true });',
+        'fs.writeFileSync(path.join(kept, "a", "f.bin"), Buffer.alloc(4096));',
+        "// Registered AFTER the require, so the registry's own hook has already",
+        "// swept by the time this runs: what it reports is the hook's work.",
+        'process.on("exit", () => {',
+        "  try {",
+        "    fs.writeFileSync(",
+        "      report,",
+        "      JSON.stringify({",
+        "        kept: kept,",
+        "        sweep: utils.TEMP_SWEEP,",
+        "        keptGone: !fs.existsSync(kept),",
+        "      }),",
+        "    );",
+        "  } catch (e) {",
+        "    /* the parent treats a missing report as a failure */",
+        "  }",
+        "});",
+        "// No app.exit() and no explicit process.exit(): this tier ends by",
+        "// returning from its main module, which is the whole point.",
+        "",
+      ].join("\n"),
+    );
+
+    const nodeEnv = Object.assign({}, process.env);
+    nodeEnv.ELECTRON_RUN_AS_NODE = "1";
+    const nodeChild = spawnSync(process.execPath, [nodeScript, nodeReport], {
+      env: nodeEnv,
+      encoding: "utf8",
+      timeout: 60000,
+      windowsHide: true,
+    });
+
+    let nodeReported = null;
+    try {
+      nodeReported = JSON.parse(fsx.readFileSync(nodeReport, "utf8"));
+    } catch (e) {
+      nodeReported = null;
+    }
+    expect(
+      "the plain-node child really ran and reported back",
+      nodeChild.status === 0 &&
+        nodeReported !== null &&
+        typeof nodeReported.kept === "string",
+      `status=${nodeChild.status} report=${JSON.stringify(nodeReported)} ` +
+        `stderr=${String(nodeChild.stderr || "").slice(-400)}`,
+    );
+    expect(
+      "the process exit hook sweeps a plain-node run that never calls app.exit",
+      !!nodeReported &&
+        nodeReported.sweep &&
+        nodeReported.sweep.ran === true &&
+        nodeReported.sweep.swept === 1 &&
+        nodeReported.keptGone === true &&
+        !fsx.existsSync(nodeReported.kept),
+      `sweep=${JSON.stringify(nodeReported && nodeReported.sweep)} ` +
+        `keptGone=${nodeReported && nodeReported.keptGone} ` +
+        `stillOnDisk=${nodeReported && nodeReported.kept ? fsx.existsSync(nodeReported.kept) : "n/a"}`,
+    );
+
+    releaseTempDir(nodeHome);
+    releaseTempDir(childHome);
   } catch (e) {
     expect("selfcheck ran without throwing", false, String(e && e.stack));
   }

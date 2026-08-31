@@ -18,6 +18,10 @@ npm install
 
 This will install all required packages including electron-builder.
 
+If it fails while downloading Electron itself, see
+"Building behind a restrictive network" below — that step reaches
+`github.com` directly and is the first thing a filtered network blocks.
+
 ### 2. Build Standalone EXE
 
 To create a **portable .exe** file (no installation required):
@@ -72,6 +76,71 @@ The portable .exe file can be:
 - ✅ Shared with colleagues
 - ✅ Run from network drive
 
+## Building behind a restrictive network
+
+Nothing in this section is needed on a normal connection, and none of it applies
+to the GitHub-hosted release runners — they reach `github.com` directly. It
+matters for a clone on a corporate network where outbound egress is filtered.
+
+**There are three independent downloads, with three separate switches.** They
+fail one at a time, so fixing one does not fix the next.
+
+### 1. The npm registry — `npm install` resolving packages
+
+Controlled by `.npmrc` (`registry=...`). Note that this repo's committed
+`package-lock.json` already pins every `resolved` URL to a public Microsoft
+mirror rather than to `registry.npmjs.org`; it is publicly fetchable without
+auth, and the release workflow installs through it on all three runner OSes.
+
+### 2. The Electron binary — electron's `postinstall`
+
+`npm install` runs `node_modules/electron/install.js`, which fetches a ~100 MB
+zip through `@electron/get`. The URL is assembled as `<base><dir>/<file>`:
+
+```
+https://github.com/electron/electron/releases/download/  v43.4.1/  electron-v43.4.1-win32-x64.zip
+                       ELECTRON_MIRROR                ELECTRON_CUSTOM_DIR
+```
+
+```powershell
+$env:ELECTRON_MIRROR = "https://<host>/electron/"   # trailing slash required
+npm install
+```
+
+- **`ELECTRON_CUSTOM_DIR` is the one that catches people out.** The directory
+  segment defaults to the version *with* its leading `v` (`v43.4.1`). Most
+  mirrors lay the files out without it, so they also need
+  `$env:ELECTRON_CUSTOM_DIR = "{{ version }}"` — the placeholder is substituted
+  with the bare version.
+- **The mirror only has to serve the zip.** Checksums are read from the local
+  `node_modules/electron/checksums.json`, so no `SHASUMS256.txt` is required
+  unless you set `electron_use_remote_checksums`.
+- **A populated cache means no network at all.** Downloads are cached in
+  `%LOCALAPPDATA%\electron\Cache` (override with `electron_config_cache`), and
+  `install.js` exits immediately when `node_modules/electron/dist/version`
+  already matches. Copying that cache in from a machine that can reach GitHub is
+  a valid unblock on its own.
+
+### 3. The electron-builder toolset — `npm run build`
+
+Packaging fetches its own tools (NSIS, `winCodeSign`) from a *different*
+release repo, and **`ELECTRON_MIRROR` deliberately cannot redirect them** —
+electron-builder pins those URLs before `@electron/get` reads the environment.
+Use the separate variable:
+
+```powershell
+$env:ELECTRON_BUILDER_BINARIES_MIRROR = "https://<host>/electron-builder-binaries/"
+npm run build
+```
+
+Cached under `%LOCALAPPDATA%\electron-builder\Cache` (override with
+`ELECTRON_BUILDER_CACHE`), so this is a first-build-only cost.
+
+Do **not** reach for `electronDownload.strictSSL: false` to get past a
+TLS-intercepting proxy. It disables certificate validation for every Electron
+and tool download; electron-builder itself logs a warning saying so. Install the
+proxy's CA into the trust store instead.
+
 ## Troubleshooting
 
 **Build fails?**
@@ -94,6 +163,22 @@ The portable .exe file can be:
 **Antivirus blocks exe?**
 - This is normal for unsigned executables
 - Add exception or sign the executable with a code signing certificate
+
+**Need developer tools in an installed build?**
+- `F12` opens them only when Folia runs from source. In a packaged build the
+  toggle is gated, because the renderer runs with `nodeIntegration: true` and so
+  the console is a Node REPL with the user's full filesystem rights — a shipped
+  build should not hand that to whoever is at the keyboard on one keystroke.
+- Start the installed app with `FOLIA_DEVTOOLS=1` in the environment to re-enable
+  it: `$env:FOLIA_DEVTOOLS="1"; & "$env:LOCALAPPDATA\Programs\Folia\Folia.exe"`.
+- Electron's default application menu is removed at startup as well. It is never
+  displayed — every window already calls `setMenu(null)` — but its `View` submenu
+  binds Toggle Developer Tools to `Ctrl+Shift+I`, which was measured to work on a
+  window that omits that call. `test-render-security.js` asserts no application
+  menu survives startup, and `test-packaging.js` asserts the `F12` gate.
+- Both are interim controls. The durable fix is SEC-08 (`contextIsolation` plus a
+  preload bridge), after which a console in the renderer is no longer a console
+  in Node.
 
 ## Code Signing (Optional)
 
@@ -135,7 +220,7 @@ warnings:
 `build.publish` targets this fork's own GitHub releases:
 
 ```json
-"publish": [{ "provider": "github", "owner": "lostinsea", "repo": "markdown-viewer" }]
+"publish": [{ "provider": "github", "owner": "lostinsea", "repo": "folia" }]
 ```
 
 electron-builder therefore writes `app-update.yml` into the package and emits
