@@ -12659,6 +12659,423 @@ const REVERTS = [
             /^the built app\.asar can be inspected$/,
           ],
         },
+        {
+          id: "R524",
+          // F25. renderLightFormat() skipped parseEmojis() entirely while
+          // renderMarkdownFull() called it, so the SAME text rendered two
+          // different ways depending only on which path detectRenderMode()
+          // happened to pick: :star: stayed literal while editing and became a
+          // star the moment some later edit took the full path.
+          //
+          // The fix is one line, placed at the SAME point in the pipeline as
+          // the full path's call - after removeBOM, before any block is lifted
+          // into a placeholder. Position is load-bearing, not cosmetic: moving
+          // it after extraction would leave the two paths disagreeing again,
+          // merely in the other direction. Reverting the line is therefore the
+          // whole revert.
+          what: "drop parseEmojis() from the light render path, so emoji resolve on one path only",
+          file: RENDERER,
+          from:
+            "  content = parseEmojis(content);\n\n  // Extract and placeholder special blocks (same as full render)",
+          to: "  // Extract and placeholder special blocks (same as full render)",
+          suite: "test:patch",
+          expect: [
+            // The light path stops resolving shortcodes at all.
+            /^\[light-format\] emoji shortcodes resolve$/,
+            // And the divergence assertion is the one that actually encodes the
+            // bug: the paths disagreeing is the defect, not either path's
+            // absolute behaviour.
+            /^the two render paths agree on emoji, so an edit cannot flip them$/,
+          ],
+          mustPass: [
+            // The full path is untouched, so its assertion staying green is
+            // what proves this revert is targeted rather than breaking emoji
+            // everywhere - without it, a change that deleted parseEmojis
+            // outright would look identical.
+            /^\[full\] emoji shortcodes resolve$/,
+            // The two-sided oracle control must survive the revert. If an
+            // unknown shortcode stopped surviving, the assertions above would
+            // be reading something other than selective emoji substitution and
+            // the whole record would be measuring the wrong thing.
+            /^an unknown shortcode survives verbatim on both paths \(oracle control\)$/,
+          ],
+        },
+        {
+          id: "R525",
+          // F23, the NARROWING half. Before the fix the arrow-key handler
+          // called preventDefault() unconditionally, i.e. it swallowed the key
+          // whether or not there was anywhere to navigate to. This revert
+          // restores exactly that, and NOTHING else - navigateBack/Forward keep
+          // their boolean return and their unsaved-work guard - so the failure
+          // is attributable to the narrowing alone.
+          //
+          // MEASURED (trusted CDP key, since a synthetic dispatchEvent cannot
+          // drive a default action and would have reported a clean zero either
+          // way): from BODY, where focus rests in the shipped product, an arrow
+          // key scrolls 0, so this revert costs a reader nothing TODAY. Give a
+          // scroller focus - which is what an accessibility fix adds - and it
+          // costs 240px inside a focused `pre.language-js` and 200px inside a
+          // focused .content-wrapper. That is why the property is pinned rather
+          // than left as a comment: the harm is latent, so the day it activates
+          // is not the day this code is being looked at.
+          what: "swallow the arrow key even when there is nowhere to navigate, as it did before F23",
+          file: RENDERER,
+          from:
+            "  if (e.key === 'ArrowLeft') {\n    if (navigateBack()) e.preventDefault();\n  } else if (e.key === 'ArrowRight') {\n    if (navigateForward()) e.preventDefault();\n  }",
+          to: "  if (e.key === 'ArrowLeft') {\n    e.preventDefault();\n    navigateBack();\n  } else if (e.key === 'ArrowRight') {\n    e.preventDefault();\n    navigateForward();\n  }",
+          suite: "test:patch",
+          expect: [
+            // The ONLY assertion that can see this. Deliberately named apart
+            // from "the arrow keys really are bound" so that a revert of the
+            // narrowing and a revert of the binding produce different verdicts
+            // rather than one indistinguishable failure.
+            /^an arrow key at the end of the history is left alone, not swallowed$/,
+            // HONEST CONSEQUENCE, named rather than left unlisted. The
+            // declined-prompt assertion also requires the key NOT to be
+            // swallowed - declining to discard your work should not cost you
+            // the keystroke either - so an unconditional preventDefault()
+            // legitimately breaks it too. It is a second, independent witness
+            // to the same narrowing, measured through a different code path
+            // (navigateBack returning false at the confirm rather than at the
+            // bounds check).
+            /^arrow-key navigation asks before discarding unsaved work, and declining stops it$/,
+          ],
+          mustPass: [
+            // The positive control. Without it, "not swallowed" would be just
+            // as satisfied by a handler that had stopped running altogether -
+            // the recorded "an absence check fails open" disease.
+            /^the arrow keys really are bound: a possible navigation is consumed and sent$/,
+            // The guard itself is a separate property and this edit does not
+            // touch it: the prompt must still be raised and must still stop the
+            // navigation. Pairing this with the widened expect above is what
+            // separates "the key was swallowed" from "the guard was lost".
+            /^accepting the unsaved-work prompt lets the arrow-key navigation through$/,
+            /^an arrow key typed into a textarea is never hijacked by file navigation$/,
+          ],
+        },
+        {
+          id: "R526",
+          // F23, the GUARD half. navigateBack/navigateForward send
+          // `open-file-path`, which replaces the document outright. Every other
+          // route to that channel asks hasUnsavedWork() first (the drag-drop
+          // handler at renderer.js is the idiom this copied); these two did
+          // not, so a back/forward silently discarded unsaved bytes.
+          //
+          // Only navigateBack is reverted, not both. The two functions are
+          // byte-identical in this respect, so breaking one is sufficient to
+          // prove the property while leaving navigateForward as a live control
+          // that the probe's send-recording oracle still works at all.
+          what: "let arrow-key back navigation discard unsaved work without asking",
+          file: RENDERER,
+          from:
+            "  if (navigationIndex <= 0) return false;\n  if (hasUnsavedWork() && !confirm(i18n('confirm.unsavedOpen'))) return false;",
+          to: "  if (navigationIndex <= 0) return false;",
+          suite: "test:patch",
+          expect: [
+            // Both halves of the guard live in one assertion because they are
+            // one behaviour: with the guard gone the prompt is never raised
+            // (asked 0) AND the navigation goes through anyway (sends 1).
+            /^arrow-key navigation asks before discarding unsaved work, and declining stops it$/,
+            // HONEST CONSEQUENCE, named rather than left unlisted. Its partner
+            // assertion requires the prompt to have been RAISED (asked === 1)
+            // before the navigation went through; with no guard at all nothing
+            // asks, so it fails for the same single reason. The pair is
+            // deliberately two-sided - one leg proves declining stops the
+            // navigation, the other that accepting does not - so a revert that
+            // removes the prompt entirely has to break both, while a revert
+            // that merely inverted the confirm's sense would break only one.
+            /^accepting the unsaved-work prompt lets the arrow-key navigation through$/,
+          ],
+          mustPass: [
+            // The narrowing is a separate property and this edit does not touch
+            // it, so it must survive - that is what makes R525 and R526 proofs
+            // about their own half rather than two ways of breaking F23.
+            /^an arrow key at the end of the history is left alone, not swallowed$/,
+            /^the arrow keys really are bound: a possible navigation is consumed and sent$/,
+          ],
+        },
+        {
+          id: "R527",
+          // N18, the LIGHT half. DOMPurify 3.4.14 deletes any attribute whose
+          // DECODED value matches /((--!?|])>)|<\/(style|title)/i, and "-->" is
+          // the canonical mermaid flowchart arrow, so `data-mermaid-src` was
+          // stripped from essentially every real diagram. No HTML-level
+          // escaping avoids it (escapeHtml writes `--&gt;`, the parser decodes,
+          // the guard inspects the decoded value), which is why the repair has
+          // to run AFTER sanitization rather than being expressed as config.
+          //
+          // Only the light path's call is removed. The two paths are reverted
+          // separately because they carried the attribute by DIFFERENT
+          // mechanisms before this fix - the full path was repairing it by
+          // accident inside the mermaid.run set-up, the light path had nothing
+          // at all - so a single revert of both would not distinguish "the
+          // helper is load-bearing" from "the accident still covers it".
+          what: "stop restoring the mermaid source attribute on the light-format path",
+          file: RENDERER,
+          from:
+            "  if (generation !== renderGeneration) return;\n\n  patchViewerDOM(html);\n  restoreMermaidSourceAttributes();",
+          to: "  if (generation !== renderGeneration) return;\n\n  patchViewerDOM(html);",
+          suite: "test:security",
+          expect: [
+            /^N18 a flowchart arrow diagram still carries its source after render \(light-format\)$/,
+            // HONEST CONSEQUENCES, named rather than left unlisted. All three
+            // F43 fixtures conjunct `mermaidSrc === <the diagram source>` -
+            // that oracle was adopted precisely BECAUSE this repair makes it
+            // hold at rest on both legs - so each is an independent witness to
+            // the same attribute loss, measured through a different fixture.
+            // Their being uniformly (light-format) is itself the evidence that
+            // this revert is path-narrow: the (full) copies of all three keep
+            // passing.
+            /^F43 control: a benign diagram carries its source on this path \(light-format\)$/,
+            /^F43 a decoy mermaid placeholder cannot capture the real diagram \(light-format\)$/,
+            /^F43 a diagram body of \$-replacement patterns round-trips verbatim \(light-format\)$/,
+            // The two fixtures added to close F43's own coverage holes read the
+            // same attribute, so they are two further witnesses to the same
+            // loss. Note which one is ABSENT from this list: the nonce-less
+            // RAW-HTML decoy keeps passing, because an iframe's srcdoc is not a
+            // data- attribute and DOMPurify's value guard never sees it. That
+            // asymmetry is the evidence this revert is attribute-narrow as well
+            // as path-narrow.
+            /^F43 a decoy matching the nonce-less token shape cannot capture the real diagram \(light-format\)$/,
+            /^F43 every block is restored, not just the first \(light-format\)$/,
+          ],
+          mustPass: [
+            // The full path must be untouched. Without this the record would
+            // not distinguish a light-only regression from a wholesale loss of
+            // the repair - which is the entire reason the two calls are
+            // reverted apart.
+            /^N18 a flowchart arrow diagram still carries its source after render \(full\)$/,
+            // The dependency premise is a fact about DOMPurify, not about the
+            // product, so no product edit may move it. If it ever fails
+            // alongside one of these reverts the sanitizer has changed and the
+            // whole finding needs re-measuring rather than the revert being
+            // widened.
+            /^N18 premise: DOMPurify deletes a data- attribute whose value decodes to a flowchart arrow$/,
+          ],
+        },
+        {
+          id: "R528",
+          // N18, the FULL half - and it needs TWO edits, not one.
+          //
+          // Reverting the call alone would be VACUOUS: the mermaid.run set-up
+          // reads `el.dataset.mermaidSrc || el.textContent.trim()` and writes
+          // the result straight back, so the full path repairs the attribute by
+          // accident on its way to computing an SVG cache key. That accidental
+          // repair is what hid this defect for the whole life of the feature -
+          // the diagram still drew, so nothing looked wrong - and it is exactly
+          // why the light path had no symptom anyone could name either.
+          //
+          // The `also` edit neutralises that fallback, so what is measured is
+          // the property the helper is named for rather than the side effect of
+          // an unrelated cache line. Expect it to be narrow: only the full leg
+          // may fail.
+          what: "stop restoring the mermaid source attribute on the full path, accident included",
+          file: RENDERER,
+          from:
+            "  if (generation !== renderGeneration) { hideLoadingScreenFor(generation); return; }\n  patchViewerDOM(html);\n  restoreMermaidSourceAttributes();",
+          to:
+            "  if (generation !== renderGeneration) { hideLoadingScreenFor(generation); return; }\n  patchViewerDOM(html);",
+          also: {
+            from: "const src = el.dataset.mermaidSrc || el.textContent.trim();",
+            to: "const src = el.dataset.mermaidSrc || '';",
+          },
+          suite: "test:security",
+          expect: [
+            /^N18 a flowchart arrow diagram still carries its source after render \(full\)$/,
+            // Same honest consequences as R527, on the mirror leg. Worth
+            // reading beside R527's evidence: there the attribute is ABSENT
+            // (mermaidSrc null), here it is present and EMPTY - the `also` edit
+            // makes the accident write '' back rather than the source, which is
+            // exactly the accident being neutralised showing up in the data.
+            /^F43 control: a benign diagram carries its source on this path \(full\)$/,
+            /^F43 a decoy mermaid placeholder cannot capture the real diagram \(full\)$/,
+            /^F43 a diagram body of \$-replacement patterns round-trips verbatim \(full\)$/,
+            // The same two added fixtures, and the same asymmetry: the raw-html
+            // decoy survives on this leg too, so both reverts agree that what
+            // is lost is the mermaid attribute specifically and not the block
+            // restore in general.
+            /^F43 a decoy matching the nonce-less token shape cannot capture the real diagram \(full\)$/,
+            /^F43 every block is restored, not just the first \(full\)$/,
+          ],
+          mustPass: [
+            // The light path keeps its own call, so it must survive. Together
+            // with R527's mirror image this is what makes the pair a proof
+            // about each path rather than about the helper existing.
+            /^N18 a flowchart arrow diagram still carries its source after render \(light-format\)$/,
+            /^N18 premise: DOMPurify deletes a data- attribute whose value decodes to a flowchart arrow$/,
+          ],
+        },
+        // F43 is ONE shared helper reached from four call sites, so a revert of
+        // the helper hits all four at once. That is not a weakness of the
+        // proof - it is the reason the fix is shaped that way - but it does
+        // mean a single "revert F43" record would fail a dozen assertions and
+        // say nothing about WHICH of the two defects each one witnesses. The
+        // three records below cut the fix along its own seams instead:
+        //
+        //   R529  the predictable literal token   (defect (a))
+        //   R530  the `$`-expansion               (defect (b), mermaid only)
+        //   R531  first-occurrence replacement    (the other half of (a))
+        //
+        // Each names the other halves' assertions in `mustPass`, so the
+        // three-way isolation is asserted rather than hoped for.
+        //
+        // NOT SEPARATELY PROVABLE, and deliberately so: the trailing `_` that
+        // stops ..._1_ being a prefix of ..._10_. Reaching that collision needs
+        // a decoy that has ALREADY consumed the real `_1`, i.e. defect (a) must
+        // succeed first - so any revert that could exercise it is a revert of
+        // R529, and the terminator would be measured through a property it does
+        // not own. It is recorded as belt-and-braces in the product comment
+        // instead. (Precedent: R110b was deleted rather than kept as a
+        // permanently vacuous entry.)
+        {
+          id: "R529",
+          // Defect (a), the source of it: the placeholder token was a literal
+          // any document could spell. Pre-fix evidence on both decoy fixtures,
+          // both paths: `codeText: ""` and `stranded: 1` - the decoy's text was
+          // consumed as though it were the placeholder, and the REAL block's
+          // marker was left in the document as prose.
+          //
+          // The revert keeps the prefix and drops only the nonce, which yields
+          // exactly `MERMAID_BLOCK_0_` / `RAWHTML_BLOCK_0_` - still passing the
+          // helper's own /^[A-Za-z0-9_]+$/ shape check, so what is measured is
+          // the unguessability rather than the guard.
+          //
+          // Expect it to be NARROW: fixtures A and B write the HISTORICAL
+          // spellings (MERMAID_PLACEHOLDER_0 / MERMAID_PH_0) that this product
+          // no longer mints, so they stay green. Only the two fixture-D
+          // assertions per leg can see it - MEASURED: the proof run fails
+          // exactly those four and nothing else, which is also the direct
+          // evidence that no pre-existing assertion observes a dropped nonce
+          // and that this record would have been VACUOUS without fixture D.
+          //
+          // The SYMPTOM SHAPE differs from the original pre-fix measurement,
+          // and usefully so. Pre-fix the decoy captured the hole and the real
+          // block was STRANDED (stranded: 1), because the restore was also
+          // first-occurrence. Here the global regex survives, so both the decoy
+          // and the genuine placeholder are rewritten and the reader gets the
+          // diagram TWICE (codeText "", mermaidCount 2). The oracle catches
+          // both shapes because it asserts the code span still holds its text
+          // AND that exactly one diagram exists.
+          what: "mint the block placeholder without a per-render nonce",
+          file: RENDERER,
+          from: "  const token = `${prefix}${mintPlaceholderNonce()}_`;",
+          to: "  const token = `${prefix}`;",
+          suite: "test:security",
+          expect: [
+            /^F43 a decoy matching the nonce-less token shape cannot capture the real diagram \(light-format\)$/,
+            /^F43 a decoy matching the nonce-less token shape cannot capture the real diagram \(full\)$/,
+            /^F43 a decoy matching the nonce-less raw-html token shape cannot capture the real block \(light-format\)$/,
+            /^F43 a decoy matching the nonce-less raw-html token shape cannot capture the real block \(full\)$/,
+          ],
+          mustPass: [
+            // The other two halves of the fix are untouched, so their
+            // assertions must survive. Without these the record would not
+            // distinguish "the nonce is load-bearing" from "F43 is broken".
+            /^F43 a diagram body of \$-replacement patterns round-trips verbatim \(light-format\)$/,
+            /^F43 every block is restored, not just the first \(light-format\)$/,
+            // And the historical-spelling fixtures, which are what make this
+            // revert narrow rather than merely small.
+            /^F43 a decoy mermaid placeholder cannot capture the real diagram \(light-format\)$/,
+            /^F43 a decoy @@@html placeholder cannot capture the real raw-html block \(light-format\)$/,
+          ],
+        },
+        {
+          id: "R530",
+          // Defect (b): the pre-fix restore passed the BUILT MARKUP as a string
+          // replacement argument, so every `$` sequence in it was expanded by
+          // String.replace. Measured pre-fix: `$\`` expanded to the whole
+          // prefix of the document, `$&` to the matched placeholder, `$'`
+          // (arriving as `$&#39;`) to placeholder + "#39;", `$$` to a bare `$`.
+          // The light leg was the vivid one - the `$\`` expansion injected
+          // unescaped HTML whose embedded `"` closed the attribute early, so an
+          // <h1> became a REAL element inside the <pre class="mermaid">.
+          //
+          // The revert restores the pre-fix per-block loop, and preserves the
+          // unwrapParagraph asymmetry exactly, so the ONLY thing that changes
+          // is the `$` expansion. It deliberately does NOT reintroduce
+          // first-occurrence semantics across blocks (the loop visits every
+          // index) - that half belongs to R531.
+          //
+          // MERMAID ONLY, and that is a fact about the two builders rather than
+          // an accident of the fixtures: rawHtmlIframeMarkup(code) puts only a
+          // hash in its variable part, so the @@@html sites carry no
+          // document-controlled `$` into the replacement at all.
+          what: "restore block placeholders with a per-block string replacement ($-expanding)",
+          file: RENDERER,
+          from:
+            "      return html.replace(new RegExp(pattern, 'g'), (match, wrapped, bare) => {\n        const index = Number(wrapped !== undefined ? wrapped : bare);\n        // A token bearing this render's nonce always indexes a block this\n        // render lifted out. Out of range is unreachable rather than hostile,\n        // so leave the text alone instead of inventing markup for it.\n        return index < blocks.length ? build(blocks[index]) : match;\n      });",
+          to:
+            "      for (let i = 0; i < blocks.length; i++) {\n        const ph = `${token}${i}_`;\n        const built = build(blocks[i]);\n        if (unwrapParagraph) html = html.replace(`<p>${ph}</p>`, built);\n        html = html.replace(ph, built);\n      }\n      return html;",
+          suite: "test:security",
+          expect: [
+            /^F43 a diagram body of \$-replacement patterns round-trips verbatim \(light-format\)$/,
+            /^F43 a diagram body of \$-replacement patterns round-trips verbatim \(full\)$/,
+            // HONEST CONSEQUENCE, and the most eloquent evidence in this whole
+            // group: the corrupted source is no longer valid mermaid, so the
+            // library draws its syntax-error graphic and the suite's global
+            // error sentinel fires. It is worth reading the captured evidence
+            // beside the two named failures - the full leg records the source
+            // as "%% Doc\n MERMAID_BLOCK_<nonce>_0_amp; ... $ $1", i.e. all
+            // five expansions at once, and the light leg records a real <h1>
+            // and <div class="collapsible-section"> INSIDE the <pre>, which is
+            // the injected quote closing the attribute early.
+            /^nothing rendered a visible error at any point during the suite$/,
+          ],
+          mustPass: [
+            // The nonce is untouched, so both decoy families must still be
+            // refused - including the nonce-less shape, which is what proves
+            // this revert did not quietly reintroduce R529's defect.
+            /^F43 a decoy matching the nonce-less token shape cannot capture the real diagram \(light-format\)$/,
+            /^F43 a decoy mermaid placeholder cannot capture the real diagram \(light-format\)$/,
+            // The loop visits every index, so multi-block restoration must
+            // survive. If this fails, the revert has strayed into R531.
+            /^F43 every block is restored, not just the first \(light-format\)$/,
+            /^F43 every block is restored, not just the first \(full\)$/,
+          ],
+        },
+        {
+          id: "R531",
+          // The other half of defect (a): the pre-fix restore replaced only the
+          // FIRST occurrence, so a document with two blocks of one kind left
+          // the second placeholder stranded in the rendered text.
+          //
+          // CORRECTED BY MEASUREMENT. The first draft of this comment claimed
+          // no pre-existing fixture rendered two blocks of a kind, and that a
+          // revert of this line would therefore have been VACUOUS before
+          // fixture E was written. The proof run falsified that: "FEATURE two
+          // identical @@@html blocks both receive their document" also fails
+          // here, and it long predates this work. So the multiplicity hole was
+          // real but PARTIAL - covered for @@@html, uncovered for mermaid, and
+          // uncovered on the light path either way. Fixture E is what closes
+          // the remainder, and the claim it is justified by is the narrower
+          // one.
+          //
+          // Dropping the `g` flag is the whole edit. The regex, the callback
+          // and the nonce are all untouched, so the two other halves of the fix
+          // are still in force - which is what `mustPass` requires.
+          what: "restore only the first block placeholder (non-global regex)",
+          file: RENDERER,
+          from: "      return html.replace(new RegExp(pattern, 'g'), (match, wrapped, bare) => {",
+          to: "      return html.replace(new RegExp(pattern), (match, wrapped, bare) => {",
+          suite: "test:security",
+          expect: [
+            /^F43 every block is restored, not just the first \(light-format\)$/,
+            /^F43 every block is restored, not just the first \(full\)$/,
+            // The pre-existing witness described above. Named rather than left
+            // unlisted precisely because it is the evidence for the correction
+            // in this record's own comment.
+            /^FEATURE two identical @@@html blocks both receive their document$/,
+          ],
+          mustPass: [
+            // Single-block fixtures cannot see this, which is the point: their
+            // continued passing is what makes the record a proof about
+            // MULTIPLICITY rather than about restoration in general.
+            /^F43 control: a benign diagram carries its source on this path \(light-format\)$/,
+            /^F43 a decoy matching the nonce-less token shape cannot capture the real diagram \(light-format\)$/,
+            /^F43 a diagram body of \$-replacement patterns round-trips verbatim \(light-format\)$/,
+            /^F43 a diagram body of \$-replacement patterns round-trips verbatim \(full\)$/,
+          ],
+        },
       ];
 
 const argv = process.argv.slice(2);

@@ -2341,8 +2341,21 @@ async function run(win) {
       "Ctrl+-": { key: "-", edit: false },
       "Ctrl+0": { key: "0", edit: false },
     };
+    // Bound at `document` like MEASURED, but deliberately CONDITIONAL: the
+    // handler consumes the key ONLY when file navigation really happens, so
+    // the flat "was it prevented" oracle above is the wrong question for them -
+    // it would demand exactly the unconditional preventDefault() that was
+    // measured to eat 240px of scrolling inside a focused scroller. They are
+    // measured below instead, in BOTH states. \u2190 / \u2192 are the arrow
+    // glyphs the README's table spells them with; written as escapes so this
+    // classifier cannot be broken by a file-encoding change.
+    const CONDITIONAL = ["\u2190", "\u2192"];
     const unclassified = documented.filter(
-      (d) => !MAIN_PROCESS.includes(d) && !ELEMENT_SCOPED.includes(d) && !MEASURED[d],
+      (d) =>
+        !MAIN_PROCESS.includes(d) &&
+        !ELEMENT_SCOPED.includes(d) &&
+        !CONDITIONAL.includes(d) &&
+        !MEASURED[d],
     );
     check(
       "every documented shortcut is classified, so none can be skipped by omission",
@@ -2444,6 +2457,130 @@ async function run(win) {
       "the shortcut sweep left the zoom level where it found it",
       probe.zoom === (await exec(`ZOOM_CONFIG.level`)),
       JSON.stringify({ after: probe.zoom }),
+    );
+
+    // --- the CONDITIONAL pair --------------------------------------------
+    //
+    // The arrow keys drive file back/forward. Their preventDefault() is narrow
+    // BY DESIGN and that narrowing is the thing being pinned here: measured
+    // with a trusted CDP key, an unconditional preventDefault() costs a reader
+    // 240px of horizontal scrolling inside a focused `pre.language-js` and
+    // 200px inside a focused .content-wrapper. Nothing in the shipped product
+    // focuses a scroller today, so the harm is LATENT - which is exactly why it
+    // needs an assertion rather than a comment.
+    //
+    // The block is HERMETIC: `open-file-path` is recorded and never forwarded,
+    // so the sweep cannot move the document under the rest of the suite, and
+    // the recorded send is also the only honest oracle for "navigation really
+    // happened". Every other channel still goes out.
+    //
+    // NOTE FOR EDITORS: never a backtick or a dollar-brace inside this
+    // template literal - it terminates it, and this file has been bitten by
+    // that four times.
+    const navProbe = await exec(`
+      (async () => {
+        const fire = (key, target) => {
+          const ev = new KeyboardEvent('keydown', { key, bubbles: true, cancelable: true });
+          (target || document).dispatchEvent(ev);
+          return ev.defaultPrevented;
+        };
+        const histBefore = navigationHistory.slice();
+        const idxBefore = navigationIndex;
+        const navBefore = isNavigating;
+        const dirtyBefore = hasUnsavedChanges;
+        const editBefore = isEditMode;
+        const realSend = ipcRenderer.send;
+        const realConfirm = window.confirm;
+        const sent = [];
+        ipcRenderer.send = function (channel) {
+          if (channel === 'open-file-path') { sent.push(channel); return; }
+          return realSend.apply(ipcRenderer, arguments);
+        };
+        const seed = (idx) => {
+          navigationHistory.length = 0;
+          navigationHistory.push({ filePath: currentFilePath, scrollPosition: 0 });
+          navigationHistory.push({ filePath: currentFilePath, scrollPosition: 0 });
+          navigationIndex = idx;
+          isNavigating = false;
+          isEditMode = false;
+          hasUnsavedChanges = false;
+          sent.length = 0;
+        };
+        const out = {};
+        window.confirm = () => true;
+        seed(1); out.backPossible = { prevented: fire('ArrowLeft'), sends: sent.length };
+        seed(0); out.backAtStart = { prevented: fire('ArrowLeft'), sends: sent.length };
+        seed(0); out.fwdPossible = { prevented: fire('ArrowRight'), sends: sent.length };
+        seed(1); out.fwdAtEnd = { prevented: fire('ArrowRight'), sends: sent.length };
+
+        let asked = 0;
+        window.confirm = () => { asked++; return false; };
+        seed(1); isEditMode = true; hasUnsavedChanges = true;
+        out.dirtyDeclined = { prevented: fire('ArrowLeft'), sends: sent.length, asked: asked };
+        asked = 0;
+        window.confirm = () => { asked++; return true; };
+        seed(1); isEditMode = true; hasUnsavedChanges = true;
+        out.dirtyAccepted = { prevented: fire('ArrowLeft'), sends: sent.length, asked: asked };
+
+        window.confirm = () => true;
+        seed(1);
+        const ta = document.createElement('textarea');
+        document.body.appendChild(ta);
+        out.inTextarea = { prevented: fire('ArrowLeft', ta), sends: sent.length };
+        ta.remove();
+
+        ipcRenderer.send = realSend;
+        window.confirm = realConfirm;
+        navigationHistory.length = 0;
+        for (const h of histBefore) navigationHistory.push(h);
+        navigationIndex = idxBefore;
+        isNavigating = navBefore;
+        hasUnsavedChanges = dirtyBefore;
+        isEditMode = editBefore;
+        updateUnsavedIndicator();
+        return out;
+      })()
+    `);
+    // THE POSITIVE CONTROL for every "not prevented" reading below. Without it
+    // a dispatch that never reaches the handler at all reports prevented=false
+    // everywhere and the narrowing assertions pass for the worst possible
+    // reason - the recorded "an absence check fails open" disease.
+    check(
+      "the arrow keys really are bound: a possible navigation is consumed and sent",
+      navProbe.backPossible.prevented === true &&
+        navProbe.backPossible.sends === 1 &&
+        navProbe.fwdPossible.prevented === true &&
+        navProbe.fwdPossible.sends === 1,
+      JSON.stringify(navProbe),
+    );
+    check(
+      "an arrow key at the end of the history is left alone, not swallowed",
+      navProbe.backAtStart.prevented === false &&
+        navProbe.backAtStart.sends === 0 &&
+        navProbe.fwdAtEnd.prevented === false &&
+        navProbe.fwdAtEnd.sends === 0,
+      JSON.stringify(navProbe),
+    );
+    check(
+      "arrow-key navigation asks before discarding unsaved work, and declining stops it",
+      navProbe.dirtyDeclined.asked === 1 &&
+        navProbe.dirtyDeclined.sends === 0 &&
+        navProbe.dirtyDeclined.prevented === false,
+      JSON.stringify(navProbe.dirtyDeclined),
+    );
+    // The other half of the same guard: without this, "sends 0" above would be
+    // equally satisfied by navigation that had stopped working altogether.
+    check(
+      "accepting the unsaved-work prompt lets the arrow-key navigation through",
+      navProbe.dirtyAccepted.asked === 1 &&
+        navProbe.dirtyAccepted.sends === 1 &&
+        navProbe.dirtyAccepted.prevented === true,
+      JSON.stringify(navProbe.dirtyAccepted),
+    );
+    check(
+      "an arrow key typed into a textarea is never hijacked by file navigation",
+      navProbe.inTextarea.prevented === false && navProbe.inTextarea.sends === 0,
+      JSON.stringify(navProbe.inTextarea),
     );
   }
 
@@ -2564,6 +2701,65 @@ async function run(win) {
       "the staging container is drained in one go rather than node by node",
       drain.stagingRemovals === 0,
       JSON.stringify(drain),
+    );
+  }
+
+  // ---------------------------------------------------------------------
+  // F25. Emoji shortcodes must resolve identically on BOTH render paths.
+  //
+  // renderLightFormat() used to skip parseEmojis() entirely, so :star: stayed
+  // literal while editing and turned into a star only once some later edit
+  // happened to select the full path - the same block of text rendering two
+  // different ways depending on which diff the dispatcher took.
+  //
+  // The oracle is deliberately TWO-SIDED. Asserting only "no :star: remains"
+  // would also pass if a bug stripped text wholesale, so an UNKNOWN shortcode
+  // must survive verbatim in the same breath. That is the positive control:
+  // it proves the assertion is reading real rendered text and that parseEmojis
+  // is selective rather than eating every colon-delimited run.
+  // ---------------------------------------------------------------------
+  {
+    const EMOJI_A = "# Emoji\n\nAlpha :star: and :rocket: plus :notanemoji_xyz: kept.\n";
+    const EMOJI_B = "# Emoji\n\nBravo :star: and :rocket: plus :notanemoji_xyz: kept.\n";
+    const READ_EMOJI = `
+      (() => {
+        const t = viewer.textContent || '';
+        return JSON.stringify({
+          star: (t.match(/\u2b50/g) || []).length,
+          rocket: (t.match(/\ud83d\ude80/g) || []).length,
+          literalStar: t.includes(':star:'),
+          unknownKept: t.includes(':notanemoji_xyz:')
+        });
+      })()
+    `;
+
+    await render(exec, EMOJI_A, "full");
+    const full = JSON.parse(await exec(READ_EMOJI));
+    // light-format needs a prior render to diff against, which the line above
+    // provides; EMOJI_B differs from EMOJI_A only in one word so the dispatcher
+    // has a formatting-only edit to patch.
+    await render(exec, EMOJI_B, "light-format");
+    const light = JSON.parse(await exec(READ_EMOJI));
+
+    check(
+      "[full] emoji shortcodes resolve",
+      full.star === 1 && full.rocket === 1 && !full.literalStar,
+      JSON.stringify(full),
+    );
+    check(
+      "[light-format] emoji shortcodes resolve",
+      light.star === 1 && light.rocket === 1 && !light.literalStar,
+      JSON.stringify(light),
+    );
+    check(
+      "the two render paths agree on emoji, so an edit cannot flip them",
+      full.star === light.star && full.rocket === light.rocket && full.literalStar === light.literalStar,
+      JSON.stringify({ full, light }),
+    );
+    check(
+      "an unknown shortcode survives verbatim on both paths (oracle control)",
+      full.unknownKept === true && light.unknownKept === true,
+      JSON.stringify({ full, light }),
     );
   }
 

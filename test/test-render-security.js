@@ -810,6 +810,397 @@ async function run(win) {
     JSON.stringify({ sec28LightPwned, ...sec28Light }),
   );
 
+  // ---------------------------------------------------------------------
+  // F43 - placeholder assembly.
+  //
+  // Both render paths lift mermaid fences and @@@html blocks out of the source,
+  // hand the remainder to marked, and splice the real markup back in over a
+  // placeholder token. Two defects live in that splice, and this block measures
+  // both. Neither is an injection today - every restore runs BEFORE
+  // sanitizeHtml() - but both are document-controlled corruption, and one
+  // sanitize reorder away from being worse.
+  //
+  //  (a) The token is a PREDICTABLE LITERAL and the restore rewrites only the
+  //      FIRST occurrence (String.replace with a string, and a non-global
+  //      RegExp, both stop at one). The token contains no HTML-special
+  //      character, so a decoy in a code span survives marked verbatim. If the
+  //      decoy comes first, the real block is spliced into the reader's code
+  //      span and the genuine token is left on screen as literal text. Same
+  //      shape as SEC-28, on a different carrier.
+  //
+  //  (b) $-EXPANSION, and it reaches the two MERMAID sites only. A replacement
+  //      STRING gives $&, $`, $' and $$ their special meaning, and the mermaid
+  //      replacement embeds escapeHtml(code) - which does not escape $. The
+  //      @@@html sites are immune because rawHtmlIframeMarkup()'s only variable
+  //      part is a hash.
+  //
+  // The two paths spell their tokens DIFFERENTLY (MERMAID_PLACEHOLDER_ /
+  // RAWHTML_PLACEHOLDER_ on the full path, MERMAID_PH_ / RAWHTML_PH_ on the
+  // light one), so each leg has to plant the token its own path will look for.
+  // That divergence is itself the reason a shared helper is the right fix.
+  //
+  // ORACLE NOTE, and the obvious one is WRONG for the mermaid leg: <pre> is in
+  // the set of start tags that close an open <p>, so the parser REPARENTS the
+  // spliced pre.mermaid out of the code span. "the diagram ended up inside a
+  // <code>" therefore cannot be the test. What survives the reparenting is the
+  // damage to the reader's own text: the code span is emptied and the real
+  // token is stranded as visible prose. Both are asserted, with the mermaid /
+  // iframe counts as positive controls - all three oracles are absence checks,
+  // and an absence check fails open.
+  const f43Probe = (token) =>
+    exec(`
+    (() => {
+      const v = document.querySelector('#viewer');
+      if (!v) return { noViewer: true };
+      const tok = ${JSON.stringify(token)};
+      const codes = Array.from(v.querySelectorAll('code'));
+      const walker = document.createTreeWalker(v, NodeFilter.SHOW_TEXT);
+      let stranded = 0;
+      for (let n = walker.nextNode(); n; n = walker.nextNode()) {
+        if (n.nodeValue.trim() !== tok) continue;
+        if (n.parentElement && n.parentElement.closest('code')) continue;
+        stranded += 1;
+      }
+      const mer = Array.from(v.querySelectorAll('pre.mermaid'));
+      const frames = Array.from(v.querySelectorAll('iframe.raw-html-block'));
+      // The "stranded" counter can only look for a token the TEST can spell, so
+      // it is blind to a real placeholder left behind - those carry a
+      // per-render nonce the test cannot know. This counts anything SHAPED like
+      // one of this file's placeholders instead, which is what a restore that
+      // misses a hole leaves in the reader's prose.
+      //
+      // The character class MUST include the underscore: a real token is
+      // MERMAID_BLOCK_<nonce>_<index>_ and the nonce is separated from the
+      // prefix by one. A first draft used [A-Za-z0-9]*_? here and matched 0 of
+      // 200000 generated real tokens while still matching the nonce-less shape
+      // - i.e. it looked like it worked on exactly the one fixture that could
+      // not tell the difference.
+      const walker2 = document.createTreeWalker(v, NodeFilter.SHOW_TEXT);
+      let strandedLike = 0;
+      for (let n = walker2.nextNode(); n; n = walker2.nextNode()) {
+        if (!/(?:MERMAID|RAWHTML)_[A-Za-z0-9_]*\\d+_/.test(n.nodeValue)) continue;
+        if (n.parentElement && n.parentElement.closest('code')) continue;
+        strandedLike += 1;
+      }
+      return {
+        codeSpans: codes.length,
+        codeText: codes.length ? codes[0].textContent.trim() : null,
+        stranded: stranded,
+        strandedLike: strandedLike,
+        mermaidCount: mer.length,
+        mermaidSrc: mer.length ? mer[0].getAttribute('data-mermaid-src') : null,
+        mermaidSrcs: mer.map((m) => m.getAttribute('data-mermaid-src')),
+        mermaidOuter: mer.length ? mer[0].outerHTML.slice(0, 200) : null,
+        frameCount: frames.length,
+        // Pins the unwrapParagraph asymmetry: the @@@html restore swallows the
+        // <p> marked wraps the lone placeholder in, the mermaid restore never
+        // has. Nothing else in either suite observes it, so flipping the flag
+        // would leave <p><iframe/></p> with every count and length unchanged.
+        frameParent: frames.length ? frames[0].parentElement.tagName : null,
+        mermaidParent: mer.length ? mer[0].parentElement.tagName : null,
+        srcdocLen: frames.length ? (frames[0].getAttribute('srcdoc') || '').length : -1,
+        srcdocLens: frames.map((f) => (f.getAttribute('srcdoc') || '').length),
+        renderError: window.__lastRenderError,
+      };
+    })()
+  `);
+
+  const F43_DIAGRAM = "graph TD\n  A[Real] --> B[Diagram]";
+  const f43MermaidDecoy = (token) =>
+    "# Doc\n\n`" + token + "`\n\n```mermaid\n" + F43_DIAGRAM + "\n```\n";
+  const f43RawDecoy = (token) =>
+    "# Doc\n\n`" + token + "`\n\n@@@html\n<b>real block</b>\n@@@\n";
+
+  // A body carrying every $-pattern that survives escapeHtml. $' is included
+  // deliberately even though escapeHtml rewrites the quote to &#39; first: what
+  // then expands is $& rather than $', so the corruption is real but arrives by
+  // a different route than the raw pattern suggests.
+  const F43_DOLLAR_DIAGRAM = "graph TD\n  A --> B\n%% $` $& $' $$ $1";
+  const f43DollarDoc = "# Doc\n\n```mermaid\n" + F43_DOLLAR_DIAGRAM + "\n```\n";
+
+  // The exact placeholders createBlockPlaceholders() would mint if the nonce
+  // were dropped but its prefixes kept: `${prefix}` + index + '_'. Written out
+  // as literals rather than derived from the product, deliberately - deriving
+  // them would make the fixture agree with whatever the product does, which is
+  // the one thing a regression test must not do.
+  const F43_NONCELESS_MERMAID = "MERMAID_BLOCK_0_";
+  const F43_NONCELESS_RAW = "RAWHTML_BLOCK_0_";
+
+  // A second diagram distinguishable from the first, so fixture E can assert
+  // WHICH source landed in WHICH <pre> rather than merely counting two of them.
+  const F43_SECOND_DIAGRAM = "graph LR\n  C[Second] --> D[Block]";
+  const f43MultiDoc =
+    "# Doc\n\n```mermaid\n" +
+    F43_DIAGRAM +
+    "\n```\n\ntext between\n\n@@@html\n<b>first raw</b>\n@@@\n\n```mermaid\n" +
+    F43_SECOND_DIAGRAM +
+    "\n```\n\nmore text\n\n@@@html\n<b>second raw</b>\n@@@\n";
+
+  for (const leg of [
+    { mode: "full", mermaidTok: "MERMAID_PLACEHOLDER_0", rawTok: "RAWHTML_PLACEHOLDER_0" },
+    { mode: "light-format", mermaidTok: "MERMAID_PH_0", rawTok: "RAWHTML_PH_0" },
+  ]) {
+    // The light-format path only engages once something has been rendered, so
+    // every light leg is preceded by a full render of a benign document - the
+    // same warm-up SEC-28 uses.
+    const warm = async () => {
+      if (leg.mode === "light-format") await render("# Warm\n\nplain text\n", "full");
+    };
+
+    // POSITIVE CONTROL for the mermaid legs' oracle. Both fixture A and
+    // fixture C read `data-mermaid-src` back off the restored <pre>, and an
+    // oracle that this render path can never satisfy is indistinguishable from
+    // a real proof - the harness checks that a revert's `expect` MATCHES, not
+    // that the assertion passes at rest (R357). The two paths carry the
+    // attribute by DIFFERENT mechanisms: the full path re-asserts it in JS
+    // after sanitization (renderer.js:5309, in the mermaid.run set-up), while
+    // the light path never runs mermaid and relies entirely on the attribute it
+    // authored surviving DOMPurify. So this control is the only thing standing
+    // between "the light oracle is sound" and "the light oracle is vacuous".
+    await warm();
+    await render("# Doc\n\n```mermaid\n" + F43_DIAGRAM + "\n```\n", leg.mode);
+    const ctl = await f43Probe(leg.mermaidTok);
+    check(
+      `F43 control: a benign diagram carries its source on this path (${leg.mode})`,
+      ctl.mermaidCount === 1 &&
+        ctl.mermaidSrc === F43_DIAGRAM &&
+        ctl.stranded === 0 &&
+        ctl.renderError === null,
+      JSON.stringify(ctl),
+    );
+
+    await warm();
+    await render(f43MermaidDecoy(leg.mermaidTok), leg.mode);
+    const a = await f43Probe(leg.mermaidTok);
+    check(
+      `F43 a decoy mermaid placeholder cannot capture the real diagram (${leg.mode})`,
+      a.codeText === leg.mermaidTok &&
+        a.stranded === 0 &&
+        a.mermaidCount === 1 &&
+        a.mermaidSrc === F43_DIAGRAM &&
+        a.renderError === null,
+      JSON.stringify(a),
+    );
+
+    await warm();
+    await render(f43RawDecoy(leg.rawTok), leg.mode);
+    const b = await f43Probe(leg.rawTok);
+    check(
+      `F43 a decoy @@@html placeholder cannot capture the real raw-html block (${leg.mode})`,
+      b.codeText === leg.rawTok &&
+        b.stranded === 0 &&
+        b.frameCount === 1 &&
+        b.srcdocLen > 0 &&
+        b.renderError === null,
+      JSON.stringify(b),
+    );
+
+    await warm();
+    await render(f43DollarDoc, leg.mode);
+    const c = await f43Probe(leg.mermaidTok);
+    check(
+      `F43 a diagram body of $-replacement patterns round-trips verbatim (${leg.mode})`,
+      c.mermaidCount === 1 &&
+        c.mermaidSrc === F43_DOLLAR_DIAGRAM &&
+        c.renderError === null,
+      JSON.stringify(c),
+    );
+
+    // Fixture D - the decoy a NONCE-LESS product would be vulnerable to.
+    //
+    // Fixtures A and B write the two HISTORICAL literals, so they guard against
+    // reintroducing those exact spellings and nothing else. They are structurally
+    // blind to the likelier accident: keeping this fix's prefix but dropping the
+    // random part, which mints a token a document can once again author. The
+    // decoy below is exactly what `MERMAID_BLOCK_`/`RAWHTML_BLOCK_` yield with no
+    // nonce, so it captures the hole the moment the nonce stops being minted and
+    // is inert while it is. R529.
+    await warm();
+    await render(f43MermaidDecoy(F43_NONCELESS_MERMAID), leg.mode);
+    const d = await f43Probe(F43_NONCELESS_MERMAID);
+    check(
+      `F43 a decoy matching the nonce-less token shape cannot capture the real diagram (${leg.mode})`,
+      d.codeText === F43_NONCELESS_MERMAID &&
+        d.stranded === 0 &&
+        d.mermaidCount === 1 &&
+        d.mermaidSrc === F43_DIAGRAM &&
+        d.renderError === null,
+      JSON.stringify(d),
+    );
+
+    await warm();
+    await render(f43RawDecoy(F43_NONCELESS_RAW), leg.mode);
+    const d2 = await f43Probe(F43_NONCELESS_RAW);
+    check(
+      `F43 a decoy matching the nonce-less raw-html token shape cannot capture the real block (${leg.mode})`,
+      d2.codeText === F43_NONCELESS_RAW &&
+        d2.stranded === 0 &&
+        d2.frameCount === 1 &&
+        d2.srcdocLen > 0 &&
+        d2.renderError === null,
+      JSON.stringify(d2),
+    );
+
+    // Fixture E - MORE THAN ONE BLOCK OF EACH KIND IN ONE DOCUMENT.
+    //
+    // Every F43 fixture above renders exactly one mermaid fence and one @@@html
+    // block, so all of them are satisfied by a restore that rewrites only the
+    // FIRST occurrence. That is not a hypothetical shape: it is what dropping
+    // the `g` flag from the shared regex produces, and it strands every block
+    // after the first as inert placeholder text in the reader's document.
+    //
+    // The coverage this closes is the REMAINDER, not the whole: "FEATURE two
+    // identical @@@html blocks both receive their document" already witnessed
+    // multiplicity for @@@html on one path (measured - it fails under R531
+    // too). What had no witness at all was multiplicity for MERMAID, and
+    // neither kind had one on the light path. The two sources are asserted
+    // DISTINCTLY rather than merely counted, so a restore that fills the right
+    // number of holes with the wrong bodies - the index-arithmetic accident -
+    // fails here as well. R531.
+    await warm();
+    await render(f43MultiDoc, leg.mode);
+    // The token argument is a SENTINEL that appears nowhere in the document:
+    // the real placeholders here carry a per-render nonce, so `stranded` cannot
+    // spell them and `strandedLike` is the oracle that can. Passing the diagram
+    // source instead would be wrong twice over - it is not a placeholder, and it
+    // legitimately appears as the text of the rendered `pre.mermaid`.
+    const e = await f43Probe("F43_SENTINEL_NEVER_RENDERED");
+    check(
+      `F43 every block is restored, not just the first (${leg.mode})`,
+      e.mermaidCount === 2 &&
+        e.mermaidSrcs[0] === F43_DIAGRAM &&
+        e.mermaidSrcs[1] === F43_SECOND_DIAGRAM &&
+        e.frameCount === 2 &&
+        e.srcdocLens.length === 2 &&
+        e.srcdocLens.every((n) => n > 0) &&
+        e.stranded === 0 &&
+        e.strandedLike === 0 &&
+        e.renderError === null,
+      JSON.stringify(e),
+    );
+
+    // The `unwrapParagraph` asymmetry itself. Nothing else in either suite
+    // observes it: flipping the flag at either @@@html call site leaves
+    // <p><iframe/></p>, and frameCount / srcdocLen / mermaidCount are all
+    // unchanged, so the whole suite stays green while the DOM shape the
+    // renderer's own comment calls load-bearing has changed.
+    //
+    // Only the iframe half is a real assertion. The mermaid half cannot be got
+    // wrong the same way - <pre> is not phrasing content, so the parser closes
+    // an open <p> before it regardless of what the restore emits - and it is
+    // recorded here as evidence rather than as a claim about the flag.
+    //
+    // `frameCount > 0` is a vacuity guard, NOT a count: with no frames,
+    // frameParent is null and "null !== P" would pass an empty page. It is
+    // deliberately not `=== 2`, because that would make this assertion fail
+    // under R531 as well and it would then be testing multiplicity - which is
+    // fixture E's job - instead of paragraph shape.
+    check(
+      `F43 the @@@html restore swallows the paragraph marked wrapped it in (${leg.mode})`,
+      e.frameCount > 0 && e.frameParent !== "P",
+      JSON.stringify({ frameParent: e.frameParent, mermaidParent: e.mermaidParent }),
+    );
+  }
+
+  // The nonce must be minted PER RENDER, not once per session. Every fixture
+  // above is blind to the difference: fixture D pins the nonce-LESS shape, and
+  // a session-constant nonce still does not match `MERMAID_BLOCK_0_`, so
+  // hoisting mintPlaceholderNonce() to module scope "because entropy per render
+  // is wasteful" would leave the whole suite green while destroying the one
+  // property the fix is named for - that a document cannot author the token.
+  // Two calls, one render, different answers is the whole claim.
+  const nonces = JSON.parse(
+    await exec(`JSON.stringify([mintPlaceholderNonce(), mintPlaceholderNonce()])`),
+  );
+  check(
+    "the placeholder nonce is minted fresh on every call, not once per session",
+    nonces.length === 2 && nonces[0] !== nonces[1] && nonces.every((n) => /^[a-z0-9]+$/.test(n)),
+    JSON.stringify(nonces),
+  );
+
+  // ---- N18 - DOMPurify deletes the mermaid source attribute for real
+  // flowcharts, and it does so on a VALUE SHAPE, not an attribute name ----
+  //
+  // DOMPurify 3.4.14 drops any attribute whose DECODED value matches
+  // /((--!?|])>)|<\/(style|script|title|xmp|textarea|noscript|iframe|noembed|noframes)/i
+  // (extracted from the shipped libs/vendor/purify.min.js, not quoted from
+  // memory - an earlier draft of this comment truncated the alternation to
+  // (style|title) and understated the finding). "-->" is the canonical mermaid
+  // flowchart arrow, so data-mermaid-src was being deleted for essentially
+  // every real diagram; a diagram body containing "</script" or "</iframe"
+  // loses it too. No HTML-level escaping avoids it: escapeHtml() writes --&gt;,
+  // the parser decodes it back, and the guard inspects the DECODED value.
+  // Adding the name to ADD_ATTR is a no-op for the same reason - the drop is
+  // not name-based.
+  //
+  // The two halves are asserted SEPARATELY on purpose (the R468 precedent).
+  // The PREMISE is a fact about the dependency: if a future DOMPurify relaxes
+  // that guard the repair becomes unnecessary, and this fails loudly rather
+  // than leaving dead code nobody dares remove. The CONSEQUENCE is a fact about
+  // the product. A reader seeing only the consequence would credit the repair
+  // for something the sanitizer might no longer be doing.
+  const n18Premise = await exec(`
+    (() => {
+      const shape = (escaped) => {
+        const out = window.sanitizeHtml(
+          '<pre class="mermaid" data-mermaid-src="' + escaped + '">x</pre>');
+        const d = document.createElement('div');
+        d.innerHTML = out;
+        const p = d.querySelector('pre.mermaid');
+        return { kept: !!p, attr: p ? p.getAttribute('data-mermaid-src') : null };
+      };
+      return {
+        hasSanitizer: typeof window.sanitizeHtml === 'function',
+        arrow: shape('A --&gt; B'),
+        plain: shape('A -&gt; B'),
+      };
+    })()
+  `);
+  check(
+    "N18 premise: DOMPurify deletes a data- attribute whose value decodes to a flowchart arrow",
+    n18Premise.hasSanitizer === true &&
+      // The ELEMENT survives in both cases - only the attribute is taken, which
+      // is what made this invisible: the diagram still rendered.
+      n18Premise.arrow.kept === true &&
+      n18Premise.plain.kept === true &&
+      n18Premise.arrow.attr === null &&
+      // Positive control: the same attribute, one dash shorter, is untouched.
+      // Without it "the attribute is gone" is equally satisfied by a sanitizer
+      // that strips every data- attribute, or by a probe that never authored
+      // one - an absence check fails open.
+      n18Premise.plain.attr === "A -> B",
+    JSON.stringify(n18Premise),
+  );
+
+  // Consequence, on BOTH paths. They carry the attribute by different
+  // mechanisms - the full path was repairing it by accident inside the
+  // mermaid.run set-up, the light path had nothing at all - so a single-leg
+  // assertion would have reported the light defect as a full-path pass.
+  const N18_ARROW = "graph TD\n  A --> B";
+  const N18_PLAIN = "graph TD\n  A[Only one node]";
+  for (const mode of ["full", "light-format"]) {
+    if (mode === "light-format") await render("# Warm\n\nplain text\n", "full");
+    await render("# Doc\n\n```mermaid\n" + N18_ARROW + "\n```\n", mode);
+    const arrow = await f43Probe("unused");
+    if (mode === "light-format") await render("# Warm\n\nplain text\n", "full");
+    await render("# Doc\n\n```mermaid\n" + N18_PLAIN + "\n```\n", mode);
+    const plain = await f43Probe("unused");
+    check(
+      `N18 a flowchart arrow diagram still carries its source after render (${mode})`,
+      arrow.mermaidCount === 1 &&
+        arrow.mermaidSrc === N18_ARROW &&
+        arrow.renderError === null &&
+        // The arrow-free diagram is the discriminator. If BOTH legs lose the
+        // attribute the repair is missing outright; if only the arrow leg does,
+        // the sanitizer's value guard is the mechanism - which is the defect
+        // this assertion is named for.
+        plain.mermaidCount === 1 &&
+        plain.mermaidSrc === N18_PLAIN &&
+        plain.renderError === null,
+      JSON.stringify({ arrow, plain }),
+    );
+  }
+
   // A javascript: URL must not survive, in either path.
   await render("# Doc\n\n[click](javascript:window.__pwned='link')\n", "full");
   const jsLink = await exec(`

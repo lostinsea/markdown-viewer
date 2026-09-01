@@ -1298,8 +1298,20 @@ function addToNavigationHistory(filePath, scrollPosition = 0) {
   updateNavButtons();
 }
 
+// Both of these send `open-file-path`, which replaces the document. Every OTHER
+// route to that channel - the toolbar Open button, the welcome button, the
+// drag-drop handler - asks hasUnsavedWork() first; these two did not, so a
+// back/forward discarded unsaved bytes with no prompt.
+//
+// The guard lives HERE rather than at the keydown call site on purpose: the
+// click handlers below bind these same functions, so a call-site guard would
+// protect one caller and leave the other open. Fix at the function.
+//
+// They now REPORT whether they navigated, so the keydown handler can decide
+// whether the key was actually consumed - see the measurement recorded there.
 function navigateBack() {
-  if (navigationIndex <= 0) return;
+  if (navigationIndex <= 0) return false;
+  if (hasUnsavedWork() && !confirm(i18n('confirm.unsavedOpen'))) return false;
 
   // Save current scroll position
   if (navigationHistory[navigationIndex]) {
@@ -1308,16 +1320,20 @@ function navigateBack() {
 
   navigationIndex--;
   const entry = navigationHistory[navigationIndex];
+  let navigated = false;
   if (entry) {
     isNavigating = true;
     ipcRenderer.send('open-file-path', entry.filePath);
+    navigated = true;
     // Scroll position will be restored when file loads
   }
   updateNavButtons();
+  return navigated;
 }
 
 function navigateForward() {
-  if (navigationIndex >= navigationHistory.length - 1) return;
+  if (navigationIndex >= navigationHistory.length - 1) return false;
+  if (hasUnsavedWork() && !confirm(i18n('confirm.unsavedOpen'))) return false;
 
   // Save current scroll position
   if (navigationHistory[navigationIndex]) {
@@ -1326,12 +1342,15 @@ function navigateForward() {
 
   navigationIndex++;
   const entry = navigationHistory[navigationIndex];
+  let navigated = false;
   if (entry) {
     isNavigating = true;
     ipcRenderer.send('open-file-path', entry.filePath);
+    navigated = true;
     // Scroll position will be restored when file loads
   }
   updateNavButtons();
+  return navigated;
 }
 
 // Navigation button click handlers
@@ -1339,17 +1358,29 @@ if (navBackBtn) navBackBtn.addEventListener('click', navigateBack);
 if (navForwardBtn) navForwardBtn.addEventListener('click', navigateForward);
 
 // Keyboard navigation (left/right arrows)
+//
+// preventDefault() is NARROW - it fires only when navigation really happened.
+// MEASURED, with a trusted CDP key (a synthetic dispatchEvent can never drive a
+// default action, so it would have reported a clean zero either way):
+//   - focus rests on BODY in the shipped product (no scroller carries a
+//     tabindex and nothing calls .focus() on one), and from BODY an arrow key
+//     scrolls 0 - so today the unconditional preventDefault() cost nothing;
+//   - but give a scroller focus and it costs real scrolling: 240px inside a
+//     focused `pre.language-js` (ArrowRight) and 200px in a focused
+//     .content-wrapper (ArrowDown).
+// So the harm is LATENT, not absent: the moment a scroller becomes focusable -
+// which an accessibility fix would do - an unconditional preventDefault() starts
+// eating the reader's scrolling. Narrowing it is what stops that landing
+// silently, and it costs nothing when navigation does occur.
 document.addEventListener('keydown', (e) => {
   // Don't trigger if typing in input/textarea or if modifier keys are pressed
   if (e.target.tagName === 'INPUT' || e.target.tagName === 'TEXTAREA') return;
   if (e.ctrlKey || e.altKey || e.metaKey) return;
 
   if (e.key === 'ArrowLeft') {
-    e.preventDefault();
-    navigateBack();
+    if (navigateBack()) e.preventDefault();
   } else if (e.key === 'ArrowRight') {
-    e.preventDefault();
-    navigateForward();
+    if (navigateForward()) e.preventDefault();
   }
 });
 
@@ -5056,43 +5087,199 @@ function resyncSearchAfterRender() {
 
 // ---- End incremental DOM patching ----
 
+// Both render paths author data-mermaid-src on the <pre class="mermaid"> they
+// build, and DOMPurify DELETES IT AGAIN for most real diagrams. Measured on the
+// shipped libs/vendor/purify.min.js (3.4.14), one <pre> per case, element kept
+// in every case:
+//
+//     "A --> B"    dropped      "A -> B"        kept
+//     "A ]> B"     dropped      "A -- B"        kept
+//     "A --!> B"   dropped      "Alice->>Bob"   kept
+//
+// i.e. exactly DOMPurify's mXSS value guard, extracted from the shipped bundle
+// rather than quoted from memory:
+//
+//   /((--!?|])>)|<\/(style|script|title|xmp|textarea|noscript|iframe|noembed|noframes)/i
+//
+// It is applied to EVERY attribute (a plain title="A --> B" is dropped too) and
+// cannot be escaped around: escapeHtml() turns > into &gt;, the parser decodes
+// it back before DOMPurify sees the value, and the guard tests the decoded
+// value. So `-->`, the canonical flowchart arrow, costs the attribute on both
+// paths - as does a diagram body mentioning `</script` or `</iframe`, which is
+// not far-fetched in this app's own documentation. (The same regex is quoted at
+// the SEC-28 comment below; an earlier draft of THIS comment truncated the
+// alternation to (style|title), so the file disagreed with itself.)
+//
+// The full path never noticed because its mermaid.run() set-up re-derives the
+// source as `el.dataset.mermaidSrc || el.textContent.trim()` and writes it back
+// - so the attribute was being repaired there by a line whose stated job is the
+// SVG cache key. The light path has no such loop and left the element with no
+// source attribute at all, which is what the "Edit Diagram" context-menu
+// handlers read (they fall back to '' , not to textContent).
+//
+// Restoring it here, on both paths, makes the attribute the single carrier both
+// paths agree on instead of one path having a private recovery.
+function restoreMermaidSourceAttributes() {
+  viewer.querySelectorAll('.mermaid').forEach((el) => {
+    if (el.dataset.mermaidSrc) return;
+    // An already-drawn diagram holds an <svg>, so its textContent is the drawing
+    // rather than the source. That cannot happen while the attribute is missing
+    // (it is written before mermaid draws), but reading the source off a drawn
+    // element would be silently wrong, so the shape is checked rather than
+    // assumed.
+    if (el.firstElementChild) return;
+    const src = el.textContent.trim();
+    if (src) el.dataset.mermaidSrc = src;
+  });
+}
+
+// ---- Placeholder tokens for blocks lifted out before marked.parse() ----
+//
+// Both render paths lift mermaid fences and @@@html blocks out of the markdown,
+// run marked over what is left, then splice the real markup back in. The token
+// marking each hole used to be a PREDICTABLE LITERAL (MERMAID_PLACEHOLDER_0,
+// RAWHTML_PH_0, ...) restored with String.replace(string, string), which has two
+// defects. Both were DEMONSTRATED on all four sites, not predicted:
+//
+//   (a) a string needle rewrites only the FIRST occurrence, so a document that
+//       writes the literal itself - in a code span, say - captures the hole and
+//       the real block is left stranded in the page as inert text.
+//   (b) a string REPLACEMENT expands $-patterns. The mermaid sites build their
+//       replacement out of the diagram source, so a diagram body containing
+//       $` $& $' injected the surrounding HTML into its own attribute: measured,
+//       the injected `"` closed the attribute early and an <h1> became a real
+//       element INSIDE the <pre class="mermaid">. escapeHtml() cannot help - it
+//       escapes & < > " ' and leaves $` $& $$ untouched.
+//
+// Both are closed structurally rather than defensively: the token carries a
+// per-render random nonce, so a document cannot author it in the first place,
+// and one GLOBAL regex with a FUNCTION replacer performs every restore for a
+// kind in a single pass ($-patterns are inert in a function replacer).
+//
+// The single pass is also dramatically cheaper, and that was MEASURED against
+// real marked output rather than argued from the O() (probe: a document of N
+// flowcharts, both restores producing byte-identical HTML at every size):
+//
+//     diagrams   html     N scans   one pass   ratio
+//        50       9 KB     0.32 ms   0.08 ms     4x
+//       100      18 KB     0.80 ms   0.10 ms     8x
+//       200      37 KB     2.30 ms   0.20 ms    11x
+//       400      75 KB     7.30 ms   0.30 ms    24x
+//       800     150 KB    53.60 ms   0.82 ms    65x
+//
+// The old side rises ~3x per doubling because each String.replace allocates a
+// fresh copy of the whole document, so it is O(N x |html|) in bytes COPIED as
+// well as scanned - at 800 blocks that is ~196 MB of copying. The new side is
+// linear in |html| and independent of N.
+//
+// The two paths share this helper on purpose. They had already drifted to
+// different prefixes for the same job, which is exactly the two-path divergence
+// RAW_HTML_FENCE exists to prevent.
+function mintPlaceholderNonce() {
+  const r = new Uint32Array(2);
+  window.crypto.getRandomValues(r);
+  // Fixed width, so the concatenation is injective. Without the padding
+  // (1, 36) and (37, 0) both spell "110": harmless here because a token is
+  // consumed by the render that minted it and never persisted, but a
+  // collision-free encoding costs one call and removes the question.
+  return r[0].toString(36).padStart(7, '0') + r[1].toString(36).padStart(7, '0');
+}
+
+function createBlockPlaceholders(prefix) {
+  const token = `${prefix}${mintPlaceholderNonce()}_`;
+  // The token is interpolated into a RegExp source below, so it must carry no
+  // metacharacters. It cannot by construction (literal prefix + base-36 digits),
+  // but a future prefix is the cheap way to break that, so the shape is checked
+  // rather than assumed.
+  if (!/^[A-Za-z0-9_]+$/.test(token)) {
+    throw new Error(`placeholder token is not regex-safe: ${token}`);
+  }
+  const blocks = [];
+  return {
+    // The trailing `_` terminates the index so that ..._1_ can never be a prefix
+    // of ..._10_. Belt and braces only: the greedy (\d+) below already makes that
+    // collision unreachable, and an unguessable nonce stops a document reaching
+    // it from the other direction - so this terminator is deliberately NOT
+    // separately provable by a revert.
+    take(code) {
+      const ph = `${token}${blocks.length}_`;
+      blocks.push(code);
+      return ph;
+    },
+    get count() {
+      return blocks.length;
+    },
+    // `unwrapParagraph` changes only WHICH text is replaced, never how the
+    // replacement is built: the @@@html sites have always swallowed the <p>
+    // marked wraps the lone placeholder in, and the mermaid sites have always
+    // left it in place. Preserving that asymmetry is what keeps this change
+    // invisible to patchViewerDOM, mermaid and every geometry assertion.
+    restore(html, build, unwrapParagraph) {
+      if (!blocks.length) return html;
+      const core = `${token}(\\d+)_`;
+      const pattern = unwrapParagraph ? `<p>${core}</p>|${core}` : core;
+      // `bare` is a capture group ONLY in the unwrapParagraph shape, which has
+      // two alternatives and therefore two groups. In the single-group shape
+      // the callback's third argument is the match OFFSET (a number), and the
+      // line below is correct only because `wrapped` is always defined there.
+      // Any extra group added to `core` breaks that silently - the failure mode
+      // is Number(undefined) -> NaN, NaN < length -> false, so the placeholder
+      // is left in the page rather than throwing.
+      return html.replace(new RegExp(pattern, 'g'), (match, wrapped, bare) => {
+        const index = Number(wrapped !== undefined ? wrapped : bare);
+        // A token bearing this render's nonce always indexes a block this
+        // render lifted out. Out of range is unreachable rather than hostile,
+        // so leave the text alone instead of inventing markup for it.
+        return index < blocks.length ? build(blocks[index]) : match;
+      });
+    },
+  };
+}
+
+// The fence body is display text inside a <pre>, never markup, so it is escaped
+// in both the attribute and the element body. Mermaid reads it back through
+// dataset/textContent, which decode entities, so diagram syntax such as `<|--`
+// round-trips unchanged. (DOMPurify then deletes the attribute again for most
+// real diagrams - see restoreMermaidSourceAttributes().)
+function mermaidPreMarkup(code) {
+  const escapedSrc = escapeHtml(code);
+  return `<pre class="mermaid" data-mermaid-src="${escapedSrc}">${escapedSrc}</pre>`;
+}
+
 // Light-format render: skip mermaid/prism, patch only changed DOM nodes
 function renderLightFormat(content, generation) {
   if (generation !== renderGeneration) return;
 
   content = removeBOM(content);
 
+  // Deliberately at the SAME point as renderMarkdownFull's call - after
+  // removeBOM, before any block is lifted out into a placeholder. Matching the
+  // full path rather than improving on it is the whole point: running it after
+  // extraction would leave the two paths disagreeing, just in the other
+  // direction. Without this an edit flips :star: between literal and emoji
+  // depending only on which render path the diff happened to select. Same
+  // two-path divergence that RAW_HTML_FENCE exists to prevent.
+  content = parseEmojis(content);
+
   // Extract and placeholder special blocks (same as full render)
-  const mermaidBlocks = [];
-  content = content.replace(/```mermaid[\r\n]+([\s\S]*?)```/g, (match, code) => {
-    const ph = `MERMAID_PH_${mermaidBlocks.length}`;
-    mermaidBlocks.push({ ph, code: code.trim() });
-    return ph;
-  });
+  const mermaidBlocks = createBlockPlaceholders('MERMAID_BLOCK_');
+  content = content.replace(/```mermaid[\r\n]+([\s\S]*?)```/g, (match, code) =>
+    mermaidBlocks.take(code.trim()));
 
   // Extract @@@html blocks
-  const rawHtmlBlocksLF = [];
-  content = eachRawHtmlBlock(content, (code) => {
-    const ph = `RAWHTML_PH_${rawHtmlBlocksLF.length}`;
-    rawHtmlBlocksLF.push({ ph, code });
-    return ph;
-  });
+  const rawHtmlBlocksLF = createBlockPlaceholders('RAWHTML_BLOCK_');
+  content = eachRawHtmlBlock(content, (code) => rawHtmlBlocksLF.take(code));
 
   let html = marked.parse(content);
 
   // Restore mermaid placeholders — patchViewerDOM will keep existing SVGs for same source
-  mermaidBlocks.forEach(({ ph, code }) => {
-    const escapedSrc = escapeHtml(code);
-    html = html.replace(ph, `<pre class="mermaid" data-mermaid-src="${escapedSrc}">${escapedSrc}</pre>`);
-  });
+  html = mermaidBlocks.restore(html, mermaidPreMarkup, false);
 
   // Restore @@@html placeholders as sandboxed iframes. The document itself is
   // attached after sanitization by applyRawHtmlDocuments(); see the comment on
   // buildRawHtmlDocument().
   rawHtmlDocuments = new Map();
-  rawHtmlBlocksLF.forEach(({ ph, code }) => {
-    html = html.replace(new RegExp(`<p>${ph}</p>|${ph}`), rawHtmlIframeMarkup(code));
-  });
+  html = rawHtmlBlocksLF.restore(html, rawHtmlIframeMarkup, true);
 
   // Sanitize last; nothing may be spliced in after this line. See the note on
   // the same call in renderMarkdownFull() for why data: image URIs need no
@@ -5102,6 +5289,7 @@ function renderLightFormat(content, generation) {
   if (generation !== renderGeneration) return;
 
   patchViewerDOM(html);
+  restoreMermaidSourceAttributes();
   applyRawHtmlDocuments();
   applyNoteStyles();
   addTableMaximizeButtons();
@@ -5166,47 +5354,27 @@ async function renderMarkdownFull(content, generation) {
     content = parseEmojis(content);
 
     // First, extract mermaid blocks and replace with placeholders
-    const mermaidBlocks = [];
-    let mermaidIndex = 0;
+    const mermaidBlocks = createBlockPlaceholders('MERMAID_BLOCK_');
 
-  // Replace mermaid code blocks with placeholders (handle both \n and \r\n)
-  content = content.replace(/```mermaid[\r\n]+([\s\S]*?)```/g, (match, code) => {
-    const placeholder = `MERMAID_PLACEHOLDER_${mermaidIndex}`;
-    mermaidBlocks.push({ placeholder, code: code.trim() });
-    mermaidIndex++;
-    return placeholder;
-  });
+    // Replace mermaid code blocks with placeholders (handle both \n and \r\n)
+    content = content.replace(/```mermaid[\r\n]+([\s\S]*?)```/g, (match, code) =>
+      mermaidBlocks.take(code.trim()));
 
     // Extract @@@html blocks and replace with placeholders (bypasses DOMPurify)
-    const rawHtmlBlocks = [];
-    let rawHtmlIndex = 0;
-    content = eachRawHtmlBlock(content, (code) => {
-      const placeholder = `RAWHTML_PLACEHOLDER_${rawHtmlIndex}`;
-      rawHtmlBlocks.push({ placeholder, code });
-      rawHtmlIndex++;
-      return placeholder;
-    });
+    const rawHtmlBlocks = createBlockPlaceholders('RAWHTML_BLOCK_');
+    content = eachRawHtmlBlock(content, (code) => rawHtmlBlocks.take(code));
 
-  // Parse markdown with marked (allows HTML)
-  let html = marked.parse(content);
+    // Parse markdown with marked (allows HTML)
+    let html = marked.parse(content);
 
-  // Replace placeholders with mermaid divs. The fence body is display text
-  // inside a <pre>, never markup, so it is escaped in both the attribute and
-  // the element body. Mermaid reads it back through dataset/textContent, which
-  // decode entities, so diagram syntax such as `<|--` round-trips unchanged.
-  mermaidBlocks.forEach(({ placeholder, code }) => {
-    const escapedSrc = escapeHtml(code);
-    const mermaidDiv = `<pre class="mermaid" data-mermaid-src="${escapedSrc}">${escapedSrc}</pre>`;
-    html = html.replace(placeholder, mermaidDiv);
-  });
+    // Replace placeholders with mermaid <pre> elements; see mermaidPreMarkup().
+    html = mermaidBlocks.restore(html, mermaidPreMarkup, false);
 
     // Replace @@@html placeholders with iframes. The sandbox attribute is what
     // makes this safe to offer at all - it is also re-applied by a DOMPurify
     // hook, so an iframe written directly into the markdown cannot opt out.
     rawHtmlDocuments = new Map();
-    rawHtmlBlocks.forEach(({ placeholder, code }) => {
-      html = html.replace(new RegExp(`<p>${placeholder}</p>|${placeholder}`), rawHtmlIframeMarkup(code));
-    });
+    html = rawHtmlBlocks.restore(html, rawHtmlIframeMarkup, true);
 
   // Sanitize last, once everything has been assembled, so that nothing can be
   // spliced in behind the sanitizer's back.
@@ -5252,6 +5420,7 @@ async function renderMarkdownFull(content, generation) {
   // to a permanent "Loading..." screen with the document invisible behind it.
   if (generation !== renderGeneration) { hideLoadingScreenFor(generation); return; }
   patchViewerDOM(html);
+  restoreMermaidSourceAttributes();
   applyRawHtmlDocuments();
 
   // Apply note styles immediately after DOM insertion (before async callbacks)

@@ -336,6 +336,7 @@ Output lands in `dist/`. See [`BUILD.md`](https://github.com/lostinsea/folia/blo
 | `F11` | Fullscreen |
 | `F12` | Developer tools — see below |
 | `Tab` | Insert two spaces (editor) |
+| `←` / `→` | Back / forward through files you have opened |
 
 On macOS, use `Cmd` in place of `Ctrl`.
 
