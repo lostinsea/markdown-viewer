@@ -5110,23 +5110,44 @@ function resyncSearchAfterRender() {
 // the SEC-28 comment below; an earlier draft of THIS comment truncated the
 // alternation to (style|title), so the file disagreed with itself.)
 //
-// The full path never noticed because its mermaid.run() set-up re-derives the
-// source as `el.dataset.mermaidSrc || el.textContent.trim()` and writes it back
-// - so the attribute was being repaired there by a line whose stated job is the
-// SVG cache key. The light path has no such loop and left the element with no
-// source attribute at all, which is what the "Edit Diagram" context-menu
-// handlers read (they fall back to '' , not to textContent).
+// The full path did not notice because its mermaid.run() set-up USED TO
+// re-derive the source as `el.dataset.mermaidSrc || el.textContent.trim()` and
+// write it back - so the attribute was being repaired there by a line whose
+// stated job is the SVG cache key. That fallback has since been removed (it
+// reimplemented this helper without the guard below, which made the guard a
+// no-op on that path); the call site now consumes what this function restored.
+// The light path never had such a loop and left the element with no source
+// attribute at all, which is what the "Edit Diagram" context-menu handlers read
+// (they fall back to '' , not to textContent).
 //
 // Restoring it here, on both paths, makes the attribute the single carrier both
 // paths agree on instead of one path having a private recovery.
 function restoreMermaidSourceAttributes() {
   viewer.querySelectorAll('.mermaid').forEach((el) => {
     if (el.dataset.mermaidSrc) return;
-    // An already-drawn diagram holds an <svg>, so its textContent is the drawing
-    // rather than the source. That cannot happen while the attribute is missing
-    // (it is written before mermaid draws), but reading the source off a drawn
-    // element would be silently wrong, so the shape is checked rather than
-    // assumed.
+    // An already-drawn diagram holds an <svg>, so its textContent is the
+    // drawing - the injected <style> rules and all - rather than the source.
+    // That cannot happen while the attribute is missing (it is written before
+    // mermaid draws), but reading the source off a drawn element would be
+    // silently wrong, so the shape is checked rather than assumed.
+    //
+    // The test is ANY element child, not just an <svg>, and the difference is
+    // load-bearing in both directions:
+    //
+    //  - the app's own failure banner (buildMermaidErrorBanner) is a <div> with
+    //    no <svg>, so an svg-only test would adopt "Mermaid Rendering Error:
+    //    ..." as the diagram source and hand that to the Edit Diagram dialog;
+    //  - a reader may author the <pre> as raw HTML with inline markup inside,
+    //    which DOMPurify admits verbatim, and that shape CANNOT be sourced from
+    //    its text: mermaid.run() reads the element's innerHTML, not its
+    //    textContent. MEASURED on the shipped bundle -
+    //    <pre class="mermaid"><b>graph TD ... </b></pre> comes back with
+    //    aria-roledescription="error", i.e. mermaid's syntax-error graphic,
+    //    where the same source without the <b> comes back as
+    //    aria-roledescription="flowchart-v2". Adopting a source for it would
+    //    therefore cache an error graphic under a perfectly clean key.
+    //
+    // Left alone, such an element keeps showing the text its author wrote.
     if (el.firstElementChild) return;
     const src = el.textContent.trim();
     if (src) el.dataset.mermaidSrc = src;
@@ -5196,11 +5217,26 @@ function createBlockPlaceholders(prefix) {
   }
   const blocks = [];
   return {
-    // The trailing `_` terminates the index so that ..._1_ can never be a prefix
-    // of ..._10_. Belt and braces only: the greedy (\d+) below already makes that
-    // collision unreachable, and an unguessable nonce stops a document reaching
-    // it from the other direction - so this terminator is deliberately NOT
-    // separately provable by a revert.
+    // The trailing `_` terminates the index. It is NOT what makes ..._1_ safe
+    // against ..._10_ - the greedy `(\d+)` below already does that - and the
+    // difference is measured rather than argued, over all five patterns, 12
+    // blocks, both `unwrapParagraph` shapes:
+    //
+    //   (\d+)_   shipped              0..11 correct, no debris
+    //   (\d+?)_  lazy, terminated     0..11 correct, no debris  (inert)
+    //   (\d+)    greedy, no term.     0..11 correct, ONE '_' left per block
+    //   (\d+?)   lazy, no terminator  10 and 11 both receive BLOCK 1
+    //   (\d)_    single digit         0..9 restored, 10 and 11 stranded
+    //
+    // So the terminator ENDS THE TOKEN CLEANLY: without it the restore leaves
+    // the '_' behind after every replacement and the `<p>...</p>` alternative
+    // stops matching, because `</p>` no longer follows the digits. An earlier
+    // version of this comment went further and called the terminator
+    // "deliberately NOT separately provable by a revert", and that was WRONG
+    // rather than cautious: R532 proves it, and R533/R538 prove the quantifier
+    // and the capture width beside it. All three are driven by the direct
+    // helper probe in test-render-security.js, which asserts the EXACT restored
+    // output at eleven blocks.
     take(code) {
       const ph = `${token}${blocks.length}_`;
       blocks.push(code);
@@ -5241,6 +5277,14 @@ function createBlockPlaceholders(prefix) {
 // dataset/textContent, which decode entities, so diagram syntax such as `<|--`
 // round-trips unchanged. (DOMPurify then deletes the attribute again for most
 // real diagrams - see restoreMermaidSourceAttributes().)
+//
+// This attribute is the diagram's SOURCE, and deliberately not its IDENTITY.
+// Nothing here can tell one diagram from another that happens to share a body,
+// or tell an app-generated fence from a `<pre class="mermaid">` the author
+// wrote by hand - a data- attribute travels with the markup, so any of them can
+// wear one. The context menu therefore refuses to rewrite the document unless
+// exactly one fence matches; see insertMermaidFromDialog(). Real per-node
+// identity is a larger change and is filed separately.
 function mermaidPreMarkup(code) {
   const escapedSrc = escapeHtml(code);
   return `<pre class="mermaid" data-mermaid-src="${escapedSrc}">${escapedSrc}</pre>`;
@@ -5433,9 +5477,31 @@ async function renderMarkdownFull(content, generation) {
       const toRender = [];
 
       mermaidElements.forEach((el, index) => {
-        // Use data-mermaid-src when available (kept elements already have SVG in textContent)
-        const src = el.dataset.mermaidSrc || el.textContent.trim();
-        el.dataset.mermaidSrc = src;
+        // CONSUME the attribute restoreMermaidSourceAttributes() has already
+        // put back; do not re-derive it. This line used to read
+        // `el.dataset.mermaidSrc || el.textContent.trim()` and write the result
+        // straight back, which reimplemented that helper WITHOUT its
+        // already-drawn guard and so made the guard a no-op on this path: a
+        // kept element holding an <svg> and no attribute got the DRAWING's text
+        // (mermaid's injected CSS included) adopted as its "source", cached
+        // under that as a key, and stamped onto the element where the Edit
+        // Diagram handlers read it. An empty <pre class="mermaid"> arrived at
+        // the same place by a different route - '' misses the cache, so the
+        // element was handed to mermaid, drew its syntax-error graphic, and the
+        // graphic was stored under '', a key every later source-less element
+        // matches.
+        //
+        // An element with no source is left exactly as found: not keyed, not
+        // cached, not handed to mermaid. MEASURED on the full path: an empty
+        // <pre class="mermaid"> is skipped and adds no cache entry
+        // (mermaidSvgCache.has('') === false), while a fence and a raw-HTML
+        // <pre class="mermaid"> both still draw and cache under their own
+        // source. A skipped element is never drawn, so it is never wrapped in a
+        // .mermaid-container either - which is why the context-menu handlers
+        // resolve their target to the .mermaid element itself rather than to
+        // its parent; see the note on ctxEditMermaid.
+        const src = el.dataset.mermaidSrc;
+        if (!src) return;
 
         if (mermaidSvgCache.has(src)) {
           // Restore cached SVG — no mermaid.run() needed for this element
@@ -8758,7 +8824,26 @@ ctxEditMermaid && ctxEditMermaid.addEventListener('click', () => {
   const mermaidEl = rightClickTarget?.closest('.mermaid-container')?.querySelector('.mermaid')
     || rightClickTarget?.closest('.mermaid');
   if (!mermaidEl) return;
-  editingMermaidContainer = mermaidEl.closest('.mermaid-container') || mermaidEl.parentElement;
+  // FALL BACK TO THE DIAGRAM ITSELF, NEVER TO ITS PARENT. A `.mermaid` is only
+  // wrapped in a `.mermaid-container` once it has DRAWN - the wrap loop in
+  // renderMarkdownFull tests for an <svg> - so an undrawn one (an empty fence,
+  // a source-less element the render path skips, or any diagram on the
+  // light-format path, which never runs mermaid) sits directly in #viewer. With
+  // `|| mermaidEl.parentElement` that made #viewer the replace target, and
+  // renderMermaidInDOM('replace') calls replaceTarget.parentElement.replaceChild
+  // on it - which DETACHES #viewer from the document. The module-level `viewer`
+  // const goes on pointing at the orphan, so every later render, search resync
+  // and table-of-contents build writes into a node that is no longer on screen:
+  // the app looks permanently blank until it is restarted.
+  //
+  // Replacing the bare `.mermaid` is also what the wrapped case does, one level
+  // down, so this is the same operation rather than a special case. R535.
+  editingMermaidContainer = mermaidEl.closest('.mermaid-container') || mermaidEl;
+  // THE DOCUMENT REVISION THIS EDIT IS ABOUT. The dialog is modeless, so the
+  // page under it can be replaced while it is open; insertMermaidFromDialog()
+  // refuses if this is no longer the live generation. Cleared by
+  // closeMermaidTemplateDialog(), so a cancelled dialog leaves nothing behind.
+  editingMermaidGeneration = renderGeneration;
   openMermaidTemplateDialog(mermaidEl.dataset.mermaidSrc?.trim() || '', 'edit');
 });
 
@@ -8866,7 +8951,11 @@ function deleteMermaidFromSource(svgTexts, mermaidEl) {
   if (!bestBlock) return;
 
   // Remove from DOM directly (no full re-render)
-  const container = mermaidEl?.closest('.mermaid-container') || mermaidEl?.parentElement;
+  // Same fallback rule as ctxEditMermaid: an undrawn diagram has no
+  // .mermaid-container, and `|| mermaidEl.parentElement` would hand #viewer to
+  // removeChild - deleting one empty fence would take the whole document with
+  // it. R535.
+  const container = mermaidEl?.closest('.mermaid-container') || mermaidEl;
   if (container && container.parentElement) {
     // Removes a live node from the viewer subtree; a pending zoom anchor's
     // recorded element and offsets are no longer describable.
@@ -9165,6 +9254,13 @@ function renderTableInDOM(mdTable, mode, replaceTarget) {
 // Dialog mode state (shared between mermaid and table dialogs)
 let mermaidDialogMode = 'insert'; // 'insert' | 'edit'
 let editingMermaidContainer = null;
+// The renderGeneration an open EDIT dialog was opened against; null when no
+// edit session is live. See ctxEditMermaid and insertMermaidFromDialog().
+let editingMermaidGeneration = null;
+// Monotonic dialog-session token, bumped by every open and every close, and a
+// re-entrancy latch for the validation window. See insertMermaidFromDialog().
+let mermaidDialogSession = 0;
+let mermaidDialogSubmitting = false;
 let tableDialogMode = 'insert';   // 'insert' | 'edit'
 let editingTableEl = null;
 
@@ -9322,6 +9418,8 @@ function scheduleMermaidPreview() {
 function openMermaidTemplateDialog(code = null, mode = 'insert') {
   if (!mermaidTemplateOverlay) return;
   mermaidDialogMode = mode;
+  // Opening ENDS any session a parked submission still belongs to.
+  mermaidDialogSession += 1;
 
   if (code !== null) {
     mermaidTemplateCode.value = code;
@@ -9345,6 +9443,12 @@ function openMermaidTemplateDialog(code = null, mode = 'insert') {
 
 function closeMermaidTemplateDialog() {
   mermaidTemplateOverlay && mermaidTemplateOverlay.classList.remove('visible');
+  // A dialog that is closed - submitted, cancelled, dismissed by its overlay or
+  // by Escape - is no longer an edit session. Clearing this here means a stale
+  // generation can never outlive the dialog that captured it, and bumping the
+  // session token means a submission parked in validation can tell.
+  editingMermaidGeneration = null;
+  mermaidDialogSession += 1;
 }
 
 async function insertMermaidFromDialog() {
@@ -9358,46 +9462,150 @@ async function insertMermaidFromDialog() {
     mermaidTemplateCode.value = code;
   }
 
+  // THE WHOLE DIALOG SESSION IS SNAPSHOTTED BEFORE THE FIRST AWAIT, and that
+  // ordering is the point. Validation below is asynchronous - ensureMermaid()
+  // can fetch 3.5MB and mermaid.render() parses - and the dialog is modeless,
+  // so between entering this function and resuming from those awaits the reader
+  // can cancel, close and reopen on a DIFFERENT diagram, or press Ctrl+Enter
+  // again. Reading `mermaidDialogMode` / `editingMermaidContainer` AFTER the
+  // await is what let a parked submission adopt whatever the dialog had become:
+  // the same code applied to somebody else's diagram, or - if the second dialog
+  // had been closed - turned into an INSERT of a diagram nobody asked for.
+  //
+  // Two mechanisms, and they do different jobs. `mermaidDialogSubmitting`
+  // serialises the validation window, so a second Ctrl+Enter is dropped rather
+  // than racing. `mermaidDialogSession` is bumped by every open and every close,
+  // so a submission that parked across either one can tell that the session it
+  // belongs to is over and refuses to commit. The snapshot is what makes that
+  // check meaningful rather than decorative - without it a stale session would
+  // resume against fresh state - but the snapshot alone cannot refuse, which is
+  // why the token is the thing a revert can perturb (R542).
+  if (mermaidDialogSubmitting) return;
+  mermaidDialogSubmitting = true;
+  const session = ++mermaidDialogSession;
+  const mode = mermaidDialogMode;
+  const editTarget = editingMermaidContainer;
+  const editGeneration = editingMermaidGeneration;
+
   // Validate before inserting — show error in dialog if invalid
+  let validated = false;
   try {
     await ensureMermaid();
     await mermaid.render('mermaid-validate-' + Date.now(), code);
+    validated = true;
   } catch (err) {
     if (mermaidTemplatePreviewEl) {
       const fallback = 'Invalid diagram syntax \u2014 fix errors before inserting';
       mermaidTemplatePreviewEl.replaceChildren(buildMermaidPreviewError(err, fallback));
     }
-    return;
   }
+  // Cleared as soon as the async window closes: everything below is synchronous
+  // up to the commit, so it cannot interleave with another submission.
+  mermaidDialogSubmitting = false;
+  if (!validated) return;
+
+  // The dialog this submission belongs to was closed, cancelled or reopened
+  // while it was validating. Commit nothing.
+  if (session !== mermaidDialogSession) return;
 
   closeMermaidTemplateDialog();
-
-  // Capture and reset state immediately so re-entrant calls are safe
-  const mode = mermaidDialogMode;
-  const editTarget = editingMermaidContainer;
   mermaidDialogMode = 'insert';
   editingMermaidContainer = null;
 
   if (mode === 'edit') {
     if (!editTarget) return;
 
-    const mermaidEl = editTarget.querySelector('.mermaid');
+    const mermaidEl = editTarget.classList && editTarget.classList.contains('mermaid')
+      ? editTarget
+      : editTarget.querySelector('.mermaid');
     const oldCode = mermaidEl?.dataset?.mermaidSrc?.trim() || '';
     const content = isEditMode ? markdownEditor.value : originalMarkdown;
 
-    // Replace the matching mermaid block in source (normalize line endings for robust matching)
-    let newContent = content;
-    if (oldCode) {
-      const normalOld = normalizeMermaidCode(oldCode);
-      const mermaidBlockRegex = /```mermaid[^\S\r\n]*[\r\n]+([\s\S]*?)```/g;
-      let m;
-      while ((m = mermaidBlockRegex.exec(content)) !== null) {
-        if (normalizeMermaidCode(m[1]) === normalOld) {
-          newContent = content.substring(0, m.index) + '```mermaid\n' + code + '\n```' + content.substring(m.index + m[0].length);
-          break;
-        }
+    // FAIL CLOSED: THE PICTURE AND THE FILE MOVE TOGETHER, OR NEITHER MOVES.
+    //
+    // This used to rewrite the FIRST fence whose body matched, guarded only by
+    // `if (oldCode)`, and go on to replace the on-screen diagram either way.
+    // Documents that made those two part company, silently - the reader saw the
+    // new diagram, the document was marked unsaved, and the FILE still held the
+    // old text, so the edit vanished at the next full render and a save wrote
+    // the unedited source:
+    //
+    //   an EMPTY fence has no body to match, so nothing was ever rewritten;
+    //   a body carrying an emoji SHORTCODE cannot match either - parseEmojis()
+    //     runs BEFORE the fences are lifted out, so the body read back here has
+    //     ★ where the file has :star:;
+    //   TWO fences sharing a body make "the first match" the wrong one, so the
+    //     clicked diagram was replaced while a different block was rewritten;
+    //   a raw-HTML <pre class="mermaid"> the author wrote is not a fence at all,
+    //     and when its body equals a real fence's it REDIRECTS the rewrite at
+    //     that fence - a document editing itself through a decoy.
+    //
+    // Three conditions, checked in order, each refusing before anything moves.
+    // WHAT THEY ARE NOT is a claim of ownership: nothing here can tell an
+    // app-generated <pre class="mermaid"> from one the author wrote, because a
+    // class and a data- attribute both travel with the markup. What (2) does is
+    // make the DECOY'S PRESENCE ITSELF disqualifying - if two nodes on screen
+    // carry the same source, neither can be edited - so a same-source decoy can
+    // no longer redirect a rewrite, at the cost of refusing the honest node
+    // beside it. Real per-node identity (a WeakMap keyed by the element,
+    // published atomically after a generation-current commit) remains the
+    // separate solution, and DELETE still has this gap: it is deliberately
+    // untouched in this batch.
+    const refuseEdit = () => {
+      // Before historyPush and before renderMermaidInDOM, so the document, the
+      // undo stack, the unsaved flag and the page are all untouched.
+      showNotification('Could not uniquely identify this diagram in the document', 2500);
+    };
+
+    // (1) THE DIALOG IS STILL ABOUT THIS DOCUMENT. An edit dialog is modeless
+    // and the document underneath it can be replaced while it is open - a tab
+    // switch, a file-watcher reload, an undo. The generation captured when Edit
+    // was clicked must still be the live one, or the dialog is describing a
+    // page that no longer exists and node reuse could even make it look valid.
+    if (editGeneration === null || editGeneration !== renderGeneration) {
+      refuseEdit();
+      return;
+    }
+
+    // (2) THE TARGET IS ON SCREEN, IN THE VIEWER, AND UNIQUELY SOURCED THERE.
+    const normalOld = normalizeMermaidCode(oldCode);
+    const sameSourceNodes = normalOld
+      ? Array.from(viewer.querySelectorAll('.mermaid')).filter(
+          (n) => normalizeMermaidCode(n.dataset && n.dataset.mermaidSrc) === normalOld)
+      : [];
+    if (
+      !mermaidEl ||
+      !mermaidEl.isConnected ||
+      !viewer.contains(mermaidEl) ||
+      sameSourceNodes.length !== 1 ||
+      sameSourceNodes[0] !== mermaidEl
+    ) {
+      refuseEdit();
+      return;
+    }
+
+    // (3) EXACTLY ONE FENCE IN THE MARKDOWN CARRIES THAT BODY. Zero is the
+    // empty fence, the emoji shortcode and the raw-HTML diagram that matches
+    // nothing; more than one is the ambiguity no body can resolve.
+    const matches = [];
+    const mermaidBlockRegex = /```mermaid[^\S\r\n]*[\r\n]+([\s\S]*?)```/g;
+    let m;
+    while ((m = mermaidBlockRegex.exec(content)) !== null) {
+      if (normalizeMermaidCode(m[1]) === normalOld) {
+        matches.push({ start: m.index, end: m.index + m[0].length });
       }
     }
+    if (matches.length !== 1) {
+      refuseEdit();
+      return;
+    }
+
+    // Replace the matching mermaid block in source (normalize line endings for robust matching)
+    const hit = matches[0];
+    const newContent =
+      content.substring(0, hit.start) +
+      '```mermaid\n' + code + '\n```' +
+      content.substring(hit.end);
 
     historyPush(isEditMode ? markdownEditor.value : originalMarkdown);
 

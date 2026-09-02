@@ -951,12 +951,15 @@ async function run(win) {
     // fixture C read `data-mermaid-src` back off the restored <pre>, and an
     // oracle that this render path can never satisfy is indistinguishable from
     // a real proof - the harness checks that a revert's `expect` MATCHES, not
-    // that the assertion passes at rest (R357). The two paths carry the
-    // attribute by DIFFERENT mechanisms: the full path re-asserts it in JS
-    // after sanitization (renderer.js:5309, in the mermaid.run set-up), while
-    // the light path never runs mermaid and relies entirely on the attribute it
-    // authored surviving DOMPurify. So this control is the only thing standing
-    // between "the light oracle is sound" and "the light oracle is vacuous".
+    // that the assertion passes at rest (R357). The two paths used to carry the
+    // attribute by DIFFERENT mechanisms: the full path re-derived it in JS
+    // inside the mermaid.run set-up, while the light path never runs mermaid
+    // and relied entirely on the attribute it authored surviving DOMPurify.
+    // That private re-derivation is gone - both paths now call
+    // restoreMermaidSourceAttributes() after sanitization and nothing else
+    // repairs it - which makes this control MORE load-bearing, not less: with
+    // one shared mechanism, an oracle nothing can satisfy would be vacuous on
+    // both legs at once.
     await warm();
     await render("# Doc\n\n```mermaid\n" + F43_DIAGRAM + "\n```\n", leg.mode);
     const ctl = await f43Probe(leg.mermaidTok);
@@ -1118,6 +1121,111 @@ async function run(win) {
     JSON.stringify(nonces),
   );
 
+  // ---- TWO-DIGIT BLOCK INDICES, at the shared helper directly -------------
+  //
+  // Every fixture above renders at most two blocks of a kind, so the highest
+  // index any of them mints is 1 and the restore pattern's `(\d+)_` is only
+  // ever asked to match ONE digit. Reaching a two-digit index through the
+  // public render path costs eleven diagrams per leg, which buys nothing the
+  // helper cannot show more precisely - so this exercises createBlockPlaceholders
+  // itself, in the live renderer page, with no render at all.
+  //
+  // It is also STRICTLY STRONGER than the page could be, in three ways:
+  //
+  //  - THE ORACLE IS THE EXACT RESTORED STRING, not a regex extract plus
+  //    counts. An extract of `[PAYLOAD-n]` matches just as happily when the
+  //    restore leaves a trailing `_` behind after every replacement, which is
+  //    precisely what dropping the index terminator does. A full compare
+  //    cannot miss it.
+  //  - the @@@html half's index-to-payload identity is unobservable in the
+  //    page: eleven iframes carry eleven srcdoc documents of near-identical
+  //    length, so a DOM fixture can assert only that each was funded, never
+  //    WHICH body each received.
+  //  - the `unwrapParagraph` shape is a DIFFERENT REGEX (`<p>core</p>|core`,
+  //    two capture groups, so the callback reads a different argument), and
+  //    only here can the paragraph be shown swallowed for EVERY block rather
+  //    than for the first frame the page happens to expose.
+  //
+  // MEASURED against this same restore, all five index patterns, 12 blocks,
+  // both `unwrapParagraph` shapes:
+  //
+  //   (\d+)_   shipped              0..11 correct, no debris
+  //   (\d+?)_  lazy, terminated     0..11 correct, no debris - INERT, so it is
+  //                                 deliberately not recorded as a revert
+  //   (\d+)    greedy, no term.     0..11 correct, ONE '_' left per block, and
+  //                                 the <p> alternative stops matching  (R532)
+  //   (\d+?)   lazy, no terminator  10 and 11 both receive BLOCK 1            (R533)
+  //   (\d)_    single digit         0..9 restored, 10 and 11 STRANDED         (R538)
+  //
+  // So the terminator is NOT a mapping guard - the greedy `(\d+)` already makes
+  // the ..._1_ / ..._10_ collision unreachable, and laziness alone is inert
+  // because the terminator forces the backtrack that recovers the second digit.
+  // What the terminator does is end the token cleanly, and that is what R532
+  // measures. The three records stay isolated through the SELECTION assertion
+  // below, which R532 must leave passing.
+  const F43_HELPER_N = 11;
+  const f43Helper = JSON.parse(
+    await exec(`
+    (() => {
+      const N = ${F43_HELPER_N};
+      const mk = (unwrap) => {
+        const ph = createBlockPlaceholders(unwrap ? 'RAWHTML_PROBE_' : 'MERMAID_PROBE_');
+        const toks = [];
+        for (let i = 0; i < N; i++) toks.push(ph.take('PAYLOAD-' + i));
+        const html = unwrap
+          ? toks.map((t) => '<p>' + t + '</p>').join('\\n')
+          : toks.map((t) => '<pre>' + t + '</pre>').join('\\n');
+        // The order the product's OWN builder was called in, recorded as it
+        // happens. This is not an extract from the output - it is which block
+        // the restore chose for each hole, in document order.
+        const chosen = [];
+        const out = ph.restore(html, (code) => { chosen.push(code); return '[' + code + ']'; }, unwrap);
+        return {
+          // POSITIVE CONTROL: the fixture has to actually reach a two-digit
+          // index, or an assertion about two-digit indices is vacuous.
+          token10: toks[10],
+          out: out,
+          chosen: chosen,
+        };
+      };
+      return JSON.stringify({ bare: mk(false), unwrapped: mk(true) });
+    })()
+  `),
+  );
+  // Built here, from the payloads this test authored, with no reference to what
+  // the product produced - the one thing a regression oracle must not do is
+  // agree with whatever the product does.
+  const f43Payloads = Array.from({ length: F43_HELPER_N }, (_, i) => "PAYLOAD-" + i);
+  const f43BareExpected = f43Payloads.map((p) => "<pre>[" + p + "]</pre>").join("\n");
+  const f43UnwrapExpected = f43Payloads.map((p) => "[" + p + "]").join("\n");
+  check(
+    "F43 the shared helper restores every placeholder exactly, two digits included",
+    /_10_$/.test(f43Helper.bare.token10) && f43Helper.bare.out === f43BareExpected,
+    JSON.stringify({ out: f43Helper.bare.out, token10: f43Helper.bare.token10 }),
+  );
+  check(
+    // The `<p>` wrappers are absent from the expected string: this shape's job
+    // is to swallow the paragraph marked wrapped the lone placeholder in, for
+    // every block and not just the first. An exact compare pins both halves at
+    // once - which block, and what became of its paragraph.
+    "F43 the helper's paragraph-unwrapping shape restores exactly, and eats every paragraph",
+    /_10_$/.test(f43Helper.unwrapped.token10) &&
+      f43Helper.unwrapped.out === f43UnwrapExpected,
+    JSON.stringify({ out: f43Helper.unwrapped.out, token10: f43Helper.unwrapped.token10 }),
+  );
+  check(
+    // SELECTION, separately, and it is what keeps the three index records apart.
+    // The exact-output assertions above fail for ANY defect in the restore;
+    // this one fails only when the WRONG BLOCK is chosen for a hole (or a hole
+    // is skipped). Dropping the terminator leaves this passing, which is the
+    // difference between R532 and R533/R538 stated as an assertion rather than
+    // as evidence.
+    "F43 the helper hands each hole its own block, in order, at two-digit indices too",
+    JSON.stringify(f43Helper.bare.chosen) === JSON.stringify(f43Payloads) &&
+      JSON.stringify(f43Helper.unwrapped.chosen) === JSON.stringify(f43Payloads),
+    JSON.stringify({ bare: f43Helper.bare.chosen, unwrapped: f43Helper.unwrapped.chosen }),
+  );
+
   // ---- N18 - DOMPurify deletes the mermaid source attribute for real
   // flowcharts, and it does so on a VALUE SHAPE, not an attribute name ----
   //
@@ -1172,10 +1280,13 @@ async function run(win) {
     JSON.stringify(n18Premise),
   );
 
-  // Consequence, on BOTH paths. They carry the attribute by different
+  // Consequence, on BOTH paths. They used to carry the attribute by different
   // mechanisms - the full path was repairing it by accident inside the
   // mermaid.run set-up, the light path had nothing at all - so a single-leg
-  // assertion would have reported the light defect as a full-path pass.
+  // assertion would have reported the light defect as a full-path pass. The
+  // accident has since been removed and both paths call the same helper, but
+  // they call it from two separate sites, so the two legs still measure two
+  // different things (R527 / R528 break one each).
   const N18_ARROW = "graph TD\n  A --> B";
   const N18_PLAIN = "graph TD\n  A[Only one node]";
   for (const mode of ["full", "light-format"]) {

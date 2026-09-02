@@ -2469,21 +2469,75 @@ async function run(win) {
     // focuses a scroller today, so the harm is LATENT - which is exactly why it
     // needs an assertion rather than a comment.
     //
-    // The block is HERMETIC: `open-file-path` is recorded and never forwarded,
-    // so the sweep cannot move the document under the rest of the suite, and
-    // the recorded send is also the only honest oracle for "navigation really
+    // The block is HERMETIC, and that is now a PROVEN property rather than a
+    // stated one. `open-file-path` is recorded and never forwarded, so the
+    // sweep cannot move the document under the rest of the suite, and the
+    // recorded send is also the only honest oracle for "navigation really
     // happened". Every other channel still goes out.
     //
-    // NOTE FOR EDITORS: never a backtick or a dollar-brace inside this
-    // template literal - it terminates it, and this file has been bitten by
-    // that four times.
-    const navProbe = await exec(`
+    // The restoration used to sit at the END of the probe, so it ran only on
+    // NORMAL COMPLETION: any throw inside the sweep - a renamed product global,
+    // a KeyboardEvent the runtime rejects, an assertion added later that reads
+    // something absent - left `ipcRenderer.send` and `window.confirm` STUBBED,
+    // the navigation history seeded with two synthetic entries, and a stray
+    // <textarea> on the body for every assertion that followed. The failure the
+    // reader would then be handed is whatever broke next, not the probe. It is
+    // a `finally` now, and the fault-injection leg below is what stops that
+    // being a comment nobody can check.
+    //
+    // NOTE FOR EDITORS: never a backtick or a dollar-brace inside these
+    // template literals - it terminates them, and this file has been bitten by
+    // that four times. The fault leg is selected through a window flag for that
+    // reason, where an interpolated argument would have been the obvious way.
+    //
+    // ONE ORACLE, installed once and read by the probe, by its fault leg and by
+    // the two assertions, so all three compare exactly the same fields. Two
+    // hand-written copies of this list would be free to drift apart, and the
+    // one that mattered would be the one that stopped looking at the stubs.
+    //
+    // EVERY FIELD OF EVERY HISTORY ENTRY, not just `filePath`. An entry also
+    // carries `scrollPosition`, and the product writes to it
+    // (addToNavigationHistory records the current scroll before navigating
+    // away), so a restore that put the right paths back with the wrong offsets
+    // - or that rebuilt entries and dropped a field added later - would have
+    // been invisible to a path list. Keys are sorted before joining so that key
+    // ORDER cannot make two equal entries compare unequal.
+    //
+    // The `__navProbeStub` markers below are EVIDENCE ONLY. They say "something
+    // stubbed this", which is not the same as "this is the object the probe
+    // borrowed" - the restoration oracle is exact function identity, computed
+    // page-side; see recordRestoration() in the probe.
+    await exec(`
+      window.__navProbeSnap = () => ({
+        histLen: navigationHistory.length,
+        hist: navigationHistory.map((h) =>
+          h && typeof h === 'object'
+            ? Object.keys(h).sort().map((k) => k + '=' + JSON.stringify(h[k])).join('&')
+            : String(h)),
+        idx: navigationIndex,
+        navigating: isNavigating,
+        dirty: hasUnsavedChanges,
+        edit: isEditMode,
+        sendStubbed: ipcRenderer.send.__navProbeStub === true,
+        confirmStubbed: window.confirm.__navProbeStub === true,
+        bodyTextareas: document.querySelectorAll('body > textarea').length,
+      });
+      window.__navProbeFault = false;
+      window.__navProbeEvidence = null;
+      null;
+    `);
+    const navProbeSource = `
       (async () => {
         const fire = (key, target) => {
           const ev = new KeyboardEvent('keydown', { key, bubbles: true, cancelable: true });
           (target || document).dispatchEvent(ev);
           return ev.defaultPrevented;
         };
+        const before = window.__navProbeSnap();
+        // Always present, so the finally can write into it whether or not the
+        // fault leg armed it, and so a rejected exec still leaves its evidence
+        // behind - a throw takes the return value with it.
+        window.__navProbeEvidence = { before: before, dirty: null, restored: null };
         const histBefore = navigationHistory.slice();
         const idxBefore = navigationIndex;
         const navBefore = isNavigating;
@@ -2492,55 +2546,118 @@ async function run(win) {
         const realSend = ipcRenderer.send;
         const realConfirm = window.confirm;
         const sent = [];
-        ipcRenderer.send = function (channel) {
-          if (channel === 'open-file-path') { sent.push(channel); return; }
-          return realSend.apply(ipcRenderer, arguments);
-        };
-        const seed = (idx) => {
+        let ta = null;
+        // EVERYTHING THE BODY BELOW IS ALLOWED TO MOVE, put back in one place.
+        // The stubs are restored FIRST: a throw inside one of the product calls
+        // that follow would otherwise leave them installed, which is the exact
+        // leak this function exists to prevent.
+        const restore = () => {
+          ipcRenderer.send = realSend;
+          window.confirm = realConfirm;
+          if (ta) { ta.remove(); ta = null; }
           navigationHistory.length = 0;
-          navigationHistory.push({ filePath: currentFilePath, scrollPosition: 0 });
-          navigationHistory.push({ filePath: currentFilePath, scrollPosition: 0 });
-          navigationIndex = idx;
-          isNavigating = false;
-          isEditMode = false;
-          hasUnsavedChanges = false;
-          sent.length = 0;
+          for (const h of histBefore) navigationHistory.push(h);
+          navigationIndex = idxBefore;
+          isNavigating = navBefore;
+          hasUnsavedChanges = dirtyBefore;
+          isEditMode = editBefore;
+          updateUnsavedIndicator();
+          // The product's own state-restoring paths call this, and the two
+          // globals it reads are both moved above. RECOMPUTING from the
+          // restored history is the contract, not preserving whatever the
+          // buttons happened to show: navigationIndex and navigationHistory are
+          // authoritative, so a disabled flag that disagreed with them before
+          // the probe was already wrong and preserving it would preserve the
+          // inconsistency. It is INERT today either way, and that is measured
+          // rather than assumed: navBackBtn and navForwardBtn both resolve to
+          // null - the file-info bar that held them was deleted - so
+          // updateNavButtons() guards on them and does nothing, and the two
+          // contracts are indistinguishable. It is called anyway, because the
+          // alternative is a restore that is silently incomplete the day those
+          // buttons come back.
+          updateNavButtons();
+        };
+        // READ AFTER restore() HAS RETURNED, deliberately, and from outside it.
+        // Function objects cannot cross executeJavaScript - they serialise to
+        // nothing - so "is this the object the probe borrowed" has to be decided
+        // HERE, in the same invocation that captured realSend and realConfirm,
+        // and only the boolean travels. Computing it inside restore(), on the
+        // line after the assignment, would be very nearly a tautology; from out
+        // here it also catches a restore that assigned some OTHER function, or
+        // anything that re-stubbed during restore()'s own tail.
+        const recordRestoration = () => {
+          if (!window.__navProbeEvidence) return;
+          window.__navProbeEvidence.restored = {
+            state: window.__navProbeSnap(),
+            sendIsOriginal: ipcRenderer.send === realSend,
+            confirmIsOriginal: window.confirm === realConfirm,
+          };
         };
         const out = {};
-        window.confirm = () => true;
-        seed(1); out.backPossible = { prevented: fire('ArrowLeft'), sends: sent.length };
-        seed(0); out.backAtStart = { prevented: fire('ArrowLeft'), sends: sent.length };
-        seed(0); out.fwdPossible = { prevented: fire('ArrowRight'), sends: sent.length };
-        seed(1); out.fwdAtEnd = { prevented: fire('ArrowRight'), sends: sent.length };
+        try {
+          const sendStub = function (channel) {
+            if (channel === 'open-file-path') { sent.push(channel); return; }
+            return realSend.apply(ipcRenderer, arguments);
+          };
+          sendStub.__navProbeStub = true;
+          ipcRenderer.send = sendStub;
+          // Marked so the snapshot can tell a stub from the real thing by
+          // identity rather than by guessing from behaviour.
+          const stubConfirm = (fn) => { fn.__navProbeStub = true; window.confirm = fn; return fn; };
+          const seed = (idx) => {
+            navigationHistory.length = 0;
+            navigationHistory.push({ filePath: currentFilePath, scrollPosition: 0 });
+            navigationHistory.push({ filePath: currentFilePath, scrollPosition: 0 });
+            navigationIndex = idx;
+            isNavigating = false;
+            isEditMode = false;
+            hasUnsavedChanges = false;
+            sent.length = 0;
+          };
+          stubConfirm(() => true);
+          seed(1); out.backPossible = { prevented: fire('ArrowLeft'), sends: sent.length };
+          seed(0); out.backAtStart = { prevented: fire('ArrowLeft'), sends: sent.length };
+          seed(0); out.fwdPossible = { prevented: fire('ArrowRight'), sends: sent.length };
+          seed(1); out.fwdAtEnd = { prevented: fire('ArrowRight'), sends: sent.length };
 
-        let asked = 0;
-        window.confirm = () => { asked++; return false; };
-        seed(1); isEditMode = true; hasUnsavedChanges = true;
-        out.dirtyDeclined = { prevented: fire('ArrowLeft'), sends: sent.length, asked: asked };
-        asked = 0;
-        window.confirm = () => { asked++; return true; };
-        seed(1); isEditMode = true; hasUnsavedChanges = true;
-        out.dirtyAccepted = { prevented: fire('ArrowLeft'), sends: sent.length, asked: asked };
+          let asked = 0;
+          stubConfirm(() => { asked++; return false; });
+          seed(1); isEditMode = true; hasUnsavedChanges = true;
+          out.dirtyDeclined = { prevented: fire('ArrowLeft'), sends: sent.length, asked: asked };
+          asked = 0;
+          stubConfirm(() => { asked++; return true; });
+          seed(1); isEditMode = true; hasUnsavedChanges = true;
+          out.dirtyAccepted = { prevented: fire('ArrowLeft'), sends: sent.length, asked: asked };
 
-        window.confirm = () => true;
-        seed(1);
-        const ta = document.createElement('textarea');
-        document.body.appendChild(ta);
-        out.inTextarea = { prevented: fire('ArrowLeft', ta), sends: sent.length };
-        ta.remove();
+          stubConfirm(() => true);
+          seed(1);
+          ta = document.createElement('textarea');
+          document.body.appendChild(ta);
+          out.inTextarea = { prevented: fire('ArrowLeft', ta), sends: sent.length };
 
-        ipcRenderer.send = realSend;
-        window.confirm = realConfirm;
-        navigationHistory.length = 0;
-        for (const h of histBefore) navigationHistory.push(h);
-        navigationIndex = idxBefore;
-        isNavigating = navBefore;
-        hasUnsavedChanges = dirtyBefore;
-        isEditMode = editBefore;
-        updateUnsavedIndicator();
+          if (window.__navProbeFault) {
+            // Recorded BEFORE the throw, because the whole point is that the
+            // state is dirty at this instant and clean once the finally has
+            // run. Without it the assertion below could not tell restoration
+            // from a leg that never mutated anything. The two identity
+            // booleans are the mirror of recordRestoration()'s: false here,
+            // true afterwards, both decided against the same two captured
+            // objects.
+            window.__navProbeEvidence.dirty = {
+              state: window.__navProbeSnap(),
+              sendIsOriginal: ipcRenderer.send === realSend,
+              confirmIsOriginal: window.confirm === realConfirm,
+            };
+            throw new Error('navprobe fault injection');
+          }
+        } finally {
+          restore();
+          recordRestoration();
+        }
         return out;
       })()
-    `);
+    `;
+    const navProbe = await exec(navProbeSource);
     // THE POSITIVE CONTROL for every "not prevented" reading below. Without it
     // a dispatch that never reaches the handler at all reports prevented=false
     // everywhere and the narrowing assertions pass for the worst possible
@@ -2581,6 +2698,77 @@ async function run(win) {
       "an arrow key typed into a textarea is never hijacked by file navigation",
       navProbe.inTextarea.prevented === false && navProbe.inTextarea.sends === 0,
       JSON.stringify(navProbe.inTextarea),
+    );
+
+    // --- the probe's own HERMETICITY, by fault injection ------------------
+    //
+    // The restoration above is a `finally`, and a `finally` that always runs is
+    // indistinguishable from a restoration written straight after the body -
+    // the two differ ONLY on the throwing path, and nothing in this suite
+    // throws. So a comment claiming "hermetic" would be unfalsifiable and would
+    // stay green through the exact refactor that unwrapped it. R534.
+    //
+    // The same probe source is run a second time with a flag that makes it
+    // throw AFTER it has stubbed both globals, seeded the history and attached
+    // its textarea. It is the SAME SOURCE deliberately - a parallel copy would
+    // prove a copy hermetic - and the leg is cheap: the sweep it repeats is
+    // seven synthetic key events.
+    await exec(`window.__navProbeFault = true; window.__navProbeEvidence = null; null;`);
+    let navFaultThrew = null;
+    await exec(navProbeSource).catch((e) => {
+      navFaultThrew = String((e && e.message) || e);
+    });
+    await exec(`window.__navProbeFault = false; null;`);
+    const navFault = await exec(`
+      (() => ({ evidence: window.__navProbeEvidence, after: window.__navProbeSnap() }))()
+    `);
+    // THE POSITIVE CONTROL, and this pair is useless without it. "State is
+    // where it was" is trivially true of a leg that never ran, never stubbed
+    // anything and never threw - the absence check failing open, again - so the
+    // fault leg has to prove it reached the throw with the page genuinely dirty
+    // before the restoration assertion below means anything at all.
+    check(
+      "the nav probe's fault leg really threw, with both stubs installed and the history seeded",
+      navFaultThrew !== null &&
+        /navprobe fault injection/.test(navFaultThrew) &&
+        navFault.evidence !== null &&
+        navFault.evidence.dirty !== null &&
+        // IDENTITY, not the marker: at the instant of the throw NEITHER global
+        // was still the object the probe borrowed. The `__navProbeStub` flags
+        // travel in `state` as evidence, but they are not what is asserted -
+        // "something stubbed this" and "this is not the original" are different
+        // claims, and only the second one makes the restoration assertion below
+        // mean anything.
+        navFault.evidence.dirty.sendIsOriginal === false &&
+        navFault.evidence.dirty.confirmIsOriginal === false &&
+        navFault.evidence.dirty.state.histLen === 2 &&
+        navFault.evidence.dirty.state.idx === 1 &&
+        navFault.evidence.dirty.state.bodyTextareas ===
+          navFault.evidence.before.bodyTextareas + 1,
+      JSON.stringify({ navFaultThrew, evidence: navFault.evidence }),
+    );
+    check(
+      "a nav probe that throws still puts back every global and both stubs it borrowed",
+      navFault.evidence !== null &&
+        // Null here is the shape a revert of the `finally` produces: the
+        // restoration never ran at all, so nothing was ever recorded.
+        navFault.evidence.restored !== null &&
+        // EXACT FUNCTION IDENTITY, decided page-side. A function that merely
+        // lacks the probe's marker satisfies a shape check while being some
+        // other function entirely - a re-wrapped stub, or a fresh no-op left by
+        // a half-written restore. These two booleans are the only thing that
+        // distinguishes "put back" from "replaced with something plausible".
+        navFault.evidence.restored.sendIsOriginal === true &&
+        navFault.evidence.restored.confirmIsOriginal === true &&
+        // EVERY captured field, entry by entry - `hist` carries each entry's
+        // whole contents, scrollPosition included, so a restore that kept the
+        // paths and lost the offsets fails here.
+        JSON.stringify(navFault.evidence.restored.state) ===
+          JSON.stringify(navFault.evidence.before) &&
+        // ...and it is STILL restored when the assertion reads it, which the
+        // in-probe snapshot alone cannot say.
+        JSON.stringify(navFault.after) === JSON.stringify(navFault.evidence.before),
+      JSON.stringify(navFault),
     );
   }
 

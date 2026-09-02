@@ -2529,6 +2529,638 @@ async function run(win) {
     JSON.stringify(bridge),
   );
 
+  // (e3) THE UNDRAWN DIAGRAM: its context-menu target, and its source rewrite.
+  //
+  // A `.mermaid` is only wrapped in a `.mermaid-container` once it has DRAWN -
+  // the wrap loop in renderMarkdownFull tests for an <svg>. Three shapes reach
+  // the reader undrawn: an EMPTY fence (no source, so the render path skips
+  // it), any diagram on the light-format path (which never runs mermaid), and
+  // a source-less element left behind by a failed render. None of them has a
+  // container, so both context-menu handlers used to fall back to
+  // `mermaidEl.parentElement`. Under a heading that is the enclosing
+  // `.collapsible-section` - i.e. the whole rest of the section; with no
+  // heading it is #viewer ITSELF, and Edit then handed #viewer to
+  // renderMermaidInDOM('replace'), which calls
+  // replaceTarget.parentElement.replaceChild(), while Delete handed it to
+  // removeChild(). Either DETACHES THE WHOLE DOCUMENT: the module-level
+  // `viewer` const goes on pointing at the orphan, so the app looks blank until
+  // it is restarted, with nothing in the console to say why.
+  //
+  // The fixture is the empty fence because it is the one an ordinary author can
+  // type, and it is written WITHOUT a heading deliberately, to reach the
+  // catastrophic parent rather than the merely bad one. MEASURED: with a
+  // leading `# Doc` the probe reports parentIsViewer false.
+  //
+  // The probe REPAIRS a detached viewer and records that it did, so a future
+  // revert of the DELETE site reports as its own assertion failing rather than
+  // as every later assertion in this suite failing against an orphan. (R535
+  // reverts the EDIT site, which resolves the target but never acts on it, so
+  // the repair cannot fire there.)
+  const EMPTY_FENCE_DOC = "Empty diagram below.\n\n```mermaid\n```\n";
+  // The second leg's fixture: a SOURCED undrawn diagram, reached through the
+  // light-format path, which never runs mermaid and never wraps. Rewriting the
+  // markdown is the half of Edit that the empty fence cannot see - its own
+  // `oldCode` is empty either way.
+  const LF_WARM_DOC = "warm text\n";
+  const LF_DIAGRAM = "graph TD\n  A[Old] --> B[Source]";
+  const LF_NEW_CODE = "graph TD\n  C[New] --> D[Source]";
+  const LF_DOC = "light text\n\n```mermaid\n" + LF_DIAGRAM + "\n```\n";
+  const undrawn = await exec(`
+    (async () => {
+      const savedSource = window.originalMarkdown;
+      const savedUndo = undoHistory.slice();
+      const savedRedo = redoHistory.slice();
+      const savedDirty = hasUnsavedChanges;
+      const v = document.getElementById('viewer');
+      const out = {};
+      try {
+      await window.renderMarkdown(${JSON.stringify(EMPTY_FENCE_DOC)}, 'full');
+      await new Promise(r => setTimeout(r, 500));
+      const el = v.querySelector('.mermaid');
+      out.found = !!el;
+      out.undrawn = !!el && !el.querySelector('svg');
+      out.unwrapped = !!el && !el.closest('.mermaid-container');
+      out.parentIsViewer = !!el && el.parentElement === v;
+      if (!el) return out;
+
+      // EDIT, through the real menu handler rather than by calling the
+      // resolution expression the test would have to copy.
+      rightClickTarget = el;
+      document.getElementById('ctxEditMermaid').click();
+      out.editTargetIsViewer = editingMermaidContainer === v;
+      out.editTargetIsDiagram = editingMermaidContainer === el;
+      closeMermaidTemplateDialog();
+      editingMermaidContainer = null;
+      // closeMermaidTemplateDialog() only drops the overlay's class; the mode
+      // the click set is the dialog's own state and has to be put back, or the
+      // next caller of insertMermaidFromDialog() in this suite takes the edit
+      // branch with a null target.
+      mermaidDialogMode = 'insert';
+      rightClickTarget = null;
+
+      // DELETE, through the handler's own function. The source holds exactly
+      // one fence, so the product takes its single-block path and no text
+      // scoring is involved.
+      window.originalMarkdown = ${JSON.stringify(EMPTY_FENCE_DOC)};
+      window.deleteMermaidFromSource([], el);
+      out.viewerStillAttached = v.isConnected;
+      out.diagramRemoved = !v.contains(el);
+      if (!v.isConnected) {
+        // Put the document back so the rest of this probe has a page to run
+        // against. Recorded, so a green run can never be a repaired one.
+        document.querySelector('.content-wrapper').appendChild(v);
+        out.repairedAfterDelete = true;
+      }
+
+      // ---- leg B: the SOURCE half of Edit, on a sourced undrawn diagram ----
+      await window.renderMarkdown(${JSON.stringify(LF_WARM_DOC)}, 'full');
+      await new Promise(r => setTimeout(r, 300));
+      await window.renderMarkdown(${JSON.stringify(LF_DOC)}, 'light-format');
+      await new Promise(r => setTimeout(r, 300));
+      const el2 = v.querySelector('.mermaid');
+      out.lfFound = !!el2;
+      out.lfUndrawn = !!el2 && !el2.querySelector('svg');
+      out.lfUnwrapped = !!el2 && !el2.closest('.mermaid-container');
+      out.lfSourced = !!el2 && el2.dataset.mermaidSrc === ${JSON.stringify(LF_DIAGRAM)};
+      if (el2) {
+        window.originalMarkdown = ${JSON.stringify(LF_DOC)};
+        rightClickTarget = el2;
+        document.getElementById('ctxEditMermaid').click();
+        document.getElementById('mermaidTemplateCode').value = ${JSON.stringify(LF_NEW_CODE)};
+        await window.insertMermaidFromDialog();
+        await new Promise(r => setTimeout(r, 600));
+        const after = window.originalMarkdown;
+        out.lfSourceRewritten = after.indexOf(${JSON.stringify(LF_NEW_CODE)}) !== -1;
+        out.lfOldSourceGone = after.indexOf(${JSON.stringify(LF_DIAGRAM)}) === -1;
+        out.lfDialogClosed = !document.getElementById('mermaidTemplateOverlay')
+          .classList.contains('visible');
+        rightClickTarget = null;
+      }
+      return out;
+      } finally {
+        // Everything this probe is allowed to move, put back - it rewrites the
+        // document source, pushes undo entries and marks the page dirty.
+        window.originalMarkdown = savedSource;
+        undoHistory.length = 0;
+        for (const h of savedUndo) undoHistory.push(h);
+        redoHistory.length = 0;
+        for (const h of savedRedo) redoHistory.push(h);
+        hasUnsavedChanges = savedDirty;
+        updateUnsavedIndicator();
+        closeMermaidTemplateDialog();
+        mermaidDialogMode = 'insert';
+        editingMermaidContainer = null;
+        rightClickTarget = null;
+        // LAST, and it covers leg B as well as the delete leg: the edit path
+        // ends in renderMermaidInDOM('replace', target), so a regression in
+        // WHICH element is targeted detaches #viewer here rather than at the
+        // delete call. Repairing it keeps the rest of the suite meaningful, and
+        // the flag keeps the repair visible.
+        if (!v.isConnected) {
+          document.querySelector('.content-wrapper').appendChild(v);
+          out.repairedAtExit = true;
+        }
+      }
+    })()
+  `);
+  // POSITIVE CONTROL. "The viewer survived" is trivially true of a fixture that
+  // never produced the shape the defect needs, so the shape is asserted first
+  // and separately: found, not drawn, not wrapped, sitting in #viewer.
+  check(
+    "an empty mermaid fence really reaches the reader as an undrawn, unwrapped diagram",
+    undrawn.found === true &&
+      undrawn.undrawn === true &&
+      undrawn.unwrapped === true &&
+      undrawn.parentIsViewer === true,
+    JSON.stringify(undrawn),
+  );
+  check(
+    "the Edit Diagram target for an undrawn diagram is the diagram, never the viewer",
+    undrawn.editTargetIsDiagram === true && undrawn.editTargetIsViewer === false,
+    JSON.stringify(undrawn),
+  );
+  check(
+    "deleting an undrawn diagram removes the diagram and leaves the viewer attached",
+    undrawn.diagramRemoved === true &&
+      undrawn.viewerStillAttached === true &&
+      undrawn.repairedAfterDelete === undefined,
+    JSON.stringify(undrawn),
+  );
+  // The SECOND positive control, for leg B. Its assertion is about the markdown
+  // being rewritten, and a leg that never produced a sourced, undrawn, unwrapped
+  // diagram would leave that unprovable rather than false.
+  check(
+    "the light-format path really leaves a sourced but undrawn, unwrapped diagram",
+    undrawn.lfFound === true &&
+      undrawn.lfUndrawn === true &&
+      undrawn.lfUnwrapped === true &&
+      undrawn.lfSourced === true,
+    JSON.stringify(undrawn),
+  );
+  check(
+    "editing an undrawn diagram rewrites the markdown, not just the picture",
+    undrawn.lfSourceRewritten === true &&
+      undrawn.lfOldSourceGone === true &&
+      undrawn.lfDialogClosed === true,
+    JSON.stringify(undrawn),
+  );
+  // The probe repairs a detached #viewer on its way out so that the rest of the
+  // suite still has a page; this is what stops that repair being silent. It is
+  // a separate assertion rather than a conjunct of the two above because it has
+  // a different subject - not what was edited or deleted, but whether the
+  // DOCUMENT survived being edited or deleted at all.
+  check(
+    "the undrawn-diagram probe left the viewer attached to the page",
+    undrawn.repairedAtExit === undefined,
+    JSON.stringify(undrawn),
+  );
+
+  // (e5) THE EDIT REFUSES RATHER THAN DIVERGING.
+  //
+  // insertMermaidFromDialog() rewrites the FIRST fence whose body matches the
+  // diagram's own, and it used to replace the on-screen diagram whether or not
+  // that rewrite happened. Four ordinary documents made the picture and the
+  // FILE disagree, silently - the reader saw the new diagram, the document was
+  // marked unsaved, and the file kept the old text, so the edit vanished at the
+  // next full render and a save wrote the unedited source:
+  //
+  //   an EMPTY fence, which has no body to match;
+  //   a body carrying an emoji SHORTCODE, because parseEmojis() runs before the
+  //     fences are lifted out, so the body read back has the glyph where the
+  //     file has :star:;
+  //   a raw-HTML <pre class="mermaid">, which is not a fence at all;
+  //   TWO fences sharing a body, where "the first match" is not the one the
+  //     reader clicked.
+  //
+  // Requiring exactly one match answers all four the same way: refuse, out
+  // loud, with nothing moved. The oracle is therefore the MARKDOWN plus the
+  // unsaved flag and the undo depth - a DOM check would have passed throughout,
+  // which is exactly how this survived so long.
+  //
+  // Both render paths are exercised: the light path never draws, so its
+  // diagrams are unwrapped, and the full path's are wrapped in a container -
+  // the two reach the handler by different routes.
+  const REF_A = "graph TD\n  A[Same] --> B[Body]";
+  const REF_OTHER = "graph TD\n  Z[Other] --> Y[Block]";
+  const REF_NEW = "graph TD\n  N[Edited] --> M[Body]";
+  const REF_EMOJI = "graph TD\n  E[:star: star] --> F[Done]";
+  const REF_DUP_DOC =
+    "dup text\n\n```mermaid\n" + REF_A + "\n```\n\nmiddle\n\n```mermaid\n" + REF_A + "\n```\n";
+  const REF_EMPTY_DOC =
+    "empty text\n\n```mermaid\n```\n\ntail\n\n```mermaid\n" + REF_OTHER + "\n```\n";
+  const REF_EMOJI_DOC = "emoji text\n\n```mermaid\n" + REF_EMOJI + "\n```\n";
+  const REF_UNIQUE_DOC = "unique text\n\n```mermaid\n" + REF_OTHER + "\n```\n";
+  // One real fence and one hand-written <pre class="mermaid"> carrying the SAME
+  // body. Sanitization admits it (measured elsewhere in this work), and
+  // restoreMermaidSourceAttributes() gives it the same data-mermaid-src, so on
+  // a source match alone the decoy is indistinguishable from the fence.
+  const REF_RAW_DOC =
+    "raw text\n\n```mermaid\n" + REF_A + "\n```\n\n<pre class=\"mermaid\">" + REF_A + "</pre>\n";
+  // A second document for the stale-dialog leg. Its diagram body is the SAME as
+  // REF_UNIQUE_DOC's, deliberately: patchViewerDOM keys mermaid blocks by their
+  // source, so the old node is REUSED and stays connected, uniquely sourced and
+  // in the viewer. Every check except the document revision therefore still
+  // passes - which is precisely the case a revision check has to catch, and the
+  // reason a fixture with a different body would have proved nothing.
+  const REF_OTHER_DOC = "other text\n\n```mermaid\n" + REF_OTHER + "\n```\n";
+  // Two DISTINCT diagrams, for the async-race leg: the submission is opened
+  // against the first and the dialog is then reopened on the second, so a
+  // commit against the wrong target is visible as the wrong body being
+  // rewritten, and an unintended insert as a third fence appearing.
+  const REF_TWO_DOC =
+    "two text\n\n```mermaid\n" + REF_A + "\n```\n\nbetween\n\n```mermaid\n" + REF_OTHER + "\n```\n";
+  const refuse = await exec(`
+    (async () => {
+      const savedSource = window.originalMarkdown;
+      const savedUndo = undoHistory.slice();
+      const savedRedo = redoHistory.slice();
+      const savedDirty = hasUnsavedChanges;
+      const v = document.getElementById('viewer');
+      const out = {};
+      // One leg: render the document, click Edit on the nth diagram, type the
+      // new body, and report what happened to the MARKDOWN - not to the page.
+      const leg = async (doc, mode, nth, code) => {
+        if (mode === 'light-format') {
+          await window.renderMarkdown('warm text\\n', 'full');
+          await new Promise(r => setTimeout(r, 250));
+        }
+        await window.renderMarkdown(doc, mode);
+        await new Promise(r => setTimeout(r, mode === 'full' ? 900 : 350));
+        window.originalMarkdown = doc;
+        hasUnsavedChanges = false;
+        undoHistory.length = 0;
+        const el = v.querySelectorAll('.mermaid')[nth];
+        if (!el) return { found: false };
+        // SETUP EVIDENCE, CAPTURED BEFORE THE CLICK. The submission can detach
+        // or replace nodes, so counting afterwards measures the aftermath and
+        // not the fixture - which is exactly how the first sweep reported
+        // "nodes: 1" for a two-node decoy document.
+        const mySrc = normalizeMermaidCode(el.dataset.mermaidSrc);
+        const sameSourceBefore = Array.from(v.querySelectorAll('.mermaid')).filter(
+          (n) => normalizeMermaidCode(n.dataset.mermaidSrc) === mySrc).length;
+        rightClickTarget = el;
+        document.getElementById('ctxEditMermaid').click();
+        document.getElementById('mermaidTemplateCode').value = code;
+        await window.insertMermaidFromDialog();
+        await new Promise(r => setTimeout(r, 500));
+        rightClickTarget = null;
+        return {
+          found: true,
+          sameSourceBefore: sameSourceBefore,
+          unchanged: window.originalMarkdown === doc,
+          holdsNew: window.originalMarkdown.indexOf(code) !== -1,
+          dirty: hasUnsavedChanges,
+          undoDepth: undoHistory.length,
+        };
+      };
+      try {
+        out.dupFull = await leg(${JSON.stringify(REF_DUP_DOC)}, 'full', 1, ${JSON.stringify(REF_NEW)});
+        out.dupLight = await leg(${JSON.stringify(REF_DUP_DOC)}, 'light-format', 1, ${JSON.stringify(REF_NEW)});
+        out.emptyFull = await leg(${JSON.stringify(REF_EMPTY_DOC)}, 'full', 0, ${JSON.stringify(REF_NEW)});
+        out.emojiFull = await leg(${JSON.stringify(REF_EMOJI_DOC)}, 'full', 0, ${JSON.stringify(REF_NEW)});
+        // THE POSITIVE CONTROL, and the whole pair is worthless without it: a
+        // document with exactly one matching fence must still be edited, on
+        // both paths, or "nothing was rewritten" is just a description of an
+        // edit path that no longer works at all.
+        out.uniqueFull = await leg(${JSON.stringify(REF_UNIQUE_DOC)}, 'full', 0, ${JSON.stringify(REF_NEW)});
+        out.uniqueLight = await leg(${JSON.stringify(REF_UNIQUE_DOC)}, 'light-format', 0, ${JSON.stringify(REF_NEW)});
+
+        // RAW-HTML REDIRECTION. One fence and one hand-written
+        // <pre class="mermaid"> carrying the SAME body. A source match alone
+        // finds exactly one fence, so clicking the decoy used to rewrite the
+        // author's real block - a document editing itself. Two nodes on screen
+        // now share that source, so neither is editable.
+        out.rawDecoyOnRaw = await leg(${JSON.stringify(REF_RAW_DOC)}, 'full', 1, ${JSON.stringify(REF_NEW)});
+        out.rawDecoyOnFence = await leg(${JSON.stringify(REF_RAW_DOC)}, 'full', 0, ${JSON.stringify(REF_NEW)});
+
+        // A STALE DIALOG. Edit is opened against one document; another is
+        // rendered under it; the dialog is then submitted. Node reuse can make
+        // the old target still look perfectly valid, so the document REVISION
+        // is what has to be checked.
+        await window.renderMarkdown(${JSON.stringify(REF_UNIQUE_DOC)}, 'full');
+        await new Promise(r => setTimeout(r, 900));
+        window.originalMarkdown = ${JSON.stringify(REF_UNIQUE_DOC)};
+        const staleEl = v.querySelectorAll('.mermaid')[0];
+        rightClickTarget = staleEl;
+        document.getElementById('ctxEditMermaid').click();
+        const genAtOpen = renderGeneration;
+        // The document underneath changes while the dialog is open.
+        await window.renderMarkdown(${JSON.stringify(REF_OTHER_DOC)}, 'full');
+        await new Promise(r => setTimeout(r, 900));
+        window.originalMarkdown = ${JSON.stringify(REF_OTHER_DOC)};
+        hasUnsavedChanges = false;
+        undoHistory.length = 0;
+        out.staleGenerationMoved = renderGeneration !== genAtOpen;
+        // EVERY OTHER GUARD, MEASURED BEFORE THE SUBMISSION. The point of this
+        // fixture is that only the REVISION check can refuse: the same-source
+        // node is reused, so it is still the current one, still connected,
+        // still in the viewer, still unique on screen and still matched by
+        // exactly one fence. Recorded here so a revert of the revision check
+        // fails for that reason and no other.
+        const nowEl = v.querySelectorAll('.mermaid')[0];
+        const staleSrc = normalizeMermaidCode(staleEl.dataset.mermaidSrc);
+        const staleRe = /\`\`\`mermaid[^\\S\\r\\n]*[\\r\\n]+([\\s\\S]*?)\`\`\`/g;
+        let staleMatches = 0;
+        let sm;
+        while ((sm = staleRe.exec(window.originalMarkdown)) !== null) {
+          if (normalizeMermaidCode(sm[1]) === staleSrc) staleMatches += 1;
+        }
+        out.staleControl = {
+          sameNode: nowEl === staleEl,
+          connected: staleEl.isConnected,
+          contained: v.contains(staleEl),
+          domCount: Array.from(v.querySelectorAll('.mermaid')).filter(
+            (n) => normalizeMermaidCode(n.dataset.mermaidSrc) === staleSrc).length,
+          srcMatches: staleMatches,
+        };
+        document.getElementById('mermaidTemplateCode').value = ${JSON.stringify(REF_NEW)};
+        await window.insertMermaidFromDialog();
+        await new Promise(r => setTimeout(r, 500));
+        rightClickTarget = null;
+        out.stale = {
+          unchanged: window.originalMarkdown === ${JSON.stringify(REF_OTHER_DOC)},
+          holdsNew: window.originalMarkdown.indexOf(${JSON.stringify(REF_NEW)}) !== -1,
+          dirty: hasUnsavedChanges,
+          undoDepth: undoHistory.length,
+        };
+
+        // AN ASYNC SUBMISSION THAT OUTLIVES ITS DIALOG. mermaid.render() is
+        // replaced with a stub this probe resolves BY HAND, so the race is
+        // deterministic rather than timing-dependent: submit against diagram
+        // ONE, then close and reopen the dialog on diagram TWO, then let the
+        // first validation finish.
+        //
+        // THE STUB HAS TO TELL ITS TWO CALLERS APART, and a stub that did not
+        // was this leg's own nondeterminism. openMermaidTemplateDialog() calls
+        // updateMermaidPreview() on EVERY open - including the reopen this leg
+        // performs on purpose - and the preview draws through the same
+        // mermaid.render(). A stub that parked every call let a PREVIEW
+        // overwrite the single shared resolver, so releasing it resumed a
+        // preview and left the submission parked for ever: whether "await
+        // parked" returned or hung came down to microtask ordering inside
+        // ensureMermaid(). The callers are distinguishable by the id they pass -
+        // insertMermaidFromDialog() uses 'mermaid-validate-<ts>' and
+        // updateMermaidPreview() uses 'mermaid-tpl-prev-<n>' - so ONLY the
+        // submission's validation is parked and every other call is handed
+        // straight to the real renderer, which is also what keeps the reopened
+        // dialog behaving exactly as it does in production.
+        await window.renderMarkdown(${JSON.stringify(REF_TWO_DOC)}, 'full');
+        await new Promise(r => setTimeout(r, 900));
+        window.originalMarkdown = ${JSON.stringify(REF_TWO_DOC)};
+        hasUnsavedChanges = false;
+        undoHistory.length = 0;
+        const nodes = v.querySelectorAll('.mermaid');
+        out.raceSetup = { nodes: nodes.length };
+        const realRender = window.mermaid.render;
+        // DECLARED OUTSIDE THE try SO THE finally CAN REACH IT. Restoring the
+        // stub is only half of the poisoning surface: insertMermaidFromDialog()
+        // latches mermaidDialogSubmitting BEFORE its first await and clears it
+        // only when validation resumes, so a submission left parked by a throw
+        // between the submit and the release would latch that flag for the rest
+        // of the window and make every LATER dialog submission in this file
+        // return silently - an unrelated cascade, which is exactly what this
+        // leg's restore exists to prevent.
+        let releaseValidation = null;
+        let validationCalls = 0;
+        try {
+          window.mermaid.render = function (id) {
+            if (typeof id === 'string' && id.indexOf('mermaid-validate-') === 0) {
+              validationCalls += 1;
+              // Only the FIRST submission is parked. A second validation would
+              // mean this is no longer the race it claims to be, so it is
+              // COUNTED and resolved immediately rather than parked: the count
+              // fails the fixture assertion out loud, and nothing can deadlock
+              // waiting on a resolver this leg never releases.
+              if (releaseValidation) return Promise.resolve({ svg: '<svg></svg>' });
+              return new Promise((res) => { releaseValidation = () => res({ svg: '<svg></svg>' }); });
+            }
+            return realRender.apply(this, arguments);
+          };
+          rightClickTarget = nodes[0];
+          document.getElementById('ctxEditMermaid').click();
+          const firstTarget = editingMermaidContainer;
+          out.raceOpenedOnFirst =
+            firstTarget !== null &&
+            firstTarget === (nodes[0].closest('.mermaid-container') || nodes[0]);
+          document.getElementById('mermaidTemplateCode').value = ${JSON.stringify(REF_NEW)};
+          // Never allowed to reject on its own. A rejection has to arrive as a
+          // recorded outcome below, not as an unhandled rejection that skips
+          // past the stub restore.
+          const parked = window.insertMermaidFromDialog().then(
+            () => 'settled',
+            (e) => 'rejected: ' + ((e && e.message) || e),
+          );
+          // WAIT FOR THE PARK, do not guess at it. A fixed sleep is a bet on how
+          // many microtasks ensureMermaid() costs; this waits for the
+          // submission's own validation call to arrive, so the close and reopen
+          // below are guaranteed to happen WHILE it is parked - which is the
+          // whole production race.
+          const parkDeadline = Date.now() + 4000;
+          while (releaseValidation === null && Date.now() < parkDeadline) {
+            await new Promise(r => setTimeout(r, 20));
+          }
+          out.raceParked = releaseValidation !== null;
+          // The reader gives up on the first diagram and opens the second.
+          closeMermaidTemplateDialog();
+          const secondNode = v.querySelectorAll('.mermaid')[1];
+          const secondTarget = secondNode &&
+            (secondNode.closest('.mermaid-container') || secondNode);
+          rightClickTarget = secondNode;
+          document.getElementById('ctxEditMermaid').click();
+          // NOT a bare non-null test, which is what this used to read and which
+          // could never have been false: closeMermaidTemplateDialog() clears the
+          // generation and bumps the session but deliberately leaves
+          // editingMermaidContainer alone, so it has been non-null since the
+          // FIRST open. A reopen that silently no-opped - the handler bailing
+          // out because it resolved no .mermaid element, say - would still have
+          // read true, and the fixture would have claimed a reopen that never
+          // happened while only the CLOSE half of the session bump was actually
+          // exercised. The identity of the target is what says the dialog really
+          // moved to diagram TWO.
+          out.raceReopened =
+            editingMermaidContainer !== null &&
+            editingMermaidContainer !== firstTarget &&
+            editingMermaidContainer === secondTarget;
+          // Now let the first submission finish validating.
+          if (releaseValidation) releaseValidation();
+          // BOUNDED. If releasing ever fails to resume the submission this leg
+          // reports 'timeout' and the assertions fail with a diagnosis, instead
+          // of hanging the suite with none.
+          out.raceOutcome = await Promise.race([
+            parked,
+            new Promise(r => setTimeout(() => r('timeout'), 4000)),
+          ]);
+          await new Promise(r => setTimeout(r, 400));
+          closeMermaidTemplateDialog();
+          rightClickTarget = null;
+          out.race = {
+            entered: validationCalls > 0,
+            validationCalls: validationCalls,
+            unchanged: window.originalMarkdown === ${JSON.stringify(REF_TWO_DOC)},
+            holdsNew: window.originalMarkdown.indexOf(${JSON.stringify(REF_NEW)}) !== -1,
+            fenceCount: (window.originalMarkdown.match(/\`\`\`mermaid/g) || []).length,
+            dirty: hasUnsavedChanges,
+            undoDepth: undoHistory.length,
+          };
+        } finally {
+          // ALL THREE, ON EVERY PATH. The stub, because one left installed by a
+          // throw or by an await that never returned answers every later
+          // mermaid.render() in this file. The parked resolver, because a
+          // submission still waiting on it never resumes and never clears the
+          // submit latch. And the latch itself, for the case where the release
+          // above cannot reach the submission at all - it parked in
+          // ensureMermaid() rather than in render(), so there is no resolver to
+          // call. On the normal path all three are already no-ops.
+          window.mermaid.render = realRender;
+          if (releaseValidation) releaseValidation();
+          mermaidDialogSubmitting = false;
+        }
+        return out;
+      } finally {
+        window.originalMarkdown = savedSource;
+        undoHistory.length = 0;
+        for (const h of savedUndo) undoHistory.push(h);
+        redoHistory.length = 0;
+        for (const h of savedRedo) redoHistory.push(h);
+        hasUnsavedChanges = savedDirty;
+        updateUnsavedIndicator();
+        closeMermaidTemplateDialog();
+        mermaidDialogMode = 'insert';
+        editingMermaidContainer = null;
+        rightClickTarget = null;
+        if (!v.isConnected) {
+          document.querySelector('.content-wrapper').appendChild(v);
+          out.repairedAtExit = true;
+        }
+      }
+    })()
+  `);
+  check(
+    "a uniquely identified diagram is still edited, on both render paths",
+    refuse.uniqueFull.found === true &&
+      refuse.uniqueFull.holdsNew === true &&
+      refuse.uniqueFull.dirty === true &&
+      refuse.uniqueLight.found === true &&
+      refuse.uniqueLight.holdsNew === true &&
+      refuse.uniqueLight.dirty === true &&
+      refuse.repairedAtExit === undefined,
+    JSON.stringify(refuse),
+  );
+  check(
+    // Three conjuncts per leg, because "the markdown is unchanged" alone is
+    // satisfied by an edit that also left the undo stack and the unsaved flag
+    // dirty - which is the half-applied state this refusal exists to prevent.
+    "an ambiguous diagram is refused: the markdown, the undo stack and the unsaved flag are all left alone",
+    refuse.dupFull.unchanged === true &&
+      refuse.dupFull.dirty === false &&
+      refuse.dupFull.undoDepth === 0 &&
+      refuse.dupLight.unchanged === true &&
+      refuse.dupLight.dirty === false &&
+      refuse.dupLight.undoDepth === 0,
+    JSON.stringify({ dupFull: refuse.dupFull, dupLight: refuse.dupLight }),
+  );
+  check(
+    // SPLIT FROM THE EMPTY CASE BY MEASUREMENT, not by taste. The authorized
+    // sweep showed the two are owned by DIFFERENT conditions: an empty body
+    // makes the DOM-cardinality set empty, so condition (2) refuses it, while
+    // an emoji shortcode leaves exactly one node on screen and is refused by
+    // condition (3) when no fence matches. Conjoined, neither could be named
+    // by a revert without dragging the other in.
+    "an emoji-bearing diagram is refused rather than half-applied",
+    refuse.emojiFull.unchanged === true &&
+      refuse.emojiFull.dirty === false &&
+      refuse.emojiFull.undoDepth === 0,
+    JSON.stringify(refuse.emojiFull),
+  );
+  check(
+    "an empty fence is refused rather than half-applied",
+    refuse.emptyFull.unchanged === true &&
+      refuse.emptyFull.dirty === false &&
+      refuse.emptyFull.undoDepth === 0,
+    JSON.stringify(refuse.emptyFull),
+  );
+  check(
+    // The decoy and the real fence BOTH refuse, and both halves are asserted:
+    // the first is the security property, the second is its honest cost, and a
+    // future change that quietly re-enabled the fence would be re-enabling the
+    // decoy with it.
+    //
+    // THE SETUP EVIDENCE IS CAPTURED BEFORE EACH CLICK, per leg, on a freshly
+    // rendered fixture. The first authorized sweep counted the nodes AFTER both
+    // legs had run and reported "nodes: 1" - the aftermath of a mutation, not
+    // the shape of the document - which is exactly the way a setup check fails
+    // open.
+    "a same-source raw-HTML diagram cannot redirect an edit at a real fence",
+    refuse.rawDecoyOnRaw.sameSourceBefore === 2 &&
+      refuse.rawDecoyOnFence.sameSourceBefore === 2 &&
+      refuse.rawDecoyOnRaw.unchanged === true &&
+      refuse.rawDecoyOnRaw.dirty === false &&
+      refuse.rawDecoyOnRaw.undoDepth === 0 &&
+      refuse.rawDecoyOnFence.unchanged === true &&
+      refuse.rawDecoyOnFence.dirty === false &&
+      refuse.rawDecoyOnFence.undoDepth === 0,
+    JSON.stringify({ onRaw: refuse.rawDecoyOnRaw, onFence: refuse.rawDecoyOnFence }),
+  );
+  check(
+    // THE STALE FIXTURE'S OWN SHAPE, asserted separately so the refusal below
+    // can only be credited to the revision check. Every other condition is
+    // shown to PASS: the node was reused, so it is the current one, connected,
+    // in the viewer, unique on screen and matched by exactly one fence.
+    "the stale-dialog fixture reuses the same node, so only the revision check can refuse it",
+    refuse.staleGenerationMoved === true &&
+      refuse.staleControl.sameNode === true &&
+      refuse.staleControl.connected === true &&
+      refuse.staleControl.contained === true &&
+      refuse.staleControl.domCount === 1 &&
+      refuse.staleControl.srcMatches === 1,
+    JSON.stringify(refuse.staleControl),
+  );
+  check(
+    "an edit dialog left open across a re-render is refused, not applied to the new document",
+    refuse.stale.unchanged === true &&
+      refuse.stale.holdsNew === false &&
+      refuse.stale.dirty === false &&
+      refuse.stale.undoDepth === 0,
+    JSON.stringify(refuse.stale),
+  );
+  check(
+    // The race's own setup, and every conjunct here is one way the leg could
+    // otherwise pass while nothing raced: two diagrams on screen; the dialog
+    // opened against diagram ONE; the stubbed validation entered exactly once
+    // and by the SUBMISSION rather than by a dialog preview; the submission
+    // demonstrably parked when the second dialog was opened; the second dialog
+    // really about diagram TWO; and the release really resuming the submission
+    // rather than timing out.
+    "the dialog-race fixture really parked a submission and reopened on another diagram",
+    refuse.raceSetup.nodes === 2 &&
+      refuse.race.entered === true &&
+      refuse.race.validationCalls === 1 &&
+      refuse.raceOpenedOnFirst === true &&
+      refuse.raceParked === true &&
+      refuse.raceOutcome === "settled" &&
+      refuse.raceReopened === true,
+    JSON.stringify({
+      setup: refuse.raceSetup,
+      openedOnFirst: refuse.raceOpenedOnFirst,
+      parked: refuse.raceParked,
+      reopened: refuse.raceReopened,
+      outcome: refuse.raceOutcome,
+      race: refuse.race,
+    }),
+  );
+  check(
+    // Both failure modes at once: committing against the REOPENED dialog's
+    // target (the wrong diagram would be rewritten) and committing as an
+    // INSERT (a third fence would appear). fenceCount pins the second.
+    "a submission parked in validation cannot commit after its dialog is closed and reopened",
+    refuse.race.unchanged === true &&
+      refuse.race.holdsNew === false &&
+      refuse.race.fenceCount === 2 &&
+      refuse.race.dirty === false &&
+      refuse.race.undoDepth === 0,
+    JSON.stringify(refuse.race),
+  );
+
   // (f) The dialog's own validate-before-insert preview. Same sink class again:
   //     on Edit the dialog is pre-filled with the DOCUMENT's diagram source, and
   //     mermaid.render() quotes that source back when it rejects.

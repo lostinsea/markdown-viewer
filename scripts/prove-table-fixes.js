@@ -12809,7 +12809,11 @@ const REVERTS = [
           // mechanisms before this fix - the full path was repairing it by
           // accident inside the mermaid.run set-up, the light path had nothing
           // at all - so a single revert of both would not distinguish "the
-          // helper is load-bearing" from "the accident still covers it".
+          // helper is load-bearing" from "the accident still covers it". That
+          // accident has since been deleted from the product, so both paths now
+          // carry the attribute by the same mechanism; the pair stays split
+          // because there are still two call sites, and only a per-path revert
+          // can show that each one is load-bearing for its own path.
           what: "stop restoring the mermaid source attribute on the light-format path",
           file: RENDERER,
           from:
@@ -12855,38 +12859,52 @@ const REVERTS = [
         },
         {
           id: "R528",
-          // N18, the FULL half - and it needs TWO edits, not one.
+          // N18, the FULL half.
           //
-          // Reverting the call alone would be VACUOUS: the mermaid.run set-up
-          // reads `el.dataset.mermaidSrc || el.textContent.trim()` and writes
-          // the result straight back, so the full path repairs the attribute by
-          // accident on its way to computing an SVG cache key. That accidental
-          // repair is what hid this defect for the whole life of the feature -
-          // the diagram still drew, so nothing looked wrong - and it is exactly
-          // why the light path had no symptom anyone could name either.
+          // ONE EDIT NOW; IT USED TO NEED TWO. Until the fallback was removed,
+          // the mermaid.run set-up read `el.dataset.mermaidSrc ||
+          // el.textContent.trim()` and wrote the result straight back, so the
+          // full path repaired the attribute by accident on its way to
+          // computing an SVG cache key. Reverting the call alone was therefore
+          // VACUOUS, and this record carried a second `also` edit
+          // (`... || ''`) whose only job was to neutralise that fallback. The
+          // product no longer has one: the loop consumes `el.dataset.mermaidSrc`
+          // and leaves an element that has none alone, so removing the call is
+          // sufficient and an `also` edit would have nothing left to neutralise.
           //
-          // The `also` edit neutralises that fallback, so what is measured is
-          // the property the helper is named for rather than the side effect of
-          // an unrelated cache line. Expect it to be narrow: only the full leg
-          // may fail.
-          what: "stop restoring the mermaid source attribute on the full path, accident included",
+          // That accidental repair is what hid this defect for the whole life
+          // of the feature - the diagram still drew, so nothing looked wrong -
+          // and it is exactly why the light path had no symptom anyone could
+          // name either.
+          //
+          // THE EVIDENCE CHANGES SHAPE with the simplification, and honestly
+          // so. Under the old two-edit form the attribute was present and
+          // EMPTY, because the neutralised accident wrote '' back. Now it is
+          // ABSENT (mermaidSrc null), the same shape R527 records on the light
+          // leg, because with the repair gone nothing writes it at all.
+          //
+          // The other half of that shape change is a NEW honest consequence,
+          // named below: a source-less element is no longer handed to mermaid,
+          // so on this leg the diagram does not draw. Pre-simplification the
+          // `also` edit left it drawing from its own textContent, so no
+          // rendering assertion could see the revert. It is still PATH-NARROW,
+          // just wider than it was: everything that fails here renders through
+          // the full path, and three of them carry no "(full)" suffix only
+          // because that is the only path they ever use.
+          what: "stop restoring the mermaid source attribute on the full path",
           file: RENDERER,
           from:
             "  if (generation !== renderGeneration) { hideLoadingScreenFor(generation); return; }\n  patchViewerDOM(html);\n  restoreMermaidSourceAttributes();",
           to:
             "  if (generation !== renderGeneration) { hideLoadingScreenFor(generation); return; }\n  patchViewerDOM(html);",
-          also: {
-            from: "const src = el.dataset.mermaidSrc || el.textContent.trim();",
-            to: "const src = el.dataset.mermaidSrc || '';",
-          },
           suite: "test:security",
           expect: [
             /^N18 a flowchart arrow diagram still carries its source after render \(full\)$/,
-            // Same honest consequences as R527, on the mirror leg. Worth
-            // reading beside R527's evidence: there the attribute is ABSENT
-            // (mermaidSrc null), here it is present and EMPTY - the `also` edit
-            // makes the accident write '' back rather than the source, which is
-            // exactly the accident being neutralised showing up in the data.
+            // Same honest consequences as R527, on the mirror leg - and now the
+            // same SHAPE too: the attribute is ABSENT (mermaidSrc null) on both
+            // legs. It used to be present-and-empty here, because the `also`
+            // edit made the neutralised accident write '' back; with the
+            // accident gone from the product there is nothing left to write.
             /^F43 control: a benign diagram carries its source on this path \(full\)$/,
             /^F43 a decoy mermaid placeholder cannot capture the real diagram \(full\)$/,
             /^F43 a diagram body of \$-replacement patterns round-trips verbatim \(full\)$/,
@@ -12896,6 +12914,18 @@ const REVERTS = [
             // restore in general.
             /^F43 a decoy matching the nonce-less token shape cannot capture the real diagram \(full\)$/,
             /^F43 every block is restored, not just the first \(full\)$/,
+            // THE RENDERING CONSEQUENCE, which this record could not produce
+            // before the simplification and which is the sharpest evidence in
+            // it. With the attribute gone the loop has no source to hand
+            // mermaid, so an arrow-bearing diagram does not DRAW on this path at
+            // all - the defect stops being invisible. All three of these
+            // assertions are about a drawn SVG and all three were MEASURED
+            // failing under this revert; the last is the CSP suite's own
+            // control, which renders `A --> B` to prove script-src 'self' still
+            // loads the mermaid bundle.
+            /^FEATURE mermaid diagram still renders to SVG$/,
+            /^FEATURE mermaid SVG is a real diagram with its labels, not an error graphic$/,
+            /^SEC-09 script-src 'self' still permits the app's own local scripts$/,
           ],
           mustPass: [
             // The light path keeps its own call, so it must survive. Together
@@ -12915,18 +12945,32 @@ const REVERTS = [
         //   R529  the predictable literal token   (defect (a))
         //   R530  the `$`-expansion               (defect (b), mermaid only)
         //   R531  first-occurrence replacement    (the other half of (a))
+        //   R532  the index terminator            (leftover character + <p> shape)
+        //   R533  terminator + lazy quantifier    (wrong block at index >= 10)
+        //   R538  single-digit index capture      (no block at all at index >= 10)
         //
         // Each names the other halves' assertions in `mustPass`, so the
-        // three-way isolation is asserted rather than hoped for.
+        // isolation is asserted rather than hoped for. The three INDEX records
+        // are kept apart by one assertion in particular - the helper's per-hole
+        // SELECTION record - which R532 must leave passing and R533/R538 must
+        // break.
         //
-        // NOT SEPARATELY PROVABLE, and deliberately so: the trailing `_` that
-        // stops ..._1_ being a prefix of ..._10_. Reaching that collision needs
-        // a decoy that has ALREADY consumed the real `_1`, i.e. defect (a) must
-        // succeed first - so any revert that could exercise it is a revert of
-        // R529, and the terminator would be measured through a property it does
-        // not own. It is recorded as belt-and-braces in the product comment
-        // instead. (Precedent: R110b was deleted rather than kept as a
-        // permanently vacuous entry.)
+        // R532/R533/R538 CORRECT A CLAIM THIS GROUP USED TO MAKE. The note here
+        // read "NOT SEPARATELY PROVABLE, and deliberately so: the trailing `_`
+        // ... any revert that could exercise it is a revert of R529", on the
+        // grounds that reaching the ..._1_ / ..._10_ collision needs a decoy
+        // that has already consumed the real `_1`. That reasoning was about the
+        // wrong route. Two-digit indices need no decoy at all - just ELEVEN
+        // blocks of a kind, which nothing exercised until the direct helper
+        // probe in test-render-security.js. It calls createBlockPlaceholders in
+        // the live renderer page and compares the EXACT restored string, so it
+        // costs no render: reaching the same indices through the public path
+        // would have meant eleven diagrams per leg for a weaker oracle.
+        //
+        // A LAZY QUANTIFIER ALONE remains inert and is therefore still not
+        // recorded: `(\d+?)_` backtracks to recover the second digit, so a
+        // revert of the greed alone would be VACUOUS. (Precedent for deleting
+        // rather than keeping a vacuous entry: R110b.)
         {
           id: "R529",
           // Defect (a), the source of it: the placeholder token was a literal
@@ -12989,6 +13033,9 @@ const REVERTS = [
           // The light leg was the vivid one - the `$\`` expansion injected
           // unescaped HTML whose embedded `"` closed the attribute early, so an
           // <h1> became a REAL element inside the <pre class="mermaid">.
+          // (Re-measured on the current tree, BOTH legs now record that shape:
+          // the full path no longer re-derives a source of its own, so its
+          // element is left with the same injected markup and no attribute.)
           //
           // The revert restores the pre-fix per-block loop, and preserves the
           // unwrapParagraph asymmetry exactly, so the ONLY thing that changes
@@ -13010,16 +13057,25 @@ const REVERTS = [
           expect: [
             /^F43 a diagram body of \$-replacement patterns round-trips verbatim \(light-format\)$/,
             /^F43 a diagram body of \$-replacement patterns round-trips verbatim \(full\)$/,
-            // HONEST CONSEQUENCE, and the most eloquent evidence in this whole
-            // group: the corrupted source is no longer valid mermaid, so the
-            // library draws its syntax-error graphic and the suite's global
-            // error sentinel fires. It is worth reading the captured evidence
-            // beside the two named failures - the full leg records the source
-            // as "%% Doc\n MERMAID_BLOCK_<nonce>_0_amp; ... $ $1", i.e. all
-            // five expansions at once, and the light leg records a real <h1>
-            // and <div class="collapsible-section"> INSIDE the <pre>, which is
-            // the injected quote closing the attribute early.
-            /^nothing rendered a visible error at any point during the suite$/,
+            // A THIRD FAILURE USED TO BE NAMED HERE - "nothing rendered a
+            // visible error at any point during the suite" - and it is REMOVED
+            // BY MEASUREMENT rather than by opinion. The record's reasoning was
+            // that the corrupted source is no longer valid mermaid, so the
+            // library draws its syntax-error graphic and the suite's sentinel
+            // sees it. That was true while the full path re-derived a source
+            // from the element's own text; it is not true now. The `$\``
+            // expansion injects unescaped HTML whose embedded `"` closes the
+            // attribute early, so a real <h1> and <div class="collapsible-
+            // section"> land INSIDE the <pre class="mermaid">, and an element
+            // with a child is one restoreMermaidSourceAttributes() will not
+            // adopt a source for. With no source the render path leaves it
+            // alone, so nothing is drawn and nothing is painted red.
+            //
+            // MEASURED under this revert on the current tree: both legs record
+            // mermaidSrc null and the injected <h1>/<div> in the element's
+            // markup, and the sentinel stays green. The corruption is still
+            // exactly as visible in the two named failures - it just no longer
+            // costs the reader an error graphic on top of it.
           ],
           mustPass: [
             // The nonce is untouched, so both decoy families must still be
@@ -13065,6 +13121,15 @@ const REVERTS = [
             // unlisted precisely because it is the evidence for the correction
             // in this record's own comment.
             /^FEATURE two identical @@@html blocks both receive their document$/,
+            // HONEST CONSEQUENCES at the helper level, where the same loss is
+            // visible with no render at all: with the `g` flag gone only the
+            // FIRST placeholder of each kind is replaced, so the exact-output
+            // compare fails for both shapes and the selection record holds one
+            // entry instead of eleven. All three are witnesses to MULTIPLICITY,
+            // the property this record owns.
+            /^F43 the shared helper restores every placeholder exactly, two digits included$/,
+            /^F43 the helper's paragraph-unwrapping shape restores exactly, and eats every paragraph$/,
+            /^F43 the helper hands each hole its own block, in order, at two-digit indices too$/,
           ],
           mustPass: [
             // Single-block fixtures cannot see this, which is the point: their
@@ -13074,6 +13139,523 @@ const REVERTS = [
             /^F43 a decoy matching the nonce-less token shape cannot capture the real diagram \(light-format\)$/,
             /^F43 a diagram body of \$-replacement patterns round-trips verbatim \(light-format\)$/,
             /^F43 a diagram body of \$-replacement patterns round-trips verbatim \(full\)$/,
+          ],
+        },
+        {
+          id: "R532",
+          // THE INDEX TERMINATOR, on its own - and it is NOT a mapping guard.
+          //
+          // This record exists because the claim it replaces was wrong. The
+          // group note above (and the product comment) said the trailing `_`
+          // was not separately provable, reasoning that reaching the ..._1_ /
+          // ..._10_ collision needs a decoy that has already consumed the real
+          // `_1`. That is one route to it and not the cheap one: an index is
+          // two digits as soon as ELEVEN blocks of a kind exist, which the
+          // direct helper probe now exercises and nothing did before.
+          //
+          // MEASURED with the greedy quantifier left in place: every index
+          // still resolves to its own block - that is the greed doing its job,
+          // and it is the whole reason this is a separate record from R533 -
+          // but the terminator's own character is left behind, ONE PER
+          // REPLACEMENT, and the @@@html alternative `<p>core</p>` stops
+          // matching because `</p>` no longer follows the digits.
+          //
+          // Both halves are caught by an EXACT-OUTPUT compare rather than by a
+          // pattern extract, which is the point of that oracle: a regex that
+          // pulls `[PAYLOAD-n]` out of the restored string matches just as
+          // happily with a stray `_` sitting after it.
+          //
+          // The DISCRIMINATOR against R533 and R538 is in `mustPass`: SELECTION
+          // is untouched here, so the helper's per-hole selection record must
+          // survive intact.
+          what: "drop the trailing terminator from the block-placeholder index",
+          file: RENDERER,
+          from: "      const core = \`${token}(\\\\d+)_\`;",
+          to: "      const core = \`${token}(\\\\d+)\`;",
+          suite: "test:security",
+          expect: [
+            // BOTH shapes, for two different reasons - the bare one because a
+            // '_' survives every replacement, the unwrapping one because its
+            // paragraph alternative no longer matches at all and every <p>
+            // stays. Neither is visible to a count or to an extract.
+            /^F43 the shared helper restores every placeholder exactly, two digits included$/,
+            /^F43 the helper's paragraph-unwrapping shape restores exactly, and eats every paragraph$/,
+            // The PRE-EXISTING witness, and the one that shows the defect in a
+            // real document: the paragraph-shape assertion was written for the
+            // `unwrapParagraph` flag and catches this for a reason nobody
+            // planned - the terminator is part of what its alternative matches.
+            /^F43 the @@@html restore swallows the paragraph marked wrapped it in \(light-format\)$/,
+            /^F43 the @@@html restore swallows the paragraph marked wrapped it in \(full\)$/,
+          ],
+          mustPass: [
+            // THE DISCRIMINATOR. The greedy quantifier still selects the right
+            // block for every index, two digits included. If this fails, the
+            // revert has strayed into R533/R538 and the record would be
+            // measuring selection rather than the terminator.
+            /^F43 the helper hands each hole its own block, in order, at two-digit indices too$/,
+            // And the other halves of the fix, untouched here.
+            /^F43 every block is restored, not just the first \(full\)$/,
+            /^F43 a decoy matching the nonce-less token shape cannot capture the real diagram \(full\)$/,
+          ],
+        },
+        {
+          id: "R533",
+          // THE PAIR, and the only shape in which the QUANTIFIER's greed is
+          // observable at all.
+          //
+          // `(\d+?)` on its own is inert and that was measured, not assumed:
+          // with the terminator present the engine backtracks to recover the
+          // second digit, so indices 0..11 all still resolve and a revert of
+          // the greed alone would report VACUOUS. It is deliberately not
+          // recorded as its own entry for exactly that reason.
+          //
+          // Take the terminator away as well and the lazy quantifier stops at
+          // the FIRST digit: measured on the real restore, ..._10_ and ..._11_
+          // both resolve to index 1, so BLOCK 1 is handed to two further holes
+          // while "0_" and "1_" are left behind. That is a WRONG-BLOCK defect
+          // rather than a cosmetic one, which is why it is separated from R532
+          // rather than folded into it.
+          //
+          // Only the eleven-block helper probe can see the selection half -
+          // every other fixture in the group tops out at index 1, where lazy
+          // and greedy agree - so this record is also the evidence that the
+          // probe was not redundant.
+          what: "make the block-placeholder index lazy and unterminated",
+          file: RENDERER,
+          from: "      const core = \`${token}(\\\\d+)_\`;",
+          to: "      const core = \`${token}(\\\\d+?)\`;",
+          suite: "test:security",
+          expect: [
+            // THE RECORD'S OWN CLAIM: selection. MEASURED, the per-hole record
+            // ends ..."PAYLOAD-9","PAYLOAD-1" - index 10 resolving to block 1 -
+            // in the bare shape as well as the unwrapping one. This is the
+            // assertion R532 must leave PASSING, so the two records say
+            // different things rather than the same thing twice.
+            /^F43 the helper hands each hole its own block, in order, at two-digit indices too$/,
+            // HONEST CONSEQUENCES: this revert CONTAINS R532's edit, so
+            // everything R532 breaks breaks here too - both exact-output
+            // compares and both paragraph-shape assertions. Named rather than
+            // left unlisted; the pair of records is only readable if the shared
+            // half is visible in both.
+            /^F43 the shared helper restores every placeholder exactly, two digits included$/,
+            /^F43 the helper's paragraph-unwrapping shape restores exactly, and eats every paragraph$/,
+            /^F43 the @@@html restore swallows the paragraph marked wrapped it in \(light-format\)$/,
+            /^F43 the @@@html restore swallows the paragraph marked wrapped it in \(full\)$/,
+          ],
+          mustPass: [
+            // Single- and two-block fixtures top out at index 1, where a lazy
+            // match and a greedy one are the same match. Their continued
+            // passing is what makes this a record about TWO-DIGIT indices
+            // rather than about the restore in general.
+            /^F43 control: a benign diagram carries its source on this path \(full\)$/,
+            /^F43 a diagram body of \$-replacement patterns round-trips verbatim \(full\)$/,
+            /^F43 every block is restored, not just the first \(full\)$/,
+            /^FEATURE two identical @@@html blocks both receive their document$/,
+          ],
+        },
+        {
+          id: "R534",
+          // THE PROBE'S OWN HERMETICITY, in the suite rather than in a comment.
+          //
+          // test-render-patch.js's arrow-key sweep stubs `ipcRenderer.send` and
+          // `window.confirm`, seeds a synthetic navigation history and attaches
+          // a textarea to the body. Its restoration used to be a run of
+          // statements at the END of the probe, so it ran only on NORMAL
+          // COMPLETION: any throw inside the sweep left both globals stubbed
+          // and the history seeded for every assertion that followed, and the
+          // failure the reader was handed was whatever broke next rather than
+          // the probe. It is a `finally` now.
+          //
+          // A `finally` and a trailing run of statements behave IDENTICALLY on
+          // every path this suite otherwise takes, so nothing could observe the
+          // difference and the word "hermetic" was unfalsifiable. The suite now
+          // runs the same probe source a second time with a flag that makes it
+          // throw after it has dirtied everything, and asserts the page is
+          // clean afterwards.
+          //
+          // WHAT "CLEAN" MEANS IS EXACT, and it has to be, because the two
+          // weaker oracles this replaced both fail open. The globals are
+          // compared by FUNCTION IDENTITY against the objects the same probe
+          // invocation captured - a function that has merely lost the probe's
+          // `__navProbeStub` marker is some other function, not the original -
+          // and the identity is decided page-side, since a function cannot
+          // cross executeJavaScript and only the boolean can. The history is
+          // compared ENTRY BY ENTRY over every field each entry carries,
+          // `scrollPosition` included, rather than by length and file path.
+          //
+          // The revert puts the pre-fix SHAPE back rather than deleting the
+          // call: `restore()` moves out of the `finally` and onto the line
+          // after the block, which is exactly "restores only at normal
+          // completion" and leaves the non-throwing leg fully restored. So what
+          // is measured is the throwing path alone.
+          //
+          // `recordRestoration()` DELIBERATELY STAYS IN THE FINALLY under the
+          // revert, and that is what makes the failure legible rather than
+          // merely absent: it still runs on the throwing path, so the evidence
+          // is captured with the stubs installed and the history seeded, and
+          // the assertion fails on exact function identity
+          // (sendIsOriginal/confirmIsOriginal false) and on a state compare that
+          // names every field it found changed - rather than on a null nobody
+          // can interpret.
+          //
+          // HONEST CONSEQUENCE, and it is the defect itself rather than noise:
+          // with the fault leg's stubs left installed, the rest of the suite
+          // runs with a `window.confirm` that always answers true and an
+          // `ipcRenderer.send` that swallows `open-file-path`. Whatever that
+          // breaks downstream is the harm the fix prevents.
+          what: "restore the arrow-key probe's borrowed globals only on normal completion",
+          file: path.join(ROOT, "test", "test-render-patch.js"),
+          from:
+            "        } finally {\n          restore();\n          recordRestoration();\n        }\n        return out;",
+          to:
+            "        } finally {\n          /* reverted: restoration moved back out of the finally */\n          recordRestoration();\n        }\n        restore();\n        return out;",
+          suite: "test:patch",
+          expect: [
+            /^a nav probe that throws still puts back every global and both stubs it borrowed$/,
+          ],
+          mustPass: [
+            // The probe itself is untouched, and every assertion it feeds runs
+            // BEFORE the fault leg. Their continued passing is what makes this
+            // a record about the restoration rather than about having broken
+            // the sweep.
+            /^the arrow keys really are bound: a possible navigation is consumed and sent$/,
+            /^an arrow key at the end of the history is left alone, not swallowed$/,
+            /^arrow-key navigation asks before discarding unsaved work, and declining stops it$/,
+            /^accepting the unsaved-work prompt lets the arrow-key navigation through$/,
+            // The positive control must survive too: it reads the evidence
+            // recorded before the throw, which this edit does not touch. If it
+            // fails, the fault leg stopped reaching the throw and the record
+            // would be proving nothing about restoration.
+            /^the nav probe's fault leg really threw, with both stubs installed and the history seeded$/,
+          ],
+        },
+        {
+          id: "R535",
+          // THE UNDRAWN DIAGRAM'S CONTEXT-MENU TARGET.
+          //
+          // A `.mermaid` is wrapped in a `.mermaid-container` only once it has
+          // DRAWN - renderMarkdownFull's wrap loop tests for an <svg> - so an
+          // empty fence, any diagram on the light-format path, and any element
+          // the render path skips for want of a source all sit outside one.
+          // Both handlers used to fall back to `mermaidEl.parentElement` there.
+          // Under a heading that is the enclosing `.collapsible-section`, i.e.
+          // the whole rest of the section; with no heading it is #viewer
+          // ITSELF, and the handlers then called replaceChild/removeChild on
+          // ITS parent: one right-click on an empty fence detached the entire
+          // document. The module-level `viewer` const kept pointing at the
+          // orphan, so every later render wrote into a node that was no longer
+          // on screen - a blank app with a silent console.
+          //
+          // Only the EDIT site is reverted, not both. The two are byte-identical
+          // in this respect, so breaking one proves the property while leaving
+          // the delete site as a live control that the probe's oracle works at
+          // all - the R526 idiom. That is also why `mustPass` names the delete
+          // assertion: it must keep passing.
+          //
+          // The suite's probe REPAIRS a detached viewer and records that it did,
+          // so a future revert of the DELETE site would report as its own
+          // assertion failing rather than as every later assertion in
+          // test:mermaid failing against an orphan. It cannot fire for THIS
+          // record: reverting the edit site changes which element is RESOLVED,
+          // and the probe reads that resolution and then closes the dialog
+          // without ever acting on it.
+          what: "resolve an undrawn diagram's edit target to its parent, which is the viewer",
+          file: RENDERER,
+          from: "  editingMermaidContainer = mermaidEl.closest('.mermaid-container') || mermaidEl;",
+          to: "  editingMermaidContainer = mermaidEl.closest('.mermaid-container') || mermaidEl.parentElement;",
+          suite: "test:mermaid",
+          expect: [
+            /^the Edit Diagram target for an undrawn diagram is the diagram, never the viewer$/,
+            // HONEST CONSEQUENCE, and the one that shows the harm rather than
+            // the resolution: with #viewer as the target, the dialog's own
+            // renderMermaidInDOM('replace') detaches the document, and the
+            // probe has to repair it on its way out.
+            /^the undrawn-diagram probe left the viewer attached to the page$/,
+          ],
+          mustPass: [
+            // The fixture must still produce the shape the defect needs; if
+            // this fails the record proves nothing about the fallback.
+            /^an empty mermaid fence really reaches the reader as an undrawn, unwrapped diagram$/,
+            // The untouched mirror site, and the evidence that this revert is
+            // site-narrow rather than a wholesale loss of the fix.
+            /^deleting an undrawn diagram removes the diagram and leaves the viewer attached$/,
+          ],
+        },
+        {
+          id: "R537",
+          // THE OTHER HALF OF THE UNDRAWN-DIAGRAM EDIT, and the half no DOM
+          // assertion can see.
+          //
+          // R535 fixed WHICH element the Edit menu resolves. This is what the
+          // dialog then does with it: `editTarget.querySelector('.mermaid')`
+          // matches descendants only, so for an undrawn diagram - where the
+          // target IS the `.mermaid` - it returned null and `oldCode` was
+          // empty, so no fence could match and the rewrite never happened.
+          //
+          // The consequence USED TO BE silent divergence: the picture was
+          // replaced, the document was marked unsaved, and the file still held
+          // the old diagram. R539's fail-closed guard changes the shape of that
+          // failure - an unidentifiable diagram is now refused outright - so
+          // what this record measures today is that the edit still WORKS for an
+          // undrawn diagram, rather than that it silently half-worked. The
+          // assertion named below reads the markdown back either way.
+          what: "read an undrawn diagram's source off its descendants, of which it has none",
+          file: RENDERER,
+          from:
+            "    const mermaidEl = editTarget.classList && editTarget.classList.contains('mermaid')\n      ? editTarget\n      : editTarget.querySelector('.mermaid');",
+          to: "    const mermaidEl = editTarget.querySelector('.mermaid');",
+          suite: "test:mermaid",
+          expect: [
+            /^editing an undrawn diagram rewrites the markdown, not just the picture$/,
+          ],
+          mustPass: [
+            // The fixture must still be a sourced, undrawn, unwrapped diagram,
+            // and the menu must still resolve to it. Those are R535's property
+            // and this record's premise.
+            /^the light-format path really leaves a sourced but undrawn, unwrapped diagram$/,
+            /^the Edit Diagram target for an undrawn diagram is the diagram, never the viewer$/,
+          ],
+        },
+        {
+          id: "R538",
+          // THE INDEX CAPTURE ITSELF, weakened to a single digit.
+          //
+          // This is the sharpest of the three index records and the only one
+          // whose symptom is a MISSING BLOCK. MEASURED over 12 blocks, both
+          // `unwrapParagraph` shapes: indices 0-9 restore normally and 10 and
+          // 11 never match at all, so their placeholders are left in the
+          // reader's prose and the blocks they stand for are simply absent from
+          // the page.
+          //
+          // It is what makes the eleven-block helper probe load-bearing rather
+          // than decorative: every other F43 fixture tops out at index 1, where
+          // `(\d)` and `(\d+)` are the same pattern, so without that probe this
+          // edit would have been VACUOUS.
+          //
+          // Read beside its two neighbours, which are deliberately NOT mapping
+          // records: R532 (terminator dropped) still selects every index
+          // correctly and is about the leftover character and the paragraph
+          // shape; R533 needs the lazy quantifier AND the missing terminator
+          // together before selection goes wrong at all. Measured, all five:
+          //
+          //   (\d+)_   shipped              0..11 correct, no debris
+          //   (\d+?)_  lazy, terminated     0..11 correct, no debris  (inert)
+          //   (\d+)    greedy, no term.     0..11 correct, one '_' per block
+          //   (\d+?)   lazy, no terminator  10 and 11 both receive BLOCK 1
+          //   (\d)_    single digit         0..9 restored, 10 and 11 STRANDED
+          what: "capture the block-placeholder index as a single digit",
+          file: RENDERER,
+          from: "      const core = \`${token}(\\\\d+)_\`;",
+          to: "      const core = \`${token}(\\\\d)_\`;",
+          suite: "test:security",
+          expect: [
+            // The exact-output compares see the two unreplaced tokens sitting
+            // in the restored string; the selection record sees ten entries
+            // where eleven were minted. All three, in both shapes.
+            /^F43 the shared helper restores every placeholder exactly, two digits included$/,
+            /^F43 the helper's paragraph-unwrapping shape restores exactly, and eats every paragraph$/,
+            /^F43 the helper hands each hole its own block, in order, at two-digit indices too$/,
+          ],
+          mustPass: [
+            // Single-digit indices are untouched, and every other F43 fixture
+            // lives there. Their continued passing is what makes this a record
+            // about the SECOND DIGIT rather than about the restore in general.
+            /^F43 control: a benign diagram carries its source on this path \(light-format\)$/,
+            /^F43 a decoy mermaid placeholder cannot capture the real diagram \(full\)$/,
+            /^F43 a diagram body of \$-replacement patterns round-trips verbatim \(full\)$/,
+            /^F43 every block is restored, not just the first \(full\)$/,
+            /^FEATURE two identical @@@html blocks both receive their document$/,
+          ],
+        },
+        {
+          id: "R539",
+          // THE SOURCE-CARDINALITY CONDITION - "exactly one fence in the
+          // markdown carries this body".
+          //
+          // THE OWNERSHIP MAP, DERIVED FROM AN AUTHORIZED SWEEP RATHER THAN
+          // FROM READING THE CODE, because the first draft of these records got
+          // it wrong in both directions:
+          //
+          //   condition (1) revision       -> the stale-dialog assertion
+          //   condition (2) DOM cardinality-> the raw decoy AND the empty fence
+          //   condition (3) source count   -> the emoji shortcode
+          //   the DUPLICATE-body assertion -> refused by (2) and (3) alike, so
+          //                                   it is not isolatable by either
+          //
+          // The empty fence belongs to (2) and not to (3), which is not
+          // obvious: an empty body makes the same-source node set empty, so (2)
+          // refuses first - and with (2) neutralised the empty fence MATCHES
+          // ITSELF as the document's only empty fence, so (3) lets it through.
+          // That is what made the first attempt at R540 report COLLATERAL.
+          what: "let the mermaid edit dialog rewrite the first matching fence, or none, as before",
+          file: RENDERER,
+          from:
+            "    if (matches.length !== 1) {\n      refuseEdit();\n      return;\n    }\n\n    // Replace the matching mermaid block in source (normalize line endings for robust matching)\n    const hit = matches[0];\n    const newContent =\n      content.substring(0, hit.start) +\n      '```mermaid\\n' + code + '\\n```' +\n      content.substring(hit.end);",
+          to:
+            "    // Replace the matching mermaid block in source (normalize line endings for robust matching)\n    const hit = matches[0];\n    const newContent = hit\n      ? content.substring(0, hit.start) +\n        '```mermaid\\n' + code + '\\n```' +\n        content.substring(hit.end)\n      : content;",
+          suite: "test:mermaid",
+          expect: [
+            // MEASURED: this is the only assertion condition (3) owns. The
+            // diagram's body carries :star:, parseEmojis() substitutes the glyph
+            // before the fences are lifted out, so the source read back matches
+            // NO fence - and with this condition gone the picture is replaced,
+            // the undo stack grows and the document is marked unsaved while the
+            // file is untouched.
+            /^an emoji-bearing diagram is refused rather than half-applied$/,
+          ],
+          mustPass: [
+            // THE CONTROL. A unique match is the case the shipped code got
+            // right, and it must keep working.
+            /^a uniquely identified diagram is still edited, on both render paths$/,
+            // OWNED BY CONDITION (2), and the first sweep proved it: with only
+            // this condition removed, the duplicate and the empty fence are
+            // still refused, and naming them here is what stopped this record
+            // reporting WRONG-GUARD a second time.
+            /^an ambiguous diagram is refused: the markdown, the undo stack and the unsaved flag are all left alone$/,
+            /^an empty fence is refused rather than half-applied$/,
+            /^a same-source raw-HTML diagram cannot redirect an edit at a real fence$/,
+            // Owned by condition (1).
+            /^an edit dialog left open across a re-render is refused, not applied to the new document$/,
+            // The sourced undrawn diagram of (e3) is also a unique match.
+            /^editing an undrawn diagram rewrites the markdown, not just the picture$/,
+          ],
+        },
+        {
+          id: "R540",
+          // THE DOM-CARDINALITY CONDITION - "this node is the only one on
+          // screen carrying that source, and it is the node that was clicked".
+          //
+          // This is the one that stops a document editing itself. A hand-written
+          // <pre class="mermaid"> is admitted by sanitization and picked up by
+          // restoreMermaidSourceAttributes(), so with the same body as a real
+          // fence it is indistinguishable from it by source alone - and the
+          // source scan still finds EXACTLY ONE fence, so R539's condition is
+          // satisfied and the decoy's edit lands on the author's real block.
+          //
+          // Neutralised with `false &&` rather than deleted, so the block stays
+          // syntactically intact and only the test changes - the R238 idiom.
+          //
+          // WHAT IT COSTS, and the record should say so: this condition refuses
+          // the HONEST node too whenever a same-source decoy is present. That is
+          // deliberate. It is cardinality, not ownership; owned identity is the
+          // separate design.
+          what: "let a same-source raw-HTML diagram stand in for the fence it copies",
+          file: RENDERER,
+          from:
+            "    if (\n      !mermaidEl ||\n      !mermaidEl.isConnected ||\n      !viewer.contains(mermaidEl) ||\n      sameSourceNodes.length !== 1 ||\n      sameSourceNodes[0] !== mermaidEl\n    ) {",
+          to:
+            "    if (\n      false && (!mermaidEl ||\n      !mermaidEl.isConnected ||\n      !viewer.contains(mermaidEl) ||\n      sameSourceNodes.length !== 1 ||\n      sameSourceNodes[0] !== mermaidEl)\n    ) {",
+          suite: "test:mermaid",
+          expect: [
+            /^a same-source raw-HTML diagram cannot redirect an edit at a real fence$/,
+            // HONEST CONSEQUENCE, NAMED RATHER THAN MISCALLED SETUP. The first
+            // sweep listed this as `mustPass` and reported COLLATERAL, which
+            // was the record being wrong rather than the fix: an empty body
+            // makes the same-source node set EMPTY, so this condition is what
+            // refuses an empty fence, and with it neutralised the empty fence
+            // matches itself as the document's only empty fence and the edit
+            // goes through. The two are not orthogonal, so the dependency is
+            // declared instead of hidden.
+            /^an empty fence is refused rather than half-applied$/,
+          ],
+          mustPass: [
+            // Duplicates are refused by the SOURCE-cardinality condition too
+            // (two fences, two matches), so they survive this edit - measured.
+            /^an ambiguous diagram is refused: the markdown, the undo stack and the unsaved flag are all left alone$/,
+            // Owned by condition (3): one node on screen, no fence matches.
+            /^an emoji-bearing diagram is refused rather than half-applied$/,
+            // Owned by condition (1).
+            /^an edit dialog left open across a re-render is refused, not applied to the new document$/,
+            /^a uniquely identified diagram is still edited, on both render paths$/,
+          ],
+        },
+        {
+          id: "R541",
+          // THE DOCUMENT-REVISION CONDITION - "the dialog is still about the
+          // document it was opened against".
+          //
+          // The edit dialog is modeless, so the page underneath it can be
+          // replaced while it is open - a tab switch, a file-watcher reload, an
+          // undo. NODE REUSE is what makes this dangerous rather than merely
+          // untidy: patchViewerDOM keys mermaid blocks by their source, so a
+          // diagram that appears in both documents keeps the SAME DOM NODE. The
+          // stale target is then still connected, still in the viewer, still
+          // uniquely sourced and still matched by exactly one fence - every
+          // other condition passes - and the edit is applied to a document the
+          // reader never opened the dialog against.
+          //
+          // The suite's fixture is built for exactly that: the second document
+          // carries the SAME diagram body as the first, so the node really is
+          // reused. A fixture with a different body would leave the target
+          // detached, R540's condition would refuse it, and this record would
+          // report VACUOUS while proving nothing.
+          what: "let an edit dialog opened against one document apply to another",
+          file: RENDERER,
+          from: "    if (editGeneration === null || editGeneration !== renderGeneration) {",
+          to: "    if (false && (editGeneration === null || editGeneration !== renderGeneration)) {",
+          suite: "test:mermaid",
+          expect: [
+            /^an edit dialog left open across a re-render is refused, not applied to the new document$/,
+          ],
+          mustPass: [
+            // THE FIXTURE'S OWN SHAPE, and the reason this record is not
+            // vacuous: every other condition is measured PASSING before the
+            // submission - the node was reused, so it is the current one,
+            // connected, in the viewer, unique on screen and matched by exactly
+            // one fence. If this fails, the reuse did not happen and the
+            // refusal would have been somebody else's.
+            /^the stale-dialog fixture reuses the same node, so only the revision check can refuse it$/,
+            // Every other refusal is untouched, and so is the control.
+            /^an ambiguous diagram is refused: the markdown, the undo stack and the unsaved flag are all left alone$/,
+            /^an empty fence is refused rather than half-applied$/,
+            /^an emoji-bearing diagram is refused rather than half-applied$/,
+            /^a same-source raw-HTML diagram cannot redirect an edit at a real fence$/,
+            /^a uniquely identified diagram is still edited, on both render paths$/,
+          ],
+        },
+        {
+          id: "R542",
+          // THE DIALOG-SESSION TOKEN, which is the async half of the same
+          // problem R541 covers synchronously.
+          //
+          // insertMermaidFromDialog() awaits ensureMermaid() and
+          // mermaid.render() before it commits, and the dialog is modeless, so
+          // a submission can be parked in validation while the reader cancels,
+          // closes and reopens it on a DIFFERENT diagram, or presses Ctrl+Enter
+          // again. Every open and every close bumps the token; a submission that
+          // parked across either one no longer matches and refuses to commit.
+          //
+          // THE SNAPSHOT IS NOT SEPARATELY RECORDED, deliberately. Reading the
+          // mode and the target BEFORE the first await is what stops a parked
+          // call adopting the reopened dialog's target or turning into an
+          // insert, but with this token in place a stale session is rejected
+          // before any of that state is used - so a revert of the snapshot
+          // ordering alone would be VACUOUS. It is a structural precondition,
+          // documented at the call site rather than given a record that could
+          // never fail. (The R539-that-was is why: a record whose expectation
+          // another condition already satisfies reports WRONG-GUARD and proves
+          // nothing.)
+          //
+          // The suite's fixture makes the race DETERMINISTIC by replacing
+          // mermaid.render() with a promise it resolves by hand, so this is not
+          // a timing test.
+          what: "let a submission parked in validation commit against whatever the dialog became",
+          file: RENDERER,
+          from: "  if (session !== mermaidDialogSession) return;",
+          to: "  if (false && session !== mermaidDialogSession) return;",
+          suite: "test:mermaid",
+          expect: [
+            /^a submission parked in validation cannot commit after its dialog is closed and reopened$/,
+          ],
+          mustPass: [
+            // The race has to have HAPPENED for the record to mean anything:
+            // two diagrams on screen, the stubbed validation entered, and a
+            // second dialog opened while the first submission was parked.
+            /^the dialog-race fixture really parked a submission and reopened on another diagram$/,
+            // Nothing else in the edit path is touched.
+            /^a uniquely identified diagram is still edited, on both render paths$/,
+            /^an edit dialog left open across a re-render is refused, not applied to the new document$/,
+            /^a same-source raw-HTML diagram cannot redirect an edit at a real fence$/,
           ],
         },
       ];
