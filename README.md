@@ -422,13 +422,16 @@ rendered DOM or the bytes on disk as the oracle. Nothing asserts on the
 implementation's own helper functions, because a test that asks the code what it
 thinks it did will always be told it went fine.
 
-**Every fix is proven by reverting it.** `scripts/prove-table-fixes.js` holds
-**458 recorded defects**. Each one re-applies the original bug to the
+**Every fix is proven by reverting it.** `scripts/prove-table-fixes.js` holds a
+recorded defect per fix. Each one re-applies the original bug to the
 source, runs the suite, and requires it to fail on *that fix's own named
 assertions* - not merely to fail. A revert that fails nothing means the test was
 decorative; a revert that fails too much means the test is not specific enough.
-276 of them additionally name assertions that **must keep passing**, so a fix
-cannot be "proven" by a test that simply breaks everything.
+Many of them additionally name assertions that **must keep passing**, so a fix
+cannot be "proven" by a test that simply breaks everything. The catalogue grows
+with the code, so no count is quoted here - derive the live figures with
+`node scripts/prove-table-fixes.js --anchors` and
+`node scripts/prove-table-fixes.js --expects`.
 
 This has repeatedly caught tests that could not fail:
 
@@ -463,12 +466,13 @@ The philosophy is **leaner and faster, and offline**. Folia makes no network
 requests: every library it renders with is vendored inside the app, so it works
 identically on an air-gapped machine and there is no telemetry to opt out of.
 
-Planned next:
-
-- Bring the removal-path rendering work to the same linear shape as the rest (a document-to-document swap with partial reuse is still super-linear).
-- Table breakout is now the single most expensive pass on wide documents; it is the next performance target.
-- Signed Windows builds, so installing does not require dismissing SmartScreen.
-- Continue reviewing upstream commits individually - each one measured against this fork before it is taken.
+Planned next: the authoritative, live roadmap is
+[`PLANNED-WORK.md`](https://github.com/lostinsea/folia/blob/main/docs/PLANNED-WORK.md) -
+every open item with a stable ID, its status, what it is blocked on, the decision
+gates still open, and the engineering process each change is held to (mandatory
+performance gates, isolated worktrees, serialised integration, revert proofs).
+That register is updated as work moves; this README deliberately does not repeat
+the inventory, because a second copy of it would be stale within a wave.
 
 ---
 

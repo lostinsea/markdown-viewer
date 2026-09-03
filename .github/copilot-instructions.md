@@ -16,7 +16,9 @@ yumedzi/markdown-viewer  ->  OmniCoreST/omnicore-markdown-viewer  ->  lostinsea/
 Diverged at `854bdec` (2026-02-23, upstream v2.0.7). It is a fork, not a branch
 of upstream: the fork's `version` is independent, upstream commits are picked
 deliberately rather than merged wholesale, and the product has been renamed to
-**Folia**. `main` is the only branch that matters.
+**Folia**. `main` is the only branch that *ships*; delivery streams work on their
+own feature branches and worktrees and land into `main` through the integration
+owner (see *Conventions*).
 
 The fork exists because of one bug — refreshing one tab silently reverted the
 *other* tabs to stale content — and most of what is here now came out of chasing
@@ -67,10 +69,25 @@ the boundary, which is why several of them carry a comment saying so:
   resolve against whatever script Electron was launched with — which is exactly
   how a test suite gets a silent blank window instead of an error.
 
-Docs that are load-bearing, not decoration: `docs/CUSTOMIZATIONS.md` (what the fork
-changed and why, so an upstream merge does not silently undo it), `docs/BUILD.md`
-(build, signing, release procedure), `docs/SECURITY-AUDIT.md`, `docs/PERF-AUDIT.md`,
-`bench/BASELINE.md` (every measurement, with the method used to get it).
+Docs that are load-bearing, not decoration: `docs/PLANNED-WORK.md` (the open work
+register and the process the work is delivered by — see the rule below),
+`docs/CUSTOMIZATIONS.md` (what the fork changed and why, so an upstream merge does
+not silently undo it), `docs/BUILD.md` (build, signing, release procedure),
+`docs/SECURITY-AUDIT.md`, `docs/PERF-AUDIT.md`, `bench/BASELINE.md` (every
+measurement, with the method used to get it).
+
+**Read `docs/PLANNED-WORK.md` before selecting or starting any work.** It is
+authoritative, and the session tracker it mirrors does not survive the session:
+stable item IDs, status, dependencies and decision gates; the mandatory
+performance acceptance gates; the isolated-worktree, one-stream-per-file,
+serialised-integration process; the mandatory model-role assignment summarised
+under *Model roles — mandatory* below, with its handoff order and its evidence
+ownership; and the per-unit gates — targeted suite, individually proven reverts,
+screenshots actually *viewed*. Do not infer the detailed procedure from this file
+or restate that detail here; the authoritative version lives there. **Update it
+at every status transition, every role handoff and after every merge**, under a
+single-writer protocol: only the integration owner edits it, so a stream reports
+its transitions rather than writing them itself.
 
 ## Commands
 
@@ -82,17 +99,17 @@ npm run test:packaging    # node, not electron. Fast. Identity, licences, asar c
 npm run test:corpus       # node --check on bench sources, then bench/verify.js (~1s, 315 checks)
 npm run bench             # electron bench/run.js. ~8 min. --profiles= --sizes= --reps=
 node scripts/prove-table-fixes.js R229 R234   # prove specific fixes are load-bearing
-node scripts/prove-table-fixes.js --anchors  # ~1s dry run: do all 458 anchors still resolve?
+node scripts/prove-table-fixes.js --anchors  # ~1s dry run: do all anchors still resolve?
 npm run build-all         # electron-builder, Windows portable + NSIS
 ```
 
 **Run `--anchors` after ANY rename, move or reformat.** Each revert works by
 string-replacing an anchor it expects to find in a source file; a full run takes
 hours, so a rotted anchor is otherwise discovered far too late. The dry run does
-the string half of all 458 setups and runs no suite. It has caught three proofs
+the string half of every setup and runs no suite. It has caught three proofs
 that had silently stopped proving anything — one of them dead for weeks, because
 a rename reformatted a JSON block the anchor quoted on a single line. Its summary
-deliberately refuses to imply proof: *"ALL 458 ANCHORS RESOLVE - nothing is
+deliberately refuses to imply proof: *"ALL ANCHORS RESOLVE - nothing is
 proven; run without --anchors for that."*
 
 **Anchor rot is the one failure this project cannot detect by testing.** A rotted
@@ -118,12 +135,14 @@ profiles scored 1.3x; the same formula scored 3.6x on the four profiles it had
 not seen. The honest number is the held-out one. Never tune a constant on the
 same data used to report its quality.
 
-**Two independent reviewers, 2-3 rounds.** Non-trivial changes get reviewed by
-two different models independently; agreements and disagreements are both
-surfaced. Stop when a round produces no new blocking findings — do not loop
-indefinitely. The convergence is worth it: on the `marked 18` upgrade both
-reviewers independently found the same defect, and one proposed a fix that was
-strictly better than the other's by exactly one case (`Infinity`).
+**Three independent reviewers, 2-3 rounds.** Non-trivial changes get reviewed
+independently by the three reviewers named under *Model roles — mandatory*
+below, each in a fresh context; agreements and disagreements are both surfaced.
+Stop when a round produces no new blocking findings — do not loop indefinitely,
+but a material correction always earns another round. The convergence is worth
+it: *(historical, from the earlier two-reviewer process)* on the `marked 18`
+upgrade both reviewers independently found the same defect, and one proposed a
+fix that was strictly better than the other's by exactly one case (`Infinity`).
 
 **Fix the class, not the instance.** When something breaks, ask what else has
 the same shape. A stale `hasOwnProperty` check that accepted garbage was fixed
@@ -133,6 +152,31 @@ by `Number.isFinite`, and the mutation suite went from 1 case to 7.
 has its reasoning at the call site, including deliberate omissions. If you
 decide *not* to do something, write down why where the next person will look.
 
+## Model roles — mandatory
+
+**Maintainer decision, 2026-09-02.** Not advisory. These assignments apply going
+forward and supersede any earlier statement in this repository that Opus 5
+implements, or that review is Luna alone or an Opus/Luna pair.
+
+| Role | Model | Notes |
+|---|---|---|
+| Product coding and implementation | **GPT-5.6 Sol** — `gpt-5.6-sol` | Reasoning effort **high**, always. |
+| Tests and automations | **GPT-5.6 Terra** — `gpt-5.6-terra` | Test design and implementation, benchmark automation, screenshot-capture automation, revert-harness records, proof orchestration. |
+| Code review | **GPT-5.6 Sol** — `gpt-5.6-sol`, **GPT-5.6 Terra** — `gpt-5.6-terra`, **GPT-5.6 Luna** — `gpt-5.6-luna` | Three independent reviews, each in a **fresh context**. The Sol agent that wrote the code and the Terra agent that wrote the tests do **not** count as those reviewers. |
+| Exploration and research | **Claude Opus 5** — `claude-opus-5` | Maps architecture, history and risk and supplies evidence. Does **not** own product implementation. |
+
+Handoff order, one behavioural unit at a time: **Opus explores -> Sol (high)
+changes the product -> Terra writes the tests, automation and evidence -> Sol,
+Terra and Luna review independently in fresh contexts -> the role owner corrects
+(product to Sol, tests and automation to Terra) -> the three reviews repeat after
+any material correction -> integration is serialised, one stream at a time.** A
+product defect that a Terra test exposed is still Sol's fix.
+
+The procedure that goes with this — how it composes with the isolated-worktree
+and file-ownership rules, what each role owns as evidence, and the per-unit gates
+— lives in `docs/PLANNED-WORK.md` under *Model roles and the delivery handoff*.
+Do not restate it here.
+
 ## Test discipline — the part that matters
 
 The rule this repository is built on: **a test that cannot fail is worse than no
@@ -141,15 +185,22 @@ is vacuous until proven otherwise.
 
 ### 1. Every fix gets a revert
 
-`scripts/prove-table-fixes.js` currently holds **458 reverts** across
-11 suites. Each one undoes a real fix in the source, runs the suite that is
-supposed to notice, and requires:
+`scripts/prove-table-fixes.js` holds the revert records, across 11 suites. Each
+one undoes a real fix in the source, runs the suite that is supposed to notice,
+and requires:
 
 - `expect` — the assertions that **must fail** when the fix is undone. If the
   suite stays green, the test is decorative and the fix is unprotected.
 - `mustPass` — assertions that **must keep passing**, so a revert that fails
   everything (a syntax error, a crashed app) cannot be mistaken for a real
-  detection. There are 276 of these.
+  detection.
+
+**Do not state a count of reverts, anchors or `mustPass` entries in prose.**
+These numbers change with every fix that lands, and a hand-maintained figure in a
+document goes stale silently and is then quoted as authority. There is no
+authoritative prose count: derive it from the harness when it is actually needed
+— `--anchors` for anchors and setups, `--expects` for the assertion inventory, or
+the counting method already used against the file — and assert it there.
 
 A fix without a revert is not finished. If you cannot write a revert that turns
 the suite red, you have not tested the fix — you have tested that the app still
@@ -316,10 +367,16 @@ improvement can quietly undo a fix here.
 
 ## Conventions
 
-- **Commit directly to `main`.** This is a single-maintainer repository; there
-  is no PR ceremony, and pushing does not need to be asked for. (Inherited
-  `.cursor` / `.claude` rule files said otherwise; they were wrong for this repo
-  and have been deleted — this file is the only agent guidance here.)
+- **Streams commit on their own feature branch or worktree; only the integration
+  owner lands into `main`.** Each delivery stream works in an isolated worktree
+  and commits there. Reviewed commits are then landed into `main` from the
+  integration worktree by the integration owner, **one stream at a time**, with
+  the impacted suites re-run after each. There is still no PR ceremony — this is
+  a single-maintainer repository — but nothing reaches `main` unreviewed or in
+  parallel. See *Parallel delivery without reducing quality* in
+  `docs/PLANNED-WORK.md`. (Inherited `.cursor` / `.claude` rule files said
+  something different; they were wrong for this repo and have been deleted —
+  this file is the only agent guidance here.)
 - **Stage named files, never `git add -A` or `git add .`.** Review `git status`
   and `git diff --stat` first. Two reasons, both learned here: the root
   directory carries untracked scratch output that must not be committed, and a
